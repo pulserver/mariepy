@@ -1,8 +1,12 @@
 # DIRECTFN — licence notice
 
 Everything under this directory is the DIRECTFN singular-integral code as
-distributed in MARIE 3.0 (<https://github.com/cloudmrhub/marie-tools>), kept
-byte-identical, together with the wrappers and bindings that build it.
+distributed in MARIE 3.0 (<https://github.com/cloudmrhub/marie-tools>), together
+with the wrappers and bindings that build it.
+
+The vendored sources are unmodified. The repository stores text with LF line
+endings, and the upstream files use CRLF, so that is the one difference from
+them: `diff --strip-trailing-cr` against a MARIE checkout reports nothing.
 
 Those sources carry the notice
 
@@ -38,7 +42,7 @@ the sources they bind and include, so they live here and carry the same licence.
 
 ## Modifications
 
-The vendored sources are unmodified. `directfn_vie/src_cpp/main.cpp`, a
+No line of the vendored sources is changed. `directfn_vie/src_cpp/main.cpp`, a
 standalone driver, and the MATLAB `*_mex.cpp` gateways are not carried.
 
 The three RWG sources each define `get_source_coords_mat` and the

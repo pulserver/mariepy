@@ -13,8 +13,9 @@ reproduced below the table at the same time.
 
 ## DIRECTFN singular integrals
 
-Kept in `src/cpp_lgpl/`, byte-identical, with the bindings and namespace
-wrappers that build them as `mariepy._directfn`. The sources carry the notice
+Kept in `src/cpp_lgpl/`, unmodified apart from the LF line endings this
+repository stores text with, together with the bindings and namespace wrappers
+that build them as `mariepy._directfn`. The sources carry the notice
 
 > Licensing: This code is distributed under the GNU LGPL license.
 
