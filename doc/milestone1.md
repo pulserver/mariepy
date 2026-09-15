@@ -243,8 +243,8 @@ Dunavant are already listed.
 | `src_pfft_coil/pfft_assemble_voxel_cc.m` | `pfft.coil_precorrection` |
 | `src_wsvie/wsvie_coupling_assembly.m` | `pfft.assemble`, with `pfft.kernels` building both grids' kernels from one table |
 | `src_solver/src_ie_solver/solver_wsvie.m` | `solver.solve` |
-| `src_solver/src_rhs/rhs_assembly.m` | `solver.right_hand_side` |
-| `src_preconditioners/prec_wsvie.m`, `prec_LU.m` | `preconditioner.coil_lu` |
+| `src_solver/src_rhs/rhs_assembly.m` | `system.CoupledOperator.right_hand_side` |
+| `src_preconditioners/prec_wsvie.m`, `prec_LU.m` | `system.CoupledOperator.preconditioner`, which carries both blocks |
 | `src_preconditioners/prec_vie.m` | `preconditioner.body_diagonal` |
 | `src_mvp/mvp_svie/mvp_svie_pfft.m` | `system.CoupledOperator.__call__` |
 | `src_ie_solver/ie_solver_svie/ie_solver_svie_pfft.m` | `solver.solve_ports` |
