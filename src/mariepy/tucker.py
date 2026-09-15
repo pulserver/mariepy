@@ -1,0 +1,256 @@
+"""Tucker compression of the three-level circulant body kernel.
+
+The volume integral operator couples every voxel to every other through a
+kernel that depends only on the offset between them, so each Cartesian
+component of it is a three-level Toeplitz tensor. Embedding that tensor in a
+circulant of twice the extent along each axis turns its application into three
+FFTs, and a truncated higher-order SVD stores the embedded tensor in a fraction
+of the memory the full grid would take.
+
+Ported from MARIE 3.0's ``src_mathematics/src_numerical_linear_algebra/
+src_tucker/{hosvd,hosvd_to_full,nmp}.m`` and
+``src_integral_equations/src_vie/src_operators_vie/
+assembly_fft_circ_tucker_pwc.m``.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+
+import torch
+
+__all__ = [
+    "CirculantSymbol",
+    "circulant_tucker",
+    "hosvd",
+    "mode_product",
+    "to_full",
+]
+
+# Parity of each component of the symmetric dyadic kernel under reflection of
+# the offset in x, y and z. The component order is xx, xy, xz, yy, yz, zz, and
+# the mirrored half of the circulant embedding carries these signs.
+_PARITY_XX_TO_ZZ = (
+    (+1, -1, -1, +1, +1, +1),
+    (+1, -1, +1, +1, -1, +1),
+    (+1, +1, -1, +1, -1, +1),
+)
+
+# Parity of the three components of a vector kernel, used where the operator
+# has one component per axis rather than the six of a symmetric dyadic.
+_PARITY_X_TO_Z = (
+    (-1, +1, +1),
+    (+1, -1, +1),
+    (+1, +1, -1),
+)
+
+
+@dataclass(frozen=True)
+class CirculantSymbol:
+    """One component of the kernel, compressed and transformed.
+
+    Attributes
+    ----------
+    core
+        Tucker core, shape ``(r1, r2, r3)``.
+    factors
+        Three factor matrices, of shapes ``(r1, 2 * n1)``, ``(r2, 2 * n2)`` and
+        ``(r3, 2 * n3)``. Each is the circulant extension of a Tucker factor
+        along its axis, already Fourier transformed, so expanding the core
+        through them gives the operator's symbol on the doubled grid.
+    """
+
+    core: torch.Tensor
+    factors: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        """Return the shape of the symbol this expands to."""
+        return tuple(factor.shape[1] for factor in self.factors)  # type: ignore[return-value]
+
+    def expand(self) -> torch.Tensor:
+        """Return the symbol on the doubled grid, shape ``(2n1, 2n2, 2n3)``."""
+        return to_full(self.core, *self.factors)
+
+
+def mode_product(tensor: torch.Tensor, matrix: torch.Tensor, mode: int) -> torch.Tensor:
+    """Contract one mode of a tensor with a matrix.
+
+    Parameters
+    ----------
+    tensor
+        Tensor of any order; mode ``mode`` has extent ``k``.
+    matrix
+        Shape ``(k, m)``. Its first axis is contracted with the named mode.
+    mode
+        Axis of ``tensor`` to contract, counted from zero.
+
+    Returns
+    -------
+    torch.Tensor
+        ``tensor`` with mode ``mode`` replaced by an axis of extent ``m``.
+    """
+    contracted = torch.tensordot(tensor, matrix, dims=([mode], [0]))
+    return torch.movedim(contracted, -1, mode)
+
+
+def to_full(
+    core: torch.Tensor,
+    factor_1: torch.Tensor,
+    factor_2: torch.Tensor,
+    factor_3: torch.Tensor,
+) -> torch.Tensor:
+    """Expand a Tucker core through its three factors.
+
+    Parameters
+    ----------
+    core
+        Shape ``(r1, r2, r3)``.
+    factor_1, factor_2, factor_3
+        Shapes ``(r1, n1)``, ``(r2, n2)`` and ``(r3, n3)``.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(n1, n2, n3)``.
+    """
+    expanded = mode_product(core, factor_1, 0)
+    expanded = mode_product(expanded, factor_2, 1)
+    return mode_product(expanded, factor_3, 2)
+
+
+def hosvd(
+    tensor: torch.Tensor, tol: float | None = None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compress a third-order tensor by a truncated higher-order SVD.
+
+    Each mode is truncated at the first singular value at or below
+    ``tol * s[0] / sqrt(3)``, that value included, which is the rule MARIE
+    applies. Exact zeros do not trigger the truncation.
+
+    Parameters
+    ----------
+    tensor
+        Shape ``(n1, n2, n3)``.
+    tol
+        Relative tolerance. ``None`` keeps every mode at full rank.
+
+    Returns
+    -------
+    core : torch.Tensor
+        Shape ``(r1, r2, r3)``.
+    factor_1, factor_2, factor_3 : torch.Tensor
+        Shapes ``(r1, n1)``, ``(r2, n2)`` and ``(r3, n3)``, so that
+        :func:`to_full` reconstructs the tensor.
+
+    Raises
+    ------
+    ValueError
+        ``tensor`` is not third order.
+    """
+    if tensor.ndim != 3:
+        raise ValueError(f"hosvd takes a third-order tensor, got {tensor.ndim} axes")
+
+    factors = []
+    for mode in range(3):
+        unfolding = torch.movedim(tensor, mode, 0).reshape(tensor.shape[mode], -1)
+        left, singular_values, _ = torch.linalg.svd(unfolding, full_matrices=False)
+        rank = _truncation_rank(singular_values, tol)
+        factors.append(left[:, :rank])
+
+    core = tensor
+    for mode, factor in enumerate(factors):
+        core = mode_product(core, factor.conj(), mode)
+
+    return core, *(factor.transpose(0, 1) for factor in factors)
+
+
+def _truncation_rank(singular_values: torch.Tensor, tol: float | None) -> int:
+    """Return how many singular values to keep, by MARIE's rule."""
+    count = singular_values.numel()
+    if tol is None or count == 0:
+        return count
+
+    threshold = tol * singular_values[0].item() / math.sqrt(3.0)
+    below = (singular_values <= threshold) & (singular_values != 0)
+    indices = torch.nonzero(below, as_tuple=False)
+    if indices.numel() == 0:
+        return count
+    return int(indices[0].item()) + 1
+
+
+def circulant_tucker(
+    kernel: torch.Tensor, tol: float | None = None
+) -> tuple[CirculantSymbol, ...]:
+    """Embed each component of a Toeplitz kernel in a circulant and compress it.
+
+    Parameters
+    ----------
+    kernel
+        Shape ``(n1, n2, n3, n_components)``, holding the kernel at
+        non-negative offsets. ``n_components`` is 6 for a symmetric dyadic
+        operator, in the order xx, xy, xz, yy, yz, zz, or 3 for a vector
+        operator, in the order x, y, z; the parity of each component under
+        reflection of the offset follows from that order.
+    tol
+        Relative tolerance passed to :func:`hosvd`.
+
+    Returns
+    -------
+    tuple of CirculantSymbol
+        One entry per component.
+
+    Raises
+    ------
+    ValueError
+        ``kernel`` is not fourth order, or carries a component count with no
+        parity assignment.
+    """
+    if kernel.ndim != 4:
+        raise ValueError(f"the kernel needs four axes, got {kernel.ndim}")
+
+    n_components = kernel.shape[3]
+    if n_components == 6:
+        parity = _PARITY_XX_TO_ZZ
+    elif n_components == 3:
+        parity = _PARITY_X_TO_Z
+    else:
+        raise ValueError(
+            f"a kernel of {n_components} components has no parity assignment; "
+            f"expected 6 for a symmetric dyadic or 3 for a vector operator"
+        )
+
+    symbols = []
+    for component in range(n_components):
+        core, *factors = hosvd(kernel[..., component], tol)
+        transformed = tuple(
+            _circulant_extension(factor, parity[axis][component])
+            for axis, factor in enumerate(factors)
+        )
+        symbols.append(CirculantSymbol(core=core, factors=transformed))
+    return tuple(symbols)
+
+
+def _circulant_extension(factor: torch.Tensor, sign: int) -> torch.Tensor:
+    """Mirror one Tucker factor into a circulant and transform it.
+
+    Parameters
+    ----------
+    factor
+        Shape ``(rank, n)``, one factor of the Tucker decomposition.
+    sign
+        Parity of this component under reflection of the offset along this
+        axis.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(rank, 2 * n)``, Fourier transformed along the extended axis.
+    """
+    rank, n = factor.shape
+    extended = torch.zeros((rank, 2 * n), device=factor.device, dtype=factor.dtype)
+    extended[:, :n] = factor
+    if n > 1:
+        extended[:, n + 1 :] = sign * torch.flip(factor[:, 1:], dims=(1,))
+    return torch.fft.fft(extended, dim=1)
