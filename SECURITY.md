@@ -1,0 +1,33 @@
+# Security policy
+
+## Reporting a vulnerability
+
+Report privately through
+[GitHub's private advisory form](https://github.com/pulserver/mariepy/security/advisories/new).
+Please do not open a public issue for a vulnerability.
+
+Include what you would need yourself to reproduce it: the version or commit,
+the platform, and the smallest input that triggers it.
+
+You can expect an acknowledgement within a week, an assessment of severity and
+scope after that, and a fix released with the advisory once one is ready.
+Credit goes to the reporter unless you ask otherwise.
+
+## Supported versions
+
+mariepy is pre-1.0. Fixes land on the default branch and go out in the next
+release; there are no maintained backport branches.
+
+| Version | Supported |
+|---|---|
+| latest release | yes |
+| older releases | no |
+
+## Scope
+
+In scope: anything that reads data from outside the process — file readers,
+array deserialisation, and any path that accepts a filename from a caller.
+
+Out of scope: resource exhaustion from inputs a caller chose themselves (an
+array too large for the machine is a sizing question, not a vulnerability),
+and behaviour under a deliberately hostile Python environment.

@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.npy binary
+*.npz binary
+*.mat binary
+*.h5 binary
+
+# Generated: keep them out of diffs and out of the language statistics.
+*.ipynb linguist-documentation=true

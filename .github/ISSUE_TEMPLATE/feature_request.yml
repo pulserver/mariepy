@@ -1,0 +1,31 @@
+name: Feature request
+description: Something this package should be able to do and cannot.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and where does it stop?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you have in mind
+      description: >
+        A sketch of the API, if you have one. If there is a paper or another
+        implementation that does this, name it — that is usually the fastest
+        way to agree on what is wanted.
+    validations:
+      required: true
+
+  - type: textarea
+    id: layer
+    attributes:
+      label: Which layer this belongs to
+      description: >
+        This package is one of a family with a strict layering (`mrutils` at the
+        base, `deepmr` at the top). If the feature needs something from a
+        sibling package, say which — that usually means it belongs elsewhere.

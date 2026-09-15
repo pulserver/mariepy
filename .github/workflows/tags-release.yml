@@ -1,0 +1,58 @@
+name: Release
+
+# Publishes a tagged version: the wheels and sdist from the reusable Wheels
+# workflow, then PyPI and a signed GitHub release. The version comes from the
+# tag via setuptools_scm.
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+jobs:
+  build:
+    uses: ./.github/workflows/wheels.yml
+    with:
+      cibw-build: "cp310-* cp311-* cp312-* cp313-*"
+
+  publish-to-pypi:
+    needs: [build]
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/mariepy
+    permissions:
+      id-token: write # trusted publishing (OIDC)
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: "{wheels-*,sdist}"
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [publish-to-pypi]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release
+      id-token: write # sigstore
+    steps:
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: "{wheels-*,sdist}"
+          path: dist
+          merge-multiple: true
+      - uses: sigstore/gh-action-sigstore-python@v3.0.0
+        with:
+          inputs: |
+            ./dist/*.tar.gz
+            ./dist/*.whl
+      - env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release create '${{ github.ref_name }}' \
+            --repo '${{ github.repository }}' \
+            --title '${{ github.ref_name }}' \
+            --generate-notes
+          gh release upload '${{ github.ref_name }}' dist/** --repo '${{ github.repository }}'

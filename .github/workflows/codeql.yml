@@ -1,0 +1,31 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  analyze:
+    name: Analyze Python
+    runs-on: ubuntu-latest
+    # Code scanning on a private repository needs GitHub Advanced Security,
+    # and uploading results without it is a hard error rather than a warning.
+    # The job stands down while the repository is private and starts working
+    # on its own once it is made public.
+    if: github.event.repository.visibility == 'public'
+    permissions:
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: python
+          build-mode: none
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:python"

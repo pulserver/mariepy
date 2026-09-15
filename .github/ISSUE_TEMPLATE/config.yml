@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Question or idea
+    url: https://github.com/pulserver/mariepy/discussions
+    about: Ask about usage, or propose something before it is a bug report.
+  - name: Security vulnerability
+    url: https://github.com/pulserver/mariepy/security/advisories/new
+    about: Report privately. Please do not open a public issue.

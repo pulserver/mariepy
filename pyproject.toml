@@ -1,0 +1,113 @@
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12", "setuptools_scm[toml]>=8"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "mariepy"
+description = "Electromagnetic simulation of MRI transmit coils and virtual observation points for SAR, ported from MARIE 3.0."
+readme = "README.md"
+requires-python = ">=3.10"
+dynamic = ["version"]
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["mri", "sar", "vop", "electromagnetics", "integral-equation", "parallel-transmit"]
+authors = [{ name = "Matteo Cencini", email = "matteo.cencini@gmail.com" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Medical Science Apps.",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+dependencies = ["numpy>=1.24", "scipy>=1.11"]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-cov>=5",
+  "coverage>=7",
+  # Pinned, not ranged: a formatter that differs between a contributor and
+  # CI makes "one entry point" a lie. Dependabot proposes the bumps.
+  "ruff==0.16.5",
+  "pre-commit>=4",
+  "build",
+]
+
+[project.urls]
+Homepage = "https://github.com/pulserver/mariepy"
+Issues = "https://github.com/pulserver/mariepy/issues"
+Source = "https://github.com/pulserver/mariepy"
+
+[tool.scikit-build]
+cmake.source-dir = "."
+sdist.include = ["src/**", "tests/**", "README.md", "LICENSE"]
+
+[tool.scikit-build.wheel]
+packages = { "mariepy" = "src/mariepy" }
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.setuptools_scm"
+
+# No write_to: the version is read at runtime with importlib.metadata, which
+# works the same under setuptools and under scikit-build-core. A generated
+# _version.py only exists under one of them.
+[tool.setuptools_scm]
+version_scheme = "python-simplified-semver"
+local_scheme = "no-local-version"
+fallback_version = "0.0.0.dev0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+  "cuda: needs a CUDA device; skipped when none is present",
+  "slow: excluded from the default run",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "@overload",
+]
+
+[tool.ruff]
+line-length = 88
+# Deliberately NOT `fix = true`: with it, `ruff check` rewrites the working
+# tree, so a command that reads as read-only is not. `format_and_lint.sh`
+# passes --fix explicitly when it means it.
+fix = false
+extend-exclude = ["docs/**", "examples/**"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = ["A", "ARG", "B", "C4", "D", "E", "F", "I", "NPY", "PIE", "PTH", "Q", "RUF", "S", "SIM", "UP", "W", "YTT"]
+ignore = [
+  "E501",   # line length is the formatter's business
+  "COM812", # trailing comma conflicts with the formatter
+  "D105",   # magic methods carry their meaning in their name
+  "D107",   # __init__ is documented on the class
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "S101", "ARG"]
+"benchmarks/**" = ["D", "S101", "T201"]
+"__init__.py" = ["D104", "F401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.flake8-quotes]
+docstring-quotes = "double"
+inline-quotes = "double"
