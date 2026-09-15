@@ -232,16 +232,16 @@ Dunavant are already listed.
 | `excitation_coil.m` | `sie.port_excitation` |
 | `src_sie/sie_assembly.m` | `sie.assemble` |
 | `src_wsvie/src_pfft/src_svie_pfft/pfft_surface_domain.m` | `pfft.extended_domain` |
-| `src_pfft_supporting/pfft_extend_vie_domain.m` | `pfft._extend_grid` |
-| `pfft_proj_surface_create_near_lists.m` | `pfft.near_lists` |
-| `src_pfft_supporting/pfft_proj_find_RWG_centers.m` | `coil.rwg_centres` |
-| `pfft_proj_find_nearest_voxel.m`, `pfft_proj_find_expansion_cell.m`, `pfft_proj_get_near_indecies.m` | `pfft._nearest_voxel`, `pfft._expansion_cells`, `pfft._near_cells` |
+| `src_pfft_supporting/pfft_extend_vie_domain.m` | folded into `pfft.extended_domain` |
+| `pfft_proj_surface_create_near_lists.m` | `pfft.near_lists` and `pfft.near_body_pairs` |
+| `src_pfft_supporting/pfft_proj_find_RWG_centers.m` | folded into `pfft.near_lists`: an RWG's centre is its own edge's midpoint |
+| `pfft_proj_find_nearest_voxel.m`, `pfft_proj_find_expansion_cell.m`, `pfft_proj_get_near_indecies.m` | folded into `pfft.near_lists` and `pfft.near_body_pairs` |
 | `pfft_proj_pwx_to_collocation.m` | `coupling.collocation_matrix` |
-| `pfft_projection_surface_assembly.m` | `pfft.projection`, returning the sparse `P` and `S` blocks |
+| `pfft_projection_surface_assembly.m` | `pfft.projection` and `pfft.projection_matrix`, with `pfft.scatter_matrix` for `S` |
 | `pfft_surface_assemble_direct_bc.m` | `pfft.direct_coupling`, calling `coupling.coupling_n` and `coupling.coupling_k` |
-| `src_pfft_coil/pfft_assemble_voxel_bc.m` | `pfft.projected_coupling` |
+| `src_pfft_coil/pfft_assemble_voxel_bc.m` | `pfft.projected_coupling`, over `pfft.expansion_response` |
 | `src_pfft_coil/pfft_assemble_voxel_cc.m` | `pfft.coil_precorrection` |
-| `src_wsvie/wsvie_coupling_assembly.m` | `pfft.assemble` |
+| `src_wsvie/wsvie_coupling_assembly.m` | `pfft.assemble`, with `pfft.kernels` building both grids' kernels from one table |
 | `src_solver/src_ie_solver/solver_wsvie.m` | `solver.solve` |
 | `src_solver/src_rhs/rhs_assembly.m` | `solver.right_hand_side` |
 | `src_preconditioners/prec_wsvie.m`, `prec_LU.m` | `preconditioner.coil_lu` |
