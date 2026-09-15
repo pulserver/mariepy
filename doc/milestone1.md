@@ -77,10 +77,11 @@ src/cpp/                    -> mariepy._ext, MIT
     vie_volume.cpp          body kernel, volume-volume quadrature
 
 src/cpp_lgpl/               -> mariepy._directfn, LGPL, notices kept
+    NOTICE.md               what is carried, and the two build changes
     module_directfn.cpp     bindings
-    LICENCE.LGPL
-    directfn/               solve_ea, solve_st, solve_va and their headers
-    rwg/                    direct_ws_ea_rwg, direct_ws_st_rwg, direct_ws_va_rwg
+    directfn_vie/           the voxel family, linking as its sources stand
+    directfn_rwg/           direct_ws_{st,ea,va}_rwg and their headers
+    rwg_namespace_*.cpp     one wrapper per RWG source, giving it a namespace
 
 tests/
     test_quadrature.py  test_tucker.py  test_mesh.py  test_coil.py
@@ -125,10 +126,23 @@ degree *d* integrates bivariate monomials up to degree *d* over the unit
 triangle exactly and its weights sum to the triangle area; the 26-point Lebedev
 set is invariant under the octahedral group; `hosvd` followed by `to_full`
 reproduces a random tensor within `tol_HOSVD`; the circulant embedding of a
-Toeplitz tensor reproduces the dense product. `_directfn` is exercised on a pair
-of coincident, edge-adjacent and vertex-adjacent triangles and its result
-compared with a brute-force quadrature at large separation, where the singular
-treatment must reduce to the smooth one.
+Toeplitz tensor reproduces the dense product.
+
+`_directfn` has no smooth limit to be compared against: its edge-adjacent and
+vertex-adjacent kernels take elements that touch, so there is no separation to
+take large. It is checked instead by the invariants that catch a binding fault
+and by convergence. Every kernel is invariant under a rigid motion of the whole
+configuration, which a vertex array read with the wrong stride or the wrong
+order would break, and every kernel converges as the quadrature order rises,
+which swapped weights and nodes would break. The triangle self term reaches
+machine precision by order 12; the edge and vertex terms converge more slowly
+and not monotonically, so their check is a trend rather than a step-by-step
+decrease. The voxel kernels are invariant under translation but *not* under
+rotation, because their reduced kernel index and scalar basis terms are defined
+against the cell's own axes; a test states that, so the body grid is not
+quietly turned later.
+
+These kernels divide by the wavenumber, which therefore may not be zero.
 
 **Stage 2 — body solver and the Mie test.**
 `body.py`, `vie.py`, `gmres.py`, `preconditioner.py`, and the incident-field and
