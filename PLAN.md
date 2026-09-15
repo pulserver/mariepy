@@ -164,12 +164,23 @@ it was measured on.
 
 | Check | Reference | Pass criterion |
 |---|---|---|
-| Body solver | Analytic Mie series for a homogeneous sphere, then a layered sphere, in a plane-wave incident field | Relative L2 error of E inside the sphere falls monotonically over three voxel sizes, and on the coarsest stays at or below its recorded value |
+| Body solver | Analytic Mie series for a homogeneous sphere, then a layered sphere, in a plane-wave incident field | Relative L2 error of E inside the sphere falls monotonically over three voxel sizes, and on the coarsest stays at or below its recorded value. Measured over the interior, for the reason below |
 | Linear solve | – | Final GMRES relative residual at or below `tol` for every port |
 | Compressed body operator | The uncompressed kernel on a small grid | Operator applied to random currents agrees within `tol_HOSVD` |
 | Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the helper functions each source repeats are made local with `objcopy --localize-symbol` so all variants link into one test binary | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
 | Coil matrix | – | Each interaction block equals the independently computed transposed pair within `tol`, before `Z + Zᵀ` is formed; port impedances converge as the mesh is refined |
 | Coupled system | – | The port matrix is reciprocal within `tol` before `(Ip + Ipᵀ)/2` is formed; body-absorbed power integrated from E equals the absorbed power predicted from the port currents, within `tol` |
+
+**What the piecewise-constant basis costs at a boundary.** The normal electric
+field jumps across a dielectric boundary by the contrast ratio, and this basis
+puts that jump on a staircase. The error is therefore concentrated in the
+boundary voxels, falls about as fast as the voxel size, and grows with contrast:
+a sphere at brain-like permittivity needs far more than ten voxels across its
+radius before its interior field is worth quoting, while at a permittivity of 2
+ten voxels already suffice. MARIE's own example runs the piecewise-linear basis
+at 2 mm for this reason. The Mie criterion is therefore measured over the
+interior rather than over every voxel, and the refinement legs carry the grids
+they were measured on.
 
 **Milestone 2.**
 

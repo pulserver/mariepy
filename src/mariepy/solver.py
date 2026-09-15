@@ -1,0 +1,200 @@
+"""Driving the body solver.
+
+Ported from MARIE 3.0's ``src_solver/src_ie_solver/ie_solver_vie/
+ie_solver_vie.m`` and ``src_solver/src_mvp/mvp_vie/mvp_vie.m``.
+
+With no coil present the body is driven by an incident field, and the volume
+integral equation is solved for the polarisation current it induces. That is the
+configuration the analytic Mie series covers, and the one the solver is checked
+against.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import torch
+
+from mariepy import vie
+from mariepy.body import VoxelBody
+from mariepy.constants import Medium
+from mariepy.gmres import Solution, gmres
+from mariepy.preconditioner import body_diagonal
+from mariepy.tucker import CirculantSymbol, circulant_tucker
+
+__all__ = ["BodyOperator", "solve_body"]
+
+
+@dataclass(frozen=True)
+class BodyOperator:
+    """The volume integral operator of one body at one frequency.
+
+    Attributes
+    ----------
+    body
+        The grid and its contrast.
+    medium
+        The frequency the kernel was built at.
+    symbols
+        The compressed N kernel.
+    """
+
+    body: VoxelBody
+    medium: Medium
+    symbols: tuple[CirculantSymbol, ...]
+
+    @classmethod
+    def build(
+        cls,
+        body: VoxelBody,
+        medium: Medium,
+        *,
+        tol: float = 1e-7,
+        far_order: int = 4,
+        medium_order: int = 8,
+        near_order: int = 15,
+    ) -> BodyOperator:
+        """Assemble and compress the kernel for one body.
+
+        Parameters
+        ----------
+        body
+            The grid to build the kernel on.
+        medium
+            Supplies the wavenumber.
+        tol
+            Relative tolerance of the Tucker compression.
+        far_order, medium_order, near_order
+            Quadrature orders for the three regimes.
+
+        Returns
+        -------
+        BodyOperator
+            Ready to apply.
+        """
+        kernel = vie.kernel_n(
+            body.shape,
+            body.resolution,
+            medium.wavenumber,
+            far_order=far_order,
+            medium_order=medium_order,
+            near_order=near_order,
+        )
+        return cls(
+            body=body,
+            medium=medium,
+            symbols=circulant_tucker(kernel.to(body.device), tol),
+        )
+
+    def __call__(self, current: torch.Tensor) -> torch.Tensor:
+        """Apply the operator to a solution vector.
+
+        The equation is ``J - Mc/Mr * G^-1 N J = ce * Mc/Mr * E_inc``, which is
+        MARIE's ``mvp_vie.m`` with its contrast written out.
+
+        Parameters
+        ----------
+        current
+            Shape ``(3 * n_voxels,)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Same shape.
+        """
+        field = self.body.from_dof(current)
+        applied = vie.apply_n(self.symbols, field)
+        contrast = self.body.contrast(self.medium)
+        reduced = contrast.reduced.unsqueeze(0)
+        scattered = reduced * vie.apply_inverse_g(applied, self.body.resolution)
+        return current - self.body.to_dof(scattered)
+
+    def right_hand_side(self, incident: torch.Tensor) -> torch.Tensor:
+        """Turn an incident electric field into the solver's right-hand side.
+
+        Parameters
+        ----------
+        incident
+            Shape ``(3, n1, n2, n3)``, the incident electric field.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(3 * n_voxels,)``.
+        """
+        contrast = self.body.contrast(self.medium)
+        scaling = torch.tensor(
+            self.medium.electric_scaling,
+            device=incident.device,
+            dtype=torch.complex128,
+        )
+        driven = scaling * contrast.reduced.unsqueeze(0) * incident
+        return self.body.to_dof(driven)
+
+    def total_field(
+        self, current: torch.Tensor, incident: torch.Tensor
+    ) -> torch.Tensor:
+        """Return the total electric field the solved current implies.
+
+        The scattered field is ``G^-1 (N J - G J) / (j omega eps_0)``, as
+        MARIE's ``em_efield_vie_excitation.m`` forms it.
+
+        Parameters
+        ----------
+        current
+            Shape ``(3 * n_voxels,)``, the solved polarisation current.
+        incident
+            Shape ``(3, n1, n2, n3)``, the field that drove it.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(3, n1, n2, n3)``, zero outside the mask.
+        """
+        scaling = torch.tensor(
+            self.medium.electric_scaling, device=current.device, dtype=torch.complex128
+        )
+        polarisation = self.body.from_dof(current)
+        applied = vie.apply_n(self.symbols, polarisation)
+        scattered = vie.apply_inverse_g(
+            (applied - vie.apply_g(polarisation, self.body.resolution)) / scaling,
+            self.body.resolution,
+        )
+        return self.body.mask.unsqueeze(0) * (incident + scattered)
+
+
+def solve_body(
+    operator: BodyOperator,
+    incident: torch.Tensor,
+    *,
+    tol: float = 1e-5,
+    restart: int = 50,
+    maxit: int = 200,
+) -> Solution:
+    """Solve for the polarisation current an incident field induces.
+
+    Parameters
+    ----------
+    operator
+        The body operator.
+    incident
+        Shape ``(3, n1, n2, n3)``, the incident electric field.
+    tol
+        Target for the preconditioned relative residual.
+    restart, maxit
+        Passed to :func:`mariepy.gmres.gmres`.
+
+    Returns
+    -------
+    mariepy.gmres.Solution
+        The solved current and the residual history.
+    """
+    diagonal = body_diagonal(operator.body, operator.medium)
+    return gmres(
+        operator,
+        operator.right_hand_side(incident),
+        preconditioner=lambda vector: diagonal * vector,
+        tol=tol,
+        restart=restart,
+        maxit=maxit,
+    )

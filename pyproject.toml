@@ -62,7 +62,9 @@ fallback_version = "0.0.0.dev0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers"
+# `slow` is deselected here rather than only described below, so that the
+# marker means what it says. `pytest -m slow` runs those, `-m ""` runs all.
+addopts = "-ra --strict-markers -m 'not slow'"
 markers = [
   "cuda: needs a CUDA device; skipped when none is present",
   "slow: excluded from the default run",
