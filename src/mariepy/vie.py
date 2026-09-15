@@ -612,7 +612,7 @@ def surface_surface_n(
                     wavenumber,
                     resolution,
                     order,
-                    1,
+                    _DIRECTFN_KERNEL_N,
                     0,
                     0,
                 )
@@ -634,23 +634,14 @@ def _non_singular_face_pair(
     """Integrate the scalar Green function over a pair of faces that do not touch."""
     import numpy as _np
 
-    def points(centre, axis, first, second):
-        free = [value for value in range(3) if value != axis]
-        place = _np.empty((first.size, 3))
-        place[:, axis] = centre[axis]
-        place[:, free[0]] = centre[free[0]] + resolution / 2.0 * first
-        place[:, free[1]] = centre[free[1]] + resolution / 2.0 * second
-        return place
-
-    a, b, c, d = (
-        grid.reshape(-1) for grid in _np.meshgrid(*([nodes] * 4), indexing="ij")
-    )
-    weight = _np.ones(a.size)
-    for grid in _np.meshgrid(*([weights] * 4), indexing="ij"):
-        weight = weight * grid.reshape(-1)
-
-    separation = points(centre_observer, axis_observer, a, b) - points(
-        centre_source, axis_source, c, d
+    separation, weight = _face_pair_separation(
+        centre_observer,
+        centre_source,
+        axis_observer,
+        axis_source,
+        resolution,
+        nodes,
+        weights,
     )
     distance = _np.linalg.norm(separation, axis=1)
     green = _np.exp(-1j * wavenumber * distance) / (4.0 * _np.pi * distance)
@@ -706,19 +697,44 @@ def kernel_n(
     torch.Tensor
         Shape ``(n1, n2, n3, 6)``, complex, in the order xx, xy, xz, yy, yz, zz.
     """
+    return _assemble(
+        shape,
+        resolution,
+        wavenumber,
+        far_order,
+        medium_order,
+        near_order,
+        volume_volume_n,
+        surface_surface_n,
+        6,
+    )
+
+
+def _assemble(
+    shape,
+    resolution,
+    wavenumber,
+    far_order,
+    medium_order,
+    near_order,
+    by_volume,
+    by_surface,
+    n_components,
+):
+    """Fill every offset of a grid from the regime that is valid there."""
     import itertools as _itertools
 
-    kernel = torch.zeros((*shape, 6), dtype=torch.complex128)
+    kernel = torch.zeros((*shape, n_components), dtype=torch.complex128)
     near = tuple(_itertools.product(*(range(min(2, n)) for n in shape)))
-
     offsets = [
         cell
         for cell in _itertools.product(*(range(n) for n in shape))
         if cell not in near
     ]
+
     if offsets:
         index = torch.tensor(offsets, dtype=torch.float64)
-        far = volume_volume_n(resolution * index, resolution, wavenumber, far_order)
+        far = by_volume(resolution * index, resolution, wavenumber, far_order)
         for row, cell in enumerate(offsets):
             kernel[cell] = far[row]
 
@@ -727,13 +743,253 @@ def kernel_n(
         ]
         if medium:
             index = torch.tensor(medium, dtype=torch.float64)
-            refined = volume_volume_n(
+            refined = by_volume(
                 resolution * index, resolution, wavenumber, medium_order
             )
             for row, cell in enumerate(medium):
                 kernel[cell] = refined[row]
 
     for cell in near:
-        kernel[cell] = surface_surface_n(cell, resolution, wavenumber, near_order)
+        kernel[cell] = by_surface(cell, resolution, wavenumber, near_order)
 
     return kernel
+
+
+# The three components of the curl, as the pair of Cartesian directions each one
+# tests. Anti-symmetry leaves three distinct interactions rather than six.
+_CURL_COMPONENT_AXES = ((2, 1), (0, 2), (1, 0))
+
+# Which reduced kernel of DIRECTFN each operator's surviving surface-surface
+# term asks for. `Kernels.cpp` branches on 0 through 8.
+_DIRECTFN_KERNEL_N = 1
+_DIRECTFN_KERNEL_K = 5
+
+
+def curl_surface_coefficient(face_source: int, component: int) -> float:
+    """Return the constant the surface-surface integral of one face pair carries.
+
+    Ported from MARIE's ``coefficients_Kop.m``. As for the N operator, only the
+    first of its four surface-surface kernels survives the piecewise-constant
+    basis, and this one depends on the source face alone.
+
+    Parameters
+    ----------
+    face_source
+        Face of the source cell.
+    component
+        Which component of the curl, in the order x, y, z.
+
+    Returns
+    -------
+    float
+        ``(e_p x e_q) . n'`` for that face and component.
+    """
+    import numpy as _np
+
+    p, q = _CURL_COMPONENT_AXES[component]
+    return float(
+        _np.dot(
+            _np.cross(_np.eye(3)[p], _np.eye(3)[q]),
+            _np.array(_FACE_NORMALS[face_source]),
+        )
+    )
+
+
+def surface_surface_k(
+    offset_cells,
+    resolution: float,
+    wavenumber: float,
+    order: int = 15,
+) -> torch.Tensor:
+    """Integrate the K kernel over two cells by their faces.
+
+    The counterpart of :func:`surface_surface_n` for the curl operator. Its
+    integrand contracts the separation with the *observation* face normal where
+    the dyadic operator's contracts with the source's.
+
+    Parameters
+    ----------
+    offset_cells
+        Whole-cell offset from the source cell to the observation cell.
+    resolution
+        Cell pitch in metres.
+    wavenumber
+        Free-space wavenumber in rad/m.
+    order
+        Points per axis, for the four-dimensional rule and for DIRECTFN alike.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(3,)``, complex, in the order x, y, z.
+    """
+    import numpy as _np
+
+    from mariepy import _accelerators
+
+    directfn = _accelerators.require(module="mariepy._directfn")
+    weights, nodes = gauss_legendre_1d(order)
+    weights, nodes = weights.numpy(), nodes.numpy()
+
+    centre_observer = _np.array([resolution * value for value in offset_cells])
+    total = _np.zeros(3, dtype=complex)
+
+    for face_observer in range(6):
+        for face_source in range(6):
+            coefficients = _np.array(
+                [
+                    curl_surface_coefficient(face_source, component)
+                    for component in range(3)
+                ]
+            )
+            if not _np.any(coefficients):
+                continue
+
+            kind, points = face_adjacency(
+                offset_cells, face_observer, face_source, resolution
+            )
+            normal_source = _np.array(_FACE_NORMALS[face_source])
+            normal_observer = _np.array(_FACE_NORMALS[face_observer])
+
+            if kind is None:
+                value = _non_singular_curl_face_pair(
+                    centre_observer + normal_observer * resolution / 2.0,
+                    normal_source * resolution / 2.0,
+                    face_observer // 2,
+                    face_source // 2,
+                    normal_observer,
+                    resolution,
+                    wavenumber,
+                    weights,
+                    nodes,
+                )
+            else:
+                vertices = _np.array(points, dtype=float)
+                routine, observer_centre = _singular_call(kind, vertices, directfn)
+                value = routine(
+                    vertices,
+                    (vertices[0] + vertices[2]) / 2.0,
+                    observer_centre,
+                    normal_source,
+                    normal_observer,
+                    wavenumber,
+                    resolution,
+                    order,
+                    _DIRECTFN_KERNEL_K,
+                    0,
+                    0,
+                )
+            total += coefficients * value
+
+    return torch.tensor(total, dtype=torch.complex128)
+
+
+def _non_singular_curl_face_pair(
+    centre_observer,
+    centre_source,
+    axis_observer,
+    axis_source,
+    normal_observer,
+    resolution,
+    wavenumber,
+    weights,
+    nodes,
+):
+    """Integrate the curl kernel over a pair of faces that do not touch."""
+    import numpy as _np
+
+    separation, weight = _face_pair_separation(
+        centre_observer,
+        centre_source,
+        axis_observer,
+        axis_source,
+        resolution,
+        nodes,
+        weights,
+    )
+    distance = _np.linalg.norm(separation, axis=1)
+    green = _np.exp(-1j * wavenumber * distance) / (4.0 * _np.pi * distance)
+    static = 1.0 / (4.0 * _np.pi * distance)
+
+    radial = (
+        -1j * wavenumber * green / distance - green / distance**2 + static / distance**2
+    ) / (1j * wavenumber) ** 2
+    contracted = separation @ normal_observer * radial
+    return (resolution / 2.0) ** 4 * _np.sum(weight * contracted)
+
+
+def _face_pair_separation(
+    centre_observer,
+    centre_source,
+    axis_observer,
+    axis_source,
+    resolution,
+    nodes,
+    weights,
+):
+    """Return the separation at every point of the four-dimensional rule."""
+    import numpy as _np
+
+    def place(centre, axis, first, second):
+        free = [value for value in range(3) if value != axis]
+        point = _np.empty((first.size, 3))
+        point[:, axis] = centre[axis]
+        point[:, free[0]] = centre[free[0]] + resolution / 2.0 * first
+        point[:, free[1]] = centre[free[1]] + resolution / 2.0 * second
+        return point
+
+    a, b, c, d = (
+        grid.reshape(-1) for grid in _np.meshgrid(*([nodes] * 4), indexing="ij")
+    )
+    weight = _np.ones(a.size)
+    for grid in _np.meshgrid(*([weights] * 4), indexing="ij"):
+        weight = weight * grid.reshape(-1)
+
+    separation = place(centre_observer, axis_observer, a, b) - place(
+        centre_source, axis_source, c, d
+    )
+    return separation, weight
+
+
+def kernel_k(
+    shape: tuple[int, int, int],
+    resolution: float,
+    wavenumber: float,
+    *,
+    far_order: int = 4,
+    medium_order: int = 8,
+    near_order: int = 15,
+) -> torch.Tensor:
+    """Assemble the K kernel at every offset of a grid.
+
+    The three regimes of :func:`kernel_n`, for the curl operator.
+
+    Parameters
+    ----------
+    shape
+        Grid shape; the kernel is stored at every non-negative offset.
+    resolution
+        Cell pitch in metres.
+    wavenumber
+        Free-space wavenumber in rad/m.
+    far_order, medium_order
+        Points per axis for the two volume-volume passes.
+    near_order
+        Points per axis for the surface-surface pass.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(n1, n2, n3, 3)``, complex, in the order x, y, z.
+    """
+    return _assemble(
+        shape,
+        resolution,
+        wavenumber,
+        far_order,
+        medium_order,
+        near_order,
+        volume_volume_k,
+        surface_surface_k,
+        3,
+    )

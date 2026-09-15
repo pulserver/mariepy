@@ -267,3 +267,75 @@ def test_the_assembled_kernel_falls_away_with_distance():
     )
     magnitudes = [abs(kernel[offset, 0, 0, 0].item()) for offset in range(5)]
     assert all(later < earlier for earlier, later in itertools.pairwise(magnitudes))
+
+
+@pytest.mark.parametrize("offset", [(2, 0, 0), (2, 1, 0), (3, 2, 1)])
+def test_the_curl_reduction_agrees_with_the_volume_rule_where_both_hold(offset):
+    """Two independent forms of the curl operator, away from the singularity."""
+    reduced = vie.surface_surface_k(offset, RESOLUTION, WAVENUMBER, order=12)
+    direct = vie.volume_volume_k(
+        RESOLUTION * torch.tensor([offset], dtype=torch.float64),
+        RESOLUTION,
+        WAVENUMBER,
+        order=10,
+    )[0]
+    error = torch.linalg.vector_norm(reduced - direct)
+    assert error <= 1e-10 * torch.linalg.vector_norm(direct)
+
+
+def test_the_curl_self_term_vanishes():
+    """The curl kernel is odd, so a cell against itself cancels exactly."""
+    value = vie.surface_surface_k((0, 0, 0), RESOLUTION, WAVENUMBER, order=6)
+    assert torch.all(value.abs() <= 1e-24)
+
+
+def test_the_curl_self_term_of_the_dyadic_operator_does_not_vanish():
+    """The contrast that makes the previous test meaningful rather than vacuous."""
+    value = vie.surface_surface_n((0, 0, 0), RESOLUTION, WAVENUMBER, order=6)
+    assert abs(value[0]) > 0
+
+
+def test_the_curl_kernel_treats_the_three_axes_alike_on_the_diagonal():
+    """An offset along (1, 1, 1) is symmetric under permuting the axes."""
+    value = vie.surface_surface_k((1, 1, 1), RESOLUTION, WAVENUMBER, order=6)
+    assert value[0].item() == pytest.approx(value[1].item(), rel=1e-12)
+    assert value[0].item() == pytest.approx(value[2].item(), rel=1e-12)
+
+
+def test_the_curl_coefficient_picks_out_the_face_normal():
+    """``(e_p x e_q) . n'`` is non-zero only on the two faces normal to it."""
+    for component in range(3):
+        nonzero = [
+            face for face in range(6) if vie.curl_surface_coefficient(face, component)
+        ]
+        assert nonzero == [2 * component, 2 * component + 1]
+
+
+def test_the_assembled_curl_kernel_is_finite_at_every_offset():
+    kernel = vie.kernel_k(
+        (4, 4, 4), RESOLUTION, WAVENUMBER, far_order=3, medium_order=4, near_order=5
+    )
+    assert kernel.shape == (4, 4, 4, 3)
+    assert torch.all(torch.isfinite(kernel))
+
+
+def test_the_assembled_curl_kernel_takes_its_near_block_from_the_reduction():
+    kernel = vie.kernel_k(
+        (3, 3, 3), RESOLUTION, WAVENUMBER, far_order=3, medium_order=3, near_order=5
+    )
+    for cell in _cells(2):
+        expected = vie.surface_surface_k(cell, RESOLUTION, WAVENUMBER, order=5)
+        assert torch.allclose(kernel[cell], expected)
+
+
+def test_both_assemblies_fill_the_same_offsets_from_the_same_regimes():
+    """N and K share one assembly, so their near blocks cover the same cells."""
+    shape = (3, 3, 3)
+    dyadic = vie.kernel_n(
+        shape, RESOLUTION, WAVENUMBER, far_order=3, medium_order=3, near_order=5
+    )
+    curl = vie.kernel_k(
+        shape, RESOLUTION, WAVENUMBER, far_order=3, medium_order=3, near_order=5
+    )
+    assert dyadic.shape[:3] == curl.shape[:3]
+    assert torch.all(torch.isfinite(dyadic)) and torch.all(torch.isfinite(curl))
