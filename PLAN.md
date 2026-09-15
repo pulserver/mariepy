@@ -209,9 +209,10 @@ its recorded value and the `slow` leg checks that the error falls with
 refinement. A failing check reports the measured error and the grid.
 
 **Acceptance.** A stage is accepted on the evidence its own checks produce, not
-on a reading of the physics by whoever merges it. Each stage lands as its own
-pull request carrying the checks its table above states, and merges when they
-pass. Where a stage meets something these criteria do not settle — a quantity
+on a reading of the physics by whoever merges it. A stage lands as one or more
+pull requests, each carrying the checks its table above states and merging when
+they pass; a stage splits where vendored sources would otherwise bury the code
+written here. Where a stage meets something these criteria do not settle — a quantity
 with no reference, a choice between two defensible conventions — the pull
 request states the reading it took and why, in `PLAN.md` where the reading is a
 design decision and in the test name where it is an invariant.
