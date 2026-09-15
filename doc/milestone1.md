@@ -153,9 +153,8 @@ function, `etod` signs are opposite across each shared edge, and the divergence
 of the basis integrates to zero over the pair of triangles. The port impedance
 matrix is checked for convergence as the mesh is refined, and the four
 interaction blocks — non-singular, edge-adjacent, vertex-adjacent, self — are
-each checked against the transposed pair computed independently. (See the open
-question in section 6: `Assembly_SIE_par.m` symmetrises `Z` explicitly, so
-symmetry of the assembled matrix is not by itself evidence of anything.)
+each checked against the transposed pair computed independently, before
+`Assembly_SIE_par.m`'s `Z + Zᵀ` is formed — see decision 1 in section 6.
 
 **Stage 4 — coupling kernels.**
 `src/cpp/coupling.cpp`, `src/cpp/collocation.cpp`, bound into `_ext`. Checked
@@ -269,9 +268,9 @@ them needs to be.
   `(±1, ±1, ±1)/√3` corners. `quadrature.lebedev_26_directions` generates them,
   with no table and no licence question.
 - `dunavant_*.m` carries the LGPL notice. Its rules are taken from Dunavant
-  (1985), as `PLAN.md` and `THIRD_PARTY.md` already allow, and checked by
-  polynomial exactness rather than against the MATLAB files. Degrees 1 to 6
-  cover milestone 1, which uses `Quad_order_sie = 4`.
+  (1985), as `PLAN.md` and `THIRD_PARTY.md` record, and checked by polynomial
+  exactness rather than against the MATLAB files. Degrees 1 to 6 cover
+  milestone 1, which uses `Quad_order_sie = 4`.
 
 The DIRECTFN sources and the RWG singular integrals stay LGPL, unmodified, in
 `_directfn`.
@@ -379,34 +378,44 @@ slice of the output, replacing MARIE's `#pragma omp parallel for`. No locks and
 no atomics, so the result does not depend on the thread count — a test asserts
 that for one and for many.
 
-## 6. Open questions for review
+## 6. Decisions taken
 
-1. **Two of the validation criteria in `PLAN.md` are not independent checks.**
+Four points where MARIE's reference leaves a choice. `PLAN.md` carries the ones
+that are design decisions; the rest are recorded here.
+
+1. **Two of `PLAN.md`'s milestone 1 validation criteria did not test what they
+   claimed, and the table now states the checks that do.**
    `Assembly_SIE_par.m` computes the non-singular, edge-adjacent and
    vertex-adjacent blocks for one triangle ordering and then sets
-   `Z = Z + Z.'`, and `np_compute.m` sets `YP_s = (Ip + Ip.')/2`. A port that
-   copies both will pass "port impedance matrix symmetric within `tol`" and
-   "coupled port matrix symmetric within `tol`" no matter what the physics says.
-   Section 3 proposes the checks that do bite — each interaction block against
-   the independently computed transposed pair, and reciprocity of `Ip` *before*
-   the symmetrisation. If that is right, `PLAN.md`'s milestone-1 validation table
-   should say so, in the pull request that ports the code.
+   `Z = Z + Z.'`; `np_compute.m` sets `YP_s = (Ip + Ip.')/2`. A port that copies
+   both — and it should, they are how MARIE builds the operators — satisfies
+   "port impedance matrix symmetric within `tol`" and "coupled port matrix
+   symmetric within `tol`" for any physics whatever. The criteria are now
+   reciprocity of each interaction block against the independently computed
+   transposed pair, and reciprocity of `Ip` before the symmetrisation. Stage 3
+   and stage 6 check those.
 
-2. **The K coupling operator is assembled but unused in the solve.**
-   `mvp_svie_pfft.m` applies only `pfft_Z_bc_N`; `pfft_Z_bc_K` first appears in
-   `em_hfield_svie_pfft.m`. Milestone 1 assembles both, as MARIE does. Worth
-   confirming that the H field is wanted from the same solve rather than from a
-   cheaper post-processing pass.
+2. **Both coupling operators are assembled, as MARIE assembles them.**
+   `mvp_svie_pfft.m` applies only `pfft_Z_bc_N`; `pfft_Z_bc_K` is first used in
+   `em_hfield_svie_pfft.m`. Since milestone 1 delivers the H field, K is needed
+   whether or not the solve touches it, and assembling it alongside N costs one
+   more pass over the same near lists and the same quadrature points.
 
-3. **GMRES breakdown.** `is_iter_gmres_svie.m` divides by `H(k+1,k)` without
-   testing it, and solves the least-squares problem with an economy SVD of the
-   Hessenberg (`fast_pinv.m`) rather than Givens rotations. The port keeps the
-   SVD, which torch does well, and adds a happy-breakdown exit when `H(k+1,k)`
-   falls below the working precision. That is a deviation from the reference and
-   is recorded here rather than buried in the code.
+3. **GMRES exits on a happy breakdown.**
+   `is_iter_gmres_svie.m` divides by `H(k+1,k)` without testing it, and solves
+   the least-squares problem with an economy SVD of the Hessenberg
+   (`fast_pinv.m`) rather than Givens rotations. The port keeps the SVD, which
+   torch does well, and returns the iterate when `H(k+1,k)` falls below the
+   working precision — the Krylov space is then invariant and the iterate is
+   exact. `PLAN.md` records the deviation under **GMRES**.
 
-4. **The `slow` marker on the Mie refinement.** `PLAN.md` puts refinement studies
-   behind `slow`, and the pass criterion is monotone decrease over three voxel
-   sizes — which only the `slow` leg measures. The default run therefore checks
-   the coarsest grid against its recorded value only. Confirming that reading
-   before stage 2 starts.
+4. **The Mie criterion splits across the two test legs.**
+   `PLAN.md` puts refinement studies behind the `slow` marker, and the milestone
+   1 criterion is monotone decrease over three voxel sizes *and* a bound on the
+   coarsest. The default run checks the coarsest grid against its recorded
+   value; the `slow` leg checks that the error falls with refinement.
+   `PLAN.md`'s **Test layout** now says so.
+
+A fifth decision sits in section 4.2 and in `PLAN.md`'s **Excluded** list rather
+than here: `gauss_1d.m` and `getLebedevSphere.m` ship without a licence, so
+neither is ported, and the rules they carry are obtained from first principles.
