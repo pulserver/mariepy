@@ -1,9 +1,11 @@
 """Loading the compiled kernels that ship inside the wheel.
 
-``mariepy._ext`` is one extension module, built for each interpreter this
-package supports. A kernel that will not import therefore means a broken
-installation -- most often a wheel built for one interpreter imported from
-another -- and never an optional extra a caller may reasonably do without.
+The package ships two extension modules, each built for every interpreter it
+supports: ``mariepy._ext`` holds the MIT kernels, and ``mariepy._directfn`` the
+DIRECTFN singular integrals, which carry their own licence. A kernel that will
+not import therefore means a broken installation -- most often a wheel built
+for one interpreter imported from another -- and never an optional extra a
+caller may reasonably do without.
 
 :func:`require` says so, naming the mismatch, rather than letting a caller
 fall through to a slower Python path whose only symptom is unexplained
@@ -19,23 +21,24 @@ from typing import Any
 
 __all__ = ["require"]
 
-_MODULE = "mariepy._ext"
+_DEFAULT_MODULE = "mariepy._ext"
 
 
-def _installed_tags() -> list[str]:
+def _installed_tags(module: str) -> list[str]:
     """Return the ABI tags of the extension builds present beside the package."""
     suffix = ".pyd" if sys.platform == "win32" else ".so"
+    stem = module.rpartition(".")[2]
     package = import_module("mariepy")
     tags = set()
     for directory in getattr(package, "__path__", ()):
-        for path in Path(directory).glob(f"_ext.*{suffix}"):
+        for path in Path(directory).glob(f"{stem}.*{suffix}"):
             parts = path.name.split(".")
             if len(parts) >= 3:
                 tags.add(parts[1])
     return sorted(tags)
 
 
-def require(attribute: str | None = None) -> Any:
+def require(attribute: str | None = None, module: str = _DEFAULT_MODULE) -> Any:
     """Load the bundled accelerator, or raise naming the mismatch.
 
     Parameters
@@ -43,6 +46,9 @@ def require(attribute: str | None = None) -> Any:
     attribute
         Symbol the caller needs. Checked here, so a binary that predates the
         symbol fails at the load rather than at the call.
+    module
+        Which extension to load: ``mariepy._ext`` for the MIT kernels, or
+        ``mariepy._directfn`` for the DIRECTFN singular integrals.
 
     Returns
     -------
@@ -56,22 +62,22 @@ def require(attribute: str | None = None) -> Any:
         not provide ``attribute``.
     """
     try:
-        module = import_module(_MODULE)
+        loaded = import_module(module)
     except ImportError as error:
-        installed = _installed_tags()
+        installed = _installed_tags(module)
         found = ", ".join(installed) if installed else "none"
         raise ImportError(
-            f"the bundled accelerator did not load. Running "
+            f"the bundled accelerator {module} did not load. Running "
             f"{sys.implementation.cache_tag}, builds present: {found}. "
             f"This package ships the kernels for every interpreter it "
             f"supports, so install the distribution matching this one."
         ) from error
     if attribute is None:
-        return module
+        return loaded
     try:
-        return getattr(module, attribute)
+        return getattr(loaded, attribute)
     except AttributeError as error:
         raise ImportError(
-            f"the bundled accelerator does not provide {attribute!r}; "
-            f"the installed binary predates it."
+            f"the bundled accelerator {module} does not provide "
+            f"{attribute!r}; the installed binary predates it."
         ) from error
