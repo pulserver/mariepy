@@ -7,8 +7,8 @@ E and H fields.
 
 `PLAN.md` states the scope, the validation criteria and the constraints. This
 note fixes the module layout, the order in which the stages are built and
-checked, the MARIE-to-mariepy mapping, and the signatures of the compiled
-coupling kernels. No solver code lands with it.
+checked, the MARIE-to-mariepy mapping, the signatures of the coupling kernels,
+and the readings taken where MARIE's reference leaves a choice.
 
 MARIE's reference is <https://github.com/cloudmrhub/marie-tools> (MIT). File
 paths below are relative to its `src/`.
@@ -52,7 +52,6 @@ src/mariepy/
     __init__.py
     _accelerators.py        loads mariepy._ext and mariepy._directfn
     constants.py            nucleus table, Larmor frequency, medium constants
-    settings.py             tolerances and quadrature orders
     quadrature.py           Gauss-Legendre, triangle rules, Dunavant, Lebedev
     tucker.py               HOSVD, n-mode product, circulant FFT embedding
     mesh.py                 GMSH 2.2 reader, triangle geometry, meshes in code
@@ -187,10 +186,13 @@ where the expansion cells and the body do not overlap; the final GMRES relative
 residual is at or below `tol` for every port.
 
 **Stage 6 — fields and power balance.**
-`fields.py`. Checks: the power absorbed in the body, integrated from E as
-`½ σ |E|²` over the voxels, equals the absorbed power predicted from the port
-currents, within `tol`; and the coupled port matrix is reciprocal before the
-symmetrisation `np_compute.m` applies.
+`fields.py`. Checks: the field in the body agrees with a direct integration of
+the coupling kernel and the body operator, taken without the projection; the
+power the body takes out of the coil's field equals the ohmic loss integrated
+from E as `½ σ |E|²` plus the power its own current puts back; and the port
+delivers more than the body absorbs. `PLAN.md`'s **Why the power balance is not
+closed at the port** paragraph says why the last of those is an inequality and
+not an equation.
 
 ## 4. Mapping from MARIE
 
@@ -202,7 +204,7 @@ Dunavant are already listed.
 
 | MARIE | mariepy |
 |---|---|
-| `src_utils/src_loaders/load_inputs.m` | `settings.Settings`, a frozen dataclass of `tol`, `tol_HOSVD`, quadrature orders and the pFFT kernel width, with `Settings.from_json` |
+| `src_utils/src_loaders/load_inputs.m` | not ported as a file: MARIE's tolerances and quadrature orders are the defaults of the functions that use them, and `solver.solve` takes `tol` and derives the rest as `load_inputs.m` does |
 | `src_physics/em_constants.m` | `constants.NUCLEI` table and `constants.Medium(b0, nucleus)` |
 | `src_utils/src_loaders/parse_inputs.m` | not ported: milestone 1 builds one path, so the dispatch has no branches to make. The branch it selects — coil present, no wire, no shield, `pFFT_flag` set — is the whole of `solver.solve` |
 | `src_geometry/geo_assembly.m` | `solver.build_geometry` |
@@ -242,7 +244,7 @@ Dunavant are already listed.
 | `src_pfft_coil/pfft_assemble_voxel_bc.m` | `pfft.projected_coupling`, over `pfft.expansion_response` |
 | `src_pfft_coil/pfft_assemble_voxel_cc.m` | `pfft.coil_precorrection` |
 | `src_wsvie/wsvie_coupling_assembly.m` | `pfft.assemble`, with `pfft.kernels` building both grids' kernels from one table |
-| `src_solver/src_ie_solver/solver_wsvie.m` | `solver.solve` |
+| `src_solver/src_ie_solver/solver_wsvie.m`, `src_runners/MARIE_runner.m` | `solver.solve` |
 | `src_solver/src_rhs/rhs_assembly.m` | `system.CoupledOperator.right_hand_side` |
 | `src_preconditioners/prec_wsvie.m`, `prec_LU.m` | `system.CoupledOperator.preconditioner`, which carries both blocks |
 | `src_preconditioners/prec_vie.m` | `preconditioner.body_diagonal` |
@@ -255,9 +257,9 @@ Dunavant are already listed.
 | `src_electronics/src_network_parameters/np_compute.m` | `network.port_parameters` |
 | `np_y2z.m`, `np_z2s.m`, `np_z2y.m` | `network.y_to_z`, `z_to_s`, `z_to_y` |
 | `src_electromagnetism/em_ehfield_wsvie.m` | `fields.compute` |
-| `em_efield/em_efield_svie/em_efield_svie_pfft.m` | `fields.electric` |
-| `em_hfield/em_hfield_svie/em_hfield_svie_pfft.m` | `fields.magnetic` |
-| `em_efield/em_efield_vie/em_efield_vie_excitation.m` | `fields.electric_from_body`, the Mie path |
+| `em_efield/em_efield_svie/em_efield_svie_pfft.m` | `fields.compute`, `fields.power_balance`, `fields.absorbed_power` |
+| `em_hfield/em_hfield_svie/em_hfield_svie_pfft.m` | `fields.compute`, `fields.circular_components` |
+| `em_efield/em_efield_vie/em_efield_vie_excitation.m` | `solver.BodyOperator.total_field`, the Mie path |
 | `src_utils/src_transformers/to_GPU.m`, `hh_mm_ss.m` | not ported; torch carries the device |
 
 Out of milestone 1 and not ported here: `co_simulation` and everything under
@@ -468,6 +470,17 @@ that are design decisions; the rest are recorded here.
    halved. Read the other way round — the rule normalised to one and the basis
    function written out — the two agree, and a test states the coupling as the
    field the basis function itself radiates.
+
+12. **The power balance is closed inside the body, not at the port.**
+   `PLAN.md`'s milestone 1 table asked for the body-absorbed power to equal
+   "the absorbed power predicted from the port currents". There is no such
+   prediction: the power a port delivers is spent on the conductor, on the body
+   and on radiation, and subtracting the coil's own dissipation leaves the
+   body's absorption plus the interference between the coil's radiation and the
+   body's, which needs a far field to separate. The criterion is now the balance
+   that is exact — extinction equals absorption plus scattering, inside the
+   body — together with the inequality at the port and a direct-integration
+   check on the field itself.
 
 A further decision sits in section 4.2 and in `PLAN.md`'s **Excluded** list rather
 than here: `gauss_1d.m` and `getLebedevSphere.m` ship without a licence, so

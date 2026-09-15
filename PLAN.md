@@ -172,7 +172,20 @@ it was measured on.
 | Compressed body operator | The uncompressed kernel on a small grid | Operator applied to random currents agrees within `tol_HOSVD` |
 | Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the three helper functions each source repeats are given internal linkage so all 24 variants link into one library | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
 | Coil matrix | Analytic Mie series for a perfectly conducting sphere in a plane-wave incident field | Each interaction block equals the independently computed transposed pair within `tol`, before `Z + Zᵀ` is formed; the scattering cross section falls monotonically towards the series over three mesh refinements and on the coarsest stays at or below its recorded value |
-| Coupled system | – | The port matrix is reciprocal within `tol` before `(Ip + Ipᵀ)/2` is formed; body-absorbed power integrated from E equals the absorbed power predicted from the port currents, within `tol` |
+| Coupled system | – | The port matrix is reciprocal within `tol` before `(Ip + Ipᵀ)/2` is formed; the field in the body agrees with a direct integration of the coupling kernel and the body operator, taken without the projection; the power the body takes out of the coil's field equals the ohmic loss integrated from E plus the power the body's own current puts back, within `tol` |
+
+**Why the power balance is not closed at the port.** The power a port
+delivers is spent on the conductor, on the body and on radiation, and the three
+cannot be separated from the port alone: the coil's field and the body's
+interfere, so what the pair radiates is not what the coil would radiate by
+itself plus what the body would. Subtracting the coil's own dissipation from the
+delivered power therefore leaves the body's absorption plus that interference,
+and the two cannot be told apart without a far field, which milestone 1 does not
+compute. What is exact, and is what the criterion above states, is the balance
+inside the body: the power it takes out of the coil's field equals what it turns
+to heat plus what its own current puts back. The port is checked instead by the
+inequality that must hold — it delivers more than the body absorbs — and by the
+field itself, against a direct integration.
 
 **Why the coil matrix is not checked at a port.** A delta-gap feed puts the
 whole drive on one ring of edges, and the charge that piles up there grows as
@@ -299,7 +312,11 @@ What this leaves uncovered is recorded rather than implied away:
   torch cannot batch runs in C++ in the pybind11 extension, on CPU buffers, and
   its result moves to the caller's device. Work that torch can batch stays in
   torch, where one code path runs on either device, and moves to C++ when a
-  profile shows it dominates, as **Loops** above says.
+  profile shows it dominates, as **Loops** above says. Milestone 1's own profile names the
+  first candidate: assembling the body kernel takes tens of seconds, nearly all
+  of it the six-dimensional volume-volume rule at `Np_1D_medium_V`, whose cost
+  is set by that order and by the 512 offsets it covers rather than by the size
+  of the grid.
 - **Arrays and units.** Arrays are C-ordered with the batch dimension first:
   (ports, …) and (N, Nc, Nc). Units are SI, and frequencies are in Hz.
 - **Provenance.** Every ported function names its MARIE source file in its
