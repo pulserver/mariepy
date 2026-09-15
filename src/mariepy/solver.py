@@ -20,9 +20,10 @@ from mariepy.body import VoxelBody
 from mariepy.constants import Medium
 from mariepy.gmres import Solution, gmres
 from mariepy.preconditioner import body_diagonal
+from mariepy.system import CoupledOperator
 from mariepy.tucker import CirculantSymbol, circulant_tucker
 
-__all__ = ["BodyOperator", "solve_body"]
+__all__ = ["BodyOperator", "PortSolution", "solve_body", "solve_ports"]
 
 
 @dataclass(frozen=True)
@@ -197,4 +198,78 @@ def solve_body(
         tol=tol,
         restart=restart,
         maxit=maxit,
+    )
+
+
+@dataclass(frozen=True)
+class PortSolution:
+    """The currents one coil drives, and how the solves went.
+
+    Attributes
+    ----------
+    coil
+        Surface-current coefficients, shape ``(n_ports, n_dof)``.
+    body
+        Polarisation current, shape ``(n_ports, 3 * n_voxels)``.
+    residual
+        Final relative residual of each port's solve.
+    iterations
+        Iterations each port's solve took.
+    """
+
+    coil: torch.Tensor
+    body: torch.Tensor
+    residual: tuple[float, ...]
+    iterations: tuple[int, ...]
+
+
+def solve_ports(
+    operator: CoupledOperator,
+    *,
+    tol: float = 1e-5,
+    restart: int = 50,
+    maxit: int = 200,
+) -> PortSolution:
+    """Drive each port in turn and solve the coupled system.
+
+    Ported from MARIE 3.0's ``src_solver/src_ie_solver/ie_solver_svie/
+    ie_solver_svie_pfft.m``.
+
+    Parameters
+    ----------
+    operator
+        The coupled operator.
+    tol
+        Target for the preconditioned relative residual.
+    restart
+        Iterations per restart cycle.
+    maxit
+        Maximum restart cycles.
+
+    Returns
+    -------
+    PortSolution
+        The coil and body currents of every port.
+    """
+    drives = operator.right_hand_side()
+    precondition = operator.preconditioner()
+    coil, body, residual, iterations = [], [], [], []
+    for row in range(drives.shape[0]):
+        solution = gmres(
+            operator,
+            drives[row],
+            preconditioner=precondition,
+            restart=restart,
+            tol=tol,
+            maxit=maxit,
+        )
+        coil.append(solution.x[: operator.n_coil])
+        body.append(solution.x[operator.n_coil :])
+        residual.append(float(solution.residuals[-1]))
+        iterations.append(len(solution.residuals) - 1)
+    return PortSolution(
+        coil=torch.stack(coil),
+        body=torch.stack(body),
+        residual=tuple(residual),
+        iterations=tuple(iterations),
     )
