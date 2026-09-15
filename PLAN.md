@@ -1,0 +1,305 @@
+# mariepy plan
+
+## Scope
+
+This package computes virtual observation points (VOPs) for the local and
+head-average SAR of multi-channel RF transmit coils. Given a coil model (a
+surface mesh with ports) and a population of head models, it:
+
+1. solves the electromagnetic problem for each port;
+2. forms each channel's field and the per-voxel Q matrices;
+3. averages them over 10 g;
+4. compresses them into VOPs;
+5. writes a file that pypulseqpp's `safety.check_sar` reads.
+
+The first milestone is a Python port of the path MARIE 3.0 takes by default: a
+surface-integral-equation coil around a piecewise-constant
+volume-integral-equation body, coupled by precorrected FFT. The later stages
+build on that solver once it reproduces an analytic sphere: Q matrices,
+averaging, compression, and head models from public MRI data.
+
+Out of scope: evaluating the SAR of pulse sequences, which pypulseqpp does;
+integration with any scanner; and models of specific commercial coils.
+
+## Output contract
+
+A VOP file is a NumPy `.npz` archive that pypulseqpp loads with
+`pypulseqpp.safety.read_vops`. It holds matrices and metadata. The metadata is a
+JSON string, so the archive loads without pickle.
+
+| Entry | Shape and type | Meaning |
+|---|---|---|
+| `vops` | (N, Nc, Nc), complex, Hermitian | Virtual observation points for 10 g local SAR |
+| `global_matrix` | (N_body, Nc, Nc), complex, Hermitian | Head-average SAR matrix of each body model |
+| `metadata` | JSON string | Coil identity, frequency, drive, method and provenance, below |
+
+**Units and convention.** Local SAR in W/kg for channel drive phasors v at peak
+amplitude is vᴴQv, with
+
+Q_ij = σ / (2ρ) · e_i* · e_j,
+
+where e_c is channel c's electric field per unit drive, σ the conductivity and ρ
+the mass density. The global matrices follow the same convention, averaged over
+each body model's head mass. Every matrix therefore has units of W/kg per unit
+drive squared.
+
+**Drive.** A channel's unit drive is set by how the channel is excited:
+
+- for a port-driven coil, 1 √W incident at the channel's input after the
+  matching network;
+- for a coil defined by fixed current patterns, one unit of that pattern.
+
+The unit must be the same for every channel. Channel order is the coil model's.
+
+**Metadata.**
+
+| Key | Content |
+|---|---|
+| `coil` | Identity string of the coil model |
+| `frequency_hz` | Frequency the fields were solved at |
+| `drive_unit` | Definition of a channel's unit drive |
+| `channels` | Channel names in matrix order |
+| `averaging` | Target mass and method |
+| `bodies` | Identifiers of the body models, in the order of `global_matrix` |
+| `compression_margin` | Overestimation allowed in VOP compression |
+| `mariepy_version` | Version that wrote the file |
+| `data_licence` | Licence of the file, set by its body models |
+
+Today `read_vops` reads a single (Nc, Nc) global matrix and no metadata. The
+stacked global matrices and the metadata need a pypulseqpp release that reads
+them.
+
+## MARIE port
+
+The port follows MARIE 3.0 (<https://github.com/cloudmrhub/marie-tools>, MIT).
+Milestone 1 is its case for a surface coil around a voxel body, with no wire
+coil and no shield, and precorrected FFT coupling. MARIE picks that case in
+`src_utils/src_loaders/parse_inputs.m`. Its runner,
+`src_runners/MARIE_runner.m`, calls the stages in order:
+
+| Stage | MARIE entry point | Functions on this path |
+|---|---|---|
+| Inputs | `load_inputs` | JSON simulation file, body `.mat`, coil mesh and its lumped-element JSON |
+| Geometry | `geo_assembly` | body voxel grid; GMSH 2.2 surface mesh parsed into RWG edges and ports |
+| Operators | `wsvie_assembly` | body kernel tensors `assembly_N`, `assembly_K` and their Tucker/FFT form `assembly_fft_circ_tucker_pwc`; coil matrix `Assembly_SIE_par`; coil–body coupling in `src_wsvie/src_pfft/src_svie_pfft`, `src_pfft_coil` and `src_pfft_supporting` |
+| Solve | `solver_wsvie` | preconditioner `prec_wsvie`, right-hand sides `rhs_assembly`, one GMRES solve per port through `ie_solver_svie_pfft` and `mvp_svie_pfft` |
+| Network | `np_compute` | Y, Z and S parameters of the ports |
+| Fields | `em_ehfield_wsvie` | `em_efield_svie_pfft`, `em_hfield_svie_pfft` |
+
+**Milestones.** The port covers MARIE 3.0 except its CloudMR export, in four
+milestones, each building on the previous one:
+
+| Milestone | Content | Needed for |
+|---|---|---|
+| 1. Default path | Surface coil, piecewise-constant body, pFFT coupling, network parameters, E and H fields | Coils defined by fixed current patterns; the solver every later milestone reuses |
+| 2. Accuracy and enclosures | Piecewise-linear body basis; RF shields with tensor-train cross coupling, porting TT-Toolbox's `dmrg_cross` | Shielded coils; measuring how the basis changes peak 10 g SAR at tissue boundaries |
+| 3. Circuits and wires | Co-simulation (tuning, matching, decoupling, preamplifier decoupling, frequency sweeps), with a scipy global optimiser in place of `particleswarm`; wire coils | Port-driven coils, whose channel drive depends on the matching network |
+| 4. Speed and coil evaluation | Incident- and total-field bases and MRGF reduced-order solves; SNR, transmit-efficiency and g-factor maps; visualizer | Many coil configurations in one body; coil design comparisons |
+
+Milestone 1 ends with each port's body currents, fields and network parameters.
+From milestone 3 onward, co-simulation forms the channel drive inside mariepy.
+
+**Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
+package's single `_ext` module, following the package template and pypulseqpp.
+
+- **Coupling kernels.** For a surface coil, MARIE ships 24 coupling sources that
+  differ only in field component, piecewise-linear basis term and operator (N or
+  K). They become one N kernel and one K kernel taking the component and basis
+  term as arguments. The wire-coil sources are checked for the same structure
+  when milestone 3 ports them.
+- **Singular integrals.** The DIRECTFN sources (`direct_ws_*_rwg` for the coil,
+  `solve_ea`, `solve_st`, `solve_va` and their headers for the body) carry an
+  LGPL notice. They build as a separate extension module with that notice kept,
+  never inside `_ext`.
+- **Threading.** OpenMP loops become standard C++ threads partitioning
+  independent work, as in the template.
+
+**MATLAB-side code.**
+
+- **Numerical building blocks.** Arrays, FFTs, sparse projection matrices and
+  dense factorisations use torch (`torch.fft`, sparse CSR tensors,
+  `torch.linalg`), so one code path runs on CPU or CUDA.
+- **GMRES.** MARIE's own GMRES (`is_gmres_svie.m`, `is_iter_gmres_svie.m`) is
+  ported to torch together with its split preconditioner: an LU-factored coil
+  block and a diagonal body block. MathWorks' `iterchk.m` and `iterapp.m`, which
+  MARIE calls only to apply the operator, are not ported.
+- **Loops.** The loops MATLAB runs with `parfor` are the body kernel tensor and
+  the coil matrix's non-singular terms. They go to C++ in `_ext` when a profile
+  shows they dominate.
+- **Array layout.** Arrays follow C order with the batch dimension first:
+  (ports, …) rather than MATLAB's trailing port axis.
+
+**Order of work.** No MATLAB reference is available, so each stage is checked
+against physics:
+
+1. **Body solver.** A homogeneous sphere, then a layered one, in a plane-wave
+   incident field, compared with the analytic Mie series.
+2. **Coil matrix.** Checked by reciprocity (the port impedance matrix equals its
+   transpose) and by convergence as the surface mesh is refined.
+3. **Coupling and fields.** Checked by reciprocity of the coupled port matrix and
+   by power balance: the power absorbed in the body, integrated from the fields,
+   matches the absorbed power predicted from the port currents.
+
+Validation sets the tolerances.
+
+## Validation
+
+No MATLAB reference run is available. Each stage is validated against physics,
+against closed-form results, or against the stage beneath it. Numerical
+tolerances default to MARIE's (`tol` for GMRES, with `tol_HOSVD`, `tol_TT` and
+`tol_ACA` derived from it in `load_inputs.m`) and are exposed as parameters.
+
+Criteria are stated as invariants. Where a threshold can only come from a
+converged run, the first such run records it as a test constant, with the grid
+it was measured on.
+
+**Milestone 1.**
+
+| Check | Reference | Pass criterion |
+|---|---|---|
+| Body solver | Analytic Mie series for a homogeneous sphere, then a layered sphere, in a plane-wave incident field | Relative L2 error of E inside the sphere falls monotonically over three voxel sizes, and on the coarsest stays at or below its recorded value |
+| Linear solve | – | Final GMRES relative residual at or below `tol` for every port |
+| Compressed body operator | The uncompressed kernel on a small grid | Operator applied to random currents agrees within `tol_HOSVD` |
+| Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the helper functions each source repeats are made local with `objcopy --localize-symbol` so all variants link into one test binary | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
+| Coil matrix | – | Port impedance matrix symmetric within `tol`; port impedances converge as the mesh is refined |
+| Coupled system | – | Coupled port matrix symmetric within `tol`; body-absorbed power integrated from E equals the absorbed power predicted from the port currents, within `tol` |
+
+**Milestone 2.**
+
+- The piecewise-linear basis meets the Mie criterion, and its error is reported
+  against the piecewise-constant basis on the same grids.
+- Shielded coils meet the reciprocity and mesh-convergence criteria.
+- Tensor-train coupling agrees with the fully assembled coupling on a small
+  case, within `tol_TT`.
+
+**Milestone 3.**
+
+- Co-simulation reproduces closed-form results for simple lumped networks: a
+  series RLC, and an L-section matching a known load.
+- On a coil, the tuned and matched reflection at the Larmor frequency meets the
+  target set in the coil's element file.
+
+**Milestone 4.**
+
+- A solve in a precomputed field basis agrees with the direct solve for the same
+  coil and body, within the basis tolerance.
+- SNR and transmit-efficiency maps agree with their definitions evaluated
+  directly from the fields.
+
+**Q matrices, averaging and VOPs.**
+
+- 10 g averaging agrees with the IEC/IEEE 62704-1 reference implementation at
+  random drives.
+- For random drives, the largest VOP SAR is at least the largest averaged voxel
+  SAR and at most that plus the compression margin.
+- Each body's global matrix reproduces the head-average SAR integrated directly
+  from the fields.
+
+**Test layout.** Every check runs on CPU on coarse grids, and the CUDA leg skips
+on a machine without a device. Refinement studies carry the `slow` marker and
+stay out of the default run. A failing check reports the measured error and the
+grid.
+
+## Constraints
+
+**Code licence.** mariepy is MIT.
+
+- **Permissive code** (MIT, BSD, Apache-2.0) may be ported with its copyright
+  notice kept, and each ported source is listed in `THIRD_PARTY.md`. This covers
+  MARIE 3.0 itself and TT-Toolbox's `dmrg_cross`.
+- **MARIE's LGPL files** stay outside the MIT code:
+  - the DIRECTFN singular integrals, built as a separate extension module with
+    their notice;
+  - the Dunavant triangle quadrature files, whose rules are taken from the
+    published paper or kept with that extension.
+- **Excluded:** GPL, AGPL, non-commercial or unlicensed code, and model weights
+  under such terms. MathWorks' `iterapp.m` and `iterchk.m` are excluded too.
+
+**Data.**
+
+- **MARIE's example bodies.** The human body models and basis meshes shipped with
+  MARIE are not copied, because their licences are unknown or restricted. Tests
+  build their spheres and simple geometries in code.
+- **IXI-derived models.** Body models and VOP files from IXI data are CC BY-SA,
+  kept separate from the code, with the licence written into each file's
+  metadata.
+- **Tissue properties.** Permittivity and conductivity are evaluated in code from
+  the published Gabriel et al. 1996 Cole–Cole parameters. Mass densities are
+  ICRU Report 44 values as tabulated by NIST, credited to NIST. The IT'IS tissue
+  database is not bundled.
+- **Coil models.** No vendor or commercial coil data enters the repository.
+
+**Implementation.**
+
+- **torch.** It carries the numerical work on CPU or CUDA, with complex128 as the
+  working precision.
+- **Other dependencies.** numpy is used for file input and output only, where VOP
+  files are `.npz`. scipy is a test and optional dependency: special functions
+  for the Mie reference, and the global optimiser for co-simulation from
+  milestone 3. No numba, no CuPy.
+- **C++ kernels.** Loops over voxels, mesh elements or quadrature points run in
+  C++ in the pybind11 extension, on CPU buffers. Their results move to the
+  caller's device.
+- **Arrays and units.** Arrays are C-ordered with the batch dimension first:
+  (ports, …) and (N, Nc, Nc). Units are SI, and frequencies are in Hz.
+- **Provenance.** Every ported function names its MARIE source file in its
+  docstring.
+
+**Tests.**
+
+- Every test runs on a CPU-only machine on coarse grids. The CUDA leg of a test
+  skips when no device is present.
+- Mesh and grid refinement studies carry the `slow` marker.
+- Build, lint and test commands are those in `AGENTS.md`, and a change is
+  reported complete only with their output.
+
+## Later stages
+
+These stages follow the solver. They are here so the solver's interfaces serve
+them; the first task is milestone 1.
+
+**Head models.**
+
+- **Source.** IXI T1 and T2 volumes, downloaded with torchio's `ixi()`, which
+  fetches the raw tarballs without preprocessing.
+- **Bone.** From a pseudo-CT predicted by mr-to-pct (Apache-2.0 code, CC BY 4.0
+  weights).
+- **Brain.** From FastSurfer (Apache-2.0 code and weights).
+- **Skin, fat, muscle and the remaining tissues.** From intensity rules, or from
+  SimNIBS charm run as an external tool: charm is GPL-3.0, but its output label
+  maps are not covered by that licence.
+- **Labels.** The label merge is written anew, using PHASE (Apache-2.0) as a
+  reference.
+- **Properties.** Each label receives permittivity and conductivity from Gabriel
+  et al. 1996 at the coil's frequency, and a mass density from NIST's ICRU Report
+  44 table. Tissues NIST does not list take a recorded substitute: soft tissue
+  for skin, dura and mucosa, water for CSF and vitreous humour, cortical bone for
+  cancellous bone.
+- **Open check.** Whether IXI volumes keep the face is unverified, so it is
+  checked before the pipeline relies on it.
+
+**Q matrices and averaging.**
+
+- **Local Q.** Per voxel, from each channel's electric field, in the convention
+  of the output contract.
+- **10 g averaging.** Follows the IEC/IEEE 62704-1 algorithm of the Apache-2.0
+  reference implementation
+  (umbertozanovello/IEC-IEEE-62704-1-spatial-average-SAR). Averaging a Q matrix
+  over a cube is linear. The two steps that depend on SAR both assign a voxel
+  the largest average over a set of cubes:
+  - step 1: the valid cubes enclosing the voxel;
+  - step 2: up to six face-centred cubes.
+- **Pooling.** Pooling every valid cube's matrix with every step-2 cube's matrix
+  therefore gives the standard's peak spatial-average SAR for any drive.
+
+**VOP compression.**
+
+- **Pool.** The averaged matrices of all body models, compressed together, so the
+  VOPs bound local SAR across the population.
+- **Algorithm.** Eichfelder and Gebhardt (MRM 2011, doi 10.1002/mrm.22927),
+  written from the paper. The open implementations found are copyleft or
+  unlicensed, so none is used.
+- **Margin.** The compression margin is a parameter recorded in the VOP file.
+
+**Head-average matrices.** One per body model, integrated over that model's head
+mass, in the stacked layout of the output contract.

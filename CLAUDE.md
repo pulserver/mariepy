@@ -9,17 +9,17 @@ scripts/sync_agent_docs.sh, which pre-commit runs. Edit this file, never those.
 
 ## What this package is
 
-Electromagnetic simulation of MRI transmit coils and virtual observation points for SAR, ported from MARIE 3.0.
+Electromagnetic simulation of MRI transmit coils and virtual observation points
+(VOPs) for SAR, ported from MARIE 3.0 (<https://github.com/cloudmrhub/marie-tools>,
+MIT).
 
-It is one of a family of small, single-purpose MRI packages. The layering is
-strict: `mrutils` is the base; `torchsolve`, `mrtoeplitz`, `mrllr`, `mrmotion`
-and `mrdistortion` sit on it and never import each other; `deepmr` sits on all
-of them. If you find yourself wanting a sibling's code, the answer is either to
-move it down into `mrutils` or to move the caller up into `deepmr`.
+`PLAN.md` is the design brief: scope, the VOP file contract, the port's
+milestones, validation, constraints and later stages. Read it before starting
+work. When a decision it records changes, change `PLAN.md` in the same pull
+request.
 
-**deepinv is a `deepmr`-only dependency.** Everything below it is plain Torch
-with duck-typed operators (`A`, `A_adjoint`, `shape`). Do not import deepinv
-here unless this package is `deepmr`.
+mariepy stands alone: it depends on torch and numpy, not on other MRI packages.
+Its one external contract is the VOP file that pypulseqpp reads.
 
 ## Build and test
 

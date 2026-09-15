@@ -22,10 +22,11 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 
-dependencies = ["numpy>=1.24", "scipy>=1.11"]
+dependencies = ["numpy>=1.24", "torch>=2.4"]
 
 [project.optional-dependencies]
 dev = [
+  "scipy>=1.11",
   "pytest>=8",
   "pytest-cov>=5",
   "coverage>=7",
