@@ -271,9 +271,11 @@ What this leaves uncovered is recorded rather than implied away:
   files are `.npz`. scipy is a test and optional dependency: special functions
   for the Mie reference, and the global optimiser for co-simulation from
   milestone 3. No numba, no CuPy.
-- **C++ kernels.** Loops over voxels, mesh elements or quadrature points run in
-  C++ in the pybind11 extension, on CPU buffers. Their results move to the
-  caller's device.
+- **C++ kernels.** Work over voxels, mesh elements or quadrature points that
+  torch cannot batch runs in C++ in the pybind11 extension, on CPU buffers, and
+  its result moves to the caller's device. Work that torch can batch stays in
+  torch, where one code path runs on either device, and moves to C++ when a
+  profile shows it dominates, as **Loops** above says.
 - **Arrays and units.** Arrays are C-ordered with the batch dimension first:
   (ports, …) and (N, Nc, Nc). Units are SI, and frequencies are in Hz.
 - **Provenance.** Every ported function names its MARIE source file in its
