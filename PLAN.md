@@ -168,8 +168,18 @@ it was measured on.
 | Linear solve | – | Final GMRES relative residual at or below `tol` for every port |
 | Compressed body operator | The uncompressed kernel on a small grid | Operator applied to random currents agrees within `tol_HOSVD` |
 | Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the helper functions each source repeats are made local with `objcopy --localize-symbol` so all variants link into one test binary | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
-| Coil matrix | – | Each interaction block equals the independently computed transposed pair within `tol`, before `Z + Zᵀ` is formed; port impedances converge as the mesh is refined |
+| Coil matrix | Analytic Mie series for a perfectly conducting sphere in a plane-wave incident field | Each interaction block equals the independently computed transposed pair within `tol`, before `Z + Zᵀ` is formed; the scattering cross section falls monotonically towards the series over three mesh refinements and on the coarsest stays at or below its recorded value |
 | Coupled system | – | The port matrix is reciprocal within `tol` before `(Ip + Ipᵀ)/2` is formed; body-absorbed power integrated from E equals the absorbed power predicted from the port currents, within `tol` |
+
+**Why the coil matrix is not checked at a port.** A delta-gap feed puts the
+whole drive on one ring of edges, and the charge that piles up there grows as
+the mesh is refined, so a port impedance does not settle: refining a loop coil
+sixfold moves its reactance by a few per cent and shows no sign of stopping. The
+closed conductor has no such feed. Its scattering cross section is the power the
+incident field does on the induced current, which the solve delivers without a
+far field, and the perfectly conducting sphere has that cross section in closed
+form. The coil matrix is therefore checked there, and the port path is checked
+against the inductance the loop's own geometry implies.
 
 **What the piecewise-constant basis costs at a boundary.** The normal electric
 field jumps across a dielectric boundary by the contrast ratio, and this basis

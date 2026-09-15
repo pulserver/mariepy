@@ -55,7 +55,7 @@ src/mariepy/
     settings.py             tolerances and quadrature orders
     quadrature.py           Gauss-Legendre, triangle rules, Dunavant, Lebedev
     tucker.py               HOSVD, n-mode product, circulant FFT embedding
-    mesh.py                 GMSH 2.2 reader, triangle geometry, coil meshes in code
+    mesh.py                 GMSH 2.2 reader, triangle geometry, meshes in code
     coil.py                 RWG basis, ports, lumped elements
     body.py                 voxel grid, tissue contrast, degree-of-freedom map
     vie.py                  body kernels N and K, and their products
@@ -161,14 +161,20 @@ Mie comparison is the only place in milestone 1 where an absolute answer is
 known, so nothing downstream is trusted until it passes.
 
 **Stage 3 — coil matrix.**
-`mesh.py`, `coil.py`, `sie.py`. The GMSH reader and the RWG construction are
-checked on a mesh built in code: every interior edge carries exactly one basis
-function, `etod` signs are opposite across each shared edge, and the divergence
-of the basis integrates to zero over the pair of triangles. The port impedance
-matrix is checked for convergence as the mesh is refined, and the four
-interaction blocks — non-singular, edge-adjacent, vertex-adjacent, self — are
-each checked against the transposed pair computed independently, before
-`Assembly_SIE_par.m`'s `Z + Zᵀ` is formed — see decision 1 in section 6.
+`mesh.py`, `coil.py`, `sie.py`, `network.py`. The GMSH reader and the RWG
+construction are checked on meshes built in code: every interior edge carries
+exactly one basis function, the two triangles of a basis function carry opposite
+signs, and the normal current of a basis function is continuous across its own
+edge. The four interaction blocks — non-singular, edge-adjacent,
+vertex-adjacent, self — are each checked against the transposed pair computed
+independently, before `Assembly_SIE_par.m`'s `Z + Zᵀ` is formed, see decision 1
+in section 6; the non-singular block is checked against a direct quadrature of
+the Galerkin entry, and the surface-impedance block against the Gram matrix of
+the basis functions. The assembled matrix is checked absolutely: a perfectly
+conducting sphere in a plane wave scatters the cross section the Mie series
+gives, and the error falls with mesh refinement. `network.py` arrives here
+rather than at stage 5 because the port path needs an impedance to be checked
+against the loop's own inductance.
 
 **Stage 4 — coupling kernels.**
 `src/cpp/coupling.cpp`, `src/cpp/collocation.cpp`, bound into `_ext`. Checked
@@ -176,7 +182,7 @@ against MARIE's own 24 sources, compiled without MATLAB, before any pFFT code
 uses them. Section 5 gives the signatures and section 4.3 the parity harness.
 
 **Stage 5 — pFFT coupling and the coupled solve.**
-`pfft.py`, `system.py`, `solver.py`, `network.py`. Checks: the projection
+`pfft.py`, `system.py`, `solver.py`. Checks: the projection
 reproduces the field of an RWG basis function at the collocation sphere to the
 tolerance the least-squares solve achieves; the sparse precorrection is zero
 where the expansion cells and the body do not overlap; the final GMRES relative
@@ -224,7 +230,7 @@ Dunavant are already listed.
 | `src_sie/src_operators_sie/Assembly_SIE_par.m` | `sie.impedance` |
 | `assembly_ns_par.m` | `_ext.sie_nonsingular` |
 | `assembly_{ea,va,st}_par.m` | `sie._edge_adjacent`, `_vertex_adjacent`, `_self`, through `_directfn` |
-| `assembly_le.m` | `sie.add_lumped_loads` |
+| `assembly_le.m` | `sie.lumped_loads` |
 | `excitation_coil.m` | `sie.port_excitation` |
 | `src_sie/sie_assembly.m` | `sie.assemble` |
 | `src_wsvie/src_pfft/src_svie_pfft/pfft_surface_domain.m` | `pfft.extended_domain` |
@@ -446,6 +452,31 @@ that are design decisions; the rest are recorded here.
    one triangle, none. A tag on a rim edge therefore leaves its port empty,
    which `build` reports rather than solving a coil whose current leaves the
    sheet.
+
+7. **The conductor's surface resistance is counted once.**
+   `assembly_st_par.m` builds `Z_ST_local` with `ZR_DE + ZR_DE_losses` in it and
+   then stores `Z_ST_local + Z_ST_local_losses`, so the loss term reaches the
+   matrix twice while `ZR_DE_losses_matrix`, which the network parameters read,
+   carries it once. `sie.surface_block` adds it once. It is also derived rather
+   than transcribed: the overlap of two basis functions over their shared
+   triangle is exact from the barycentric moment, the integral of
+   `lambda_u lambda_v` over a triangle of area `A` being `A (1 + delta_uv) / 12`,
+   and a test states it as the Gram matrix of the basis functions. Evaluating
+   MARIE's three-branch `staticq` on a random triangle reproduces it exactly,
+   which is how the reading was confirmed.
+
+8. **The edge-adjacent rule runs at order 10, where MARIE uses 6.**
+   The DIRECTFN edge-adjacent integral converges at a rate set by the shape of
+   the two triangles. On the near-equilateral triangles of a sphere, order 6
+   already leaves the block reciprocal to 4e-7. On the elongated triangles a
+   loop coil's strip produces, order 6 leaves 1e-4 — above `PLAN.md`'s `tol` —
+   and order 10 brings it under. The default is 10 here; a mesh of very
+   elongated elements may still need more, and a test states that the defect
+   falls with the order rather than fixing a number.
+
+9. **The coil matrix is checked on a closed conductor, not at a port.**
+   `PLAN.md`'s **Why the coil matrix is not checked at a port** paragraph and
+   its milestone 1 table now carry the reason and the criterion.
 
 A further decision sits in section 4.2 and in `PLAN.md`'s **Excluded** list rather
 than here: `gauss_1d.m` and `getLebedevSphere.m` ship without a licence, so
