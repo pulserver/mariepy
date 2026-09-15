@@ -37,7 +37,12 @@ def _medium():
 
 def _coil(device, ports=1):
     mesh = SurfaceMesh.loop(
-        radius=COIL_RADIUS, width=0.01, n_around=12, n_across=1, ports=ports, device=device
+        radius=COIL_RADIUS,
+        width=0.01,
+        n_around=12,
+        n_across=1,
+        ports=ports,
+        device=device,
     )
     elements = tuple(
         Port(tag=tag, kind="port", load="none", value=0.0, quality=1.0, voltage=1.0)
@@ -51,7 +56,12 @@ def _operator(device, *, permittivity=PERMITTIVITY, conductivity=CONDUCTIVITY, p
     if key not in _BUILT:
         medium = _medium()
         body = VoxelBody.sphere(
-            BODY_RADIUS, RESOLUTION, permittivity, conductivity, padding=1, device=device
+            BODY_RADIUS,
+            RESOLUTION,
+            permittivity,
+            conductivity,
+            padding=1,
+            device=device,
         )
         coil = _coil(device, ports=ports)
         system = sie.assemble(coil, medium)
@@ -87,7 +97,9 @@ def test_the_coil_rows_of_the_coupled_operator_reproduce_the_coil_matrix(device)
     assert float((got - want).abs().max() / want.abs().max()) <= 1e-4
 
 
-def test_the_preconditioned_body_rows_are_the_body_operator_with_no_coil_current(device):
+def test_the_preconditioned_body_rows_are_the_body_operator_with_no_coil_current(
+    device,
+):
     operator = _operator(device)
     vector = torch.zeros(
         operator.n_coil + operator.n_body, dtype=torch.complex128, device=device
@@ -96,9 +108,7 @@ def test_the_preconditioned_body_rows_are_the_body_operator_with_no_coil_current
     vector[operator.n_coil :] = current
 
     preconditioned = operator.preconditioner()(operator(vector))[operator.n_coil :]
-    body = BodyOperator.build(
-        operator.body, operator.medium, medium_order=MEDIUM_ORDER
-    )
+    body = BodyOperator.build(operator.body, operator.medium, medium_order=MEDIUM_ORDER)
     torch.testing.assert_close(preconditioned, body(current), rtol=1e-9, atol=0.0)
 
 
@@ -135,7 +145,9 @@ def test_every_port_solve_reaches_the_tolerance_it_was_given(device):
     assert solution.body.shape == (operator.coil.n_driven, operator.n_body)
 
 
-def test_a_body_of_free_space_leaves_the_port_impedance_where_the_empty_coil_had_it(device):
+def test_a_body_of_free_space_leaves_the_port_impedance_where_the_empty_coil_had_it(
+    device,
+):
     operator = _operator(device, permittivity=1.000001, conductivity=0.0)
     solution = solve_ports(operator, tol=TOLERANCE)
     coupled = _port_impedance(operator, solution)[0, 0]
