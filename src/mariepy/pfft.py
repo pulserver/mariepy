@@ -359,8 +359,15 @@ def projection(
         triangle_order=triangle_order,
     ).reshape(n_dof, n_points, 3)
 
+    # The collocation sphere gives 78 equations for 81 cell currents, so the
+    # system is underdetermined and a pseudo-inverse takes the smallest
+    # solution. Which solution it is does not reach the answer: every one of
+    # them radiates the same field, and the near correction subtracts back
+    # exactly the one that was used. It is a pseudo-inverse rather than a
+    # least-squares solve because CUDA's driver needs at least as many
+    # equations as unknowns and this has fewer.
     right = field.permute(0, 2, 1).reshape(n_dof, 3 * n_points).transpose(0, 1)
-    weights = torch.linalg.lstsq(matrix, right).solution
+    weights = torch.linalg.pinv(matrix) @ right
     n_block = near.expansion.shape[1]
     return weights.reshape(3, n_block, n_dof).permute(2, 0, 1).contiguous()
 

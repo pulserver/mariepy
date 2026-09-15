@@ -15,15 +15,24 @@ from dataclasses import dataclass
 
 import torch
 
-from mariepy import vie
+from mariepy import fields, network, pfft, sie, vie
 from mariepy.body import VoxelBody
+from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
+from mariepy.fields import Fields
 from mariepy.gmres import Solution, gmres
 from mariepy.preconditioner import body_diagonal
 from mariepy.system import CoupledOperator
 from mariepy.tucker import CirculantSymbol, circulant_tucker
 
-__all__ = ["BodyOperator", "PortSolution", "solve_body", "solve_ports"]
+__all__ = [
+    "BodyOperator",
+    "PortSolution",
+    "Result",
+    "solve",
+    "solve_body",
+    "solve_ports",
+]
 
 
 @dataclass(frozen=True)
@@ -272,4 +281,105 @@ def solve_ports(
         body=torch.stack(body),
         residual=tuple(residual),
         iterations=tuple(iterations),
+    )
+
+
+@dataclass(frozen=True)
+class Result:
+    """Everything one coil and one body produce at one frequency.
+
+    Attributes
+    ----------
+    operator
+        The coupled operator that was solved.
+    ports
+        Each port's coil and body currents.
+    admittance
+        Port admittance in siemens, symmetrised as ``np_compute.m`` does.
+    impedance
+        Port impedance in ohms.
+    scattering
+        Port scattering parameters, referred to the line impedance.
+    fields
+        The electric and magnetic field each port drives in the body.
+    """
+
+    operator: CoupledOperator
+    ports: PortSolution
+    admittance: torch.Tensor
+    impedance: torch.Tensor
+    scattering: torch.Tensor
+    fields: Fields
+
+
+def solve(
+    body: VoxelBody,
+    coil: SurfaceCoil,
+    medium: Medium,
+    *,
+    tol: float = 1e-5,
+    reference: float = 50.0,
+    triangle_order: int = 4,
+    cell_order: int = 2,
+    far_order: int = 4,
+    medium_order: int = 8,
+    near_order: int = 15,
+) -> Result:
+    """Drive one coil against one body and return everything milestone 1 computes.
+
+    Ported from MARIE 3.0's ``src_solver/src_ie_solver/solver_wsvie.m`` and the
+    path ``src_runners/MARIE_runner.m`` takes for a surface coil around a voxel
+    body with precorrected FFT coupling.
+
+    Parameters
+    ----------
+    body
+        The body and its grid.
+    coil
+        The coil, its basis and its ports.
+    medium
+        The frequency to solve at.
+    tol
+        Target for the preconditioned relative residual of every port's solve,
+        and the tolerance the operator compressions are derived from.
+    reference
+        Line impedance the scattering parameters are referred to, in ohms.
+    triangle_order, cell_order
+        Quadrature orders of the coupling kernels.
+    far_order, medium_order, near_order
+        Quadrature orders of the body kernels.
+
+    Returns
+    -------
+    Result
+        The port parameters and the fields.
+    """
+    system = sie.assemble(coil, medium)
+    coupling = pfft.assemble(
+        body,
+        coil,
+        system.impedance,
+        medium,
+        tol=tol * 1e-2,
+        triangle_order=triangle_order,
+        cell_order=cell_order,
+        far_order=far_order,
+        medium_order=medium_order,
+        near_order=near_order,
+    )
+    operator = CoupledOperator(
+        body=body, coil=coil, medium=medium, system=system, coupling=coupling
+    )
+    ports = solve_ports(operator, tol=tol)
+    admittance = network.symmetrise(
+        network.port_admittance(system.excitation, ports.coil)
+    )
+    impedance = network.y_to_z(admittance)
+    return Result(
+        operator=operator,
+        ports=ports,
+        admittance=admittance,
+        impedance=impedance,
+        scattering=network.z_to_s(impedance, reference),
+        fields=fields.compute(operator, ports.coil, ports.body),
     )
