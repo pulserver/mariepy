@@ -105,6 +105,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D", "S101", "ARG"]
+# tests/parity.py compiles MARIE's own sources: it names the compiler and
+# every path it passes, so there is no untrusted input to check.
+"tests/parity.py" = ["D", "S101", "ARG", "S603", "S607"]
 "benchmarks/**" = ["D", "S101", "T201"]
 "__init__.py" = ["D104", "F401"]
 

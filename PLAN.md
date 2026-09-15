@@ -105,8 +105,11 @@ package's single `_ext` module, following the package template and pypulseqpp.
 - **Coupling kernels.** For a surface coil, MARIE ships 24 coupling sources that
   differ only in field component, piecewise-linear basis term and operator (N or
   K). They become one N kernel and one K kernel taking the component and basis
-  term as arguments. The wire-coil sources are checked for the same structure
-  when milestone 3 ports them.
+  term as arguments. Both are batched quadratures over the same `N` and `K`
+  kernels the body operator already uses, so under **C++ kernels** below they
+  stay in torch; the 24 sources remain the reference they are checked against.
+  The wire-coil sources are checked for the same structure when milestone 3
+  ports them.
 - **Singular integrals.** The DIRECTFN sources (`direct_ws_*_rwg` for the coil,
   `solve_ea`, `solve_st`, `solve_va` and their headers for the body) carry an
   LGPL notice. They build as a separate extension module with that notice kept,
@@ -167,7 +170,7 @@ it was measured on.
 | Body solver | Analytic Mie series for a homogeneous sphere, then a layered sphere, in a plane-wave incident field | Relative L2 error of E inside the sphere falls monotonically over three voxel sizes, and on the coarsest stays at or below its recorded value. Measured over the interior, for the reason below |
 | Linear solve | – | Final GMRES relative residual at or below `tol` for every port |
 | Compressed body operator | The uncompressed kernel on a small grid | Operator applied to random currents agrees within `tol_HOSVD` |
-| Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the helper functions each source repeats are made local with `objcopy --localize-symbol` so all variants link into one test binary | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
+| Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the three helper functions each source repeats are given internal linkage so all 24 variants link into one library | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
 | Coil matrix | Analytic Mie series for a perfectly conducting sphere in a plane-wave incident field | Each interaction block equals the independently computed transposed pair within `tol`, before `Z + Zᵀ` is formed; the scattering cross section falls monotonically towards the series over three mesh refinements and on the coarsest stays at or below its recorded value |
 | Coupled system | – | The port matrix is reciprocal within `tol` before `(Ip + Ipᵀ)/2` is formed; body-absorbed power integrated from E equals the absorbed power predicted from the port currents, within `tol` |
 

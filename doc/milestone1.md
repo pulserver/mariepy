@@ -59,6 +59,7 @@ src/mariepy/
     coil.py                 RWG basis, ports, lumped elements
     body.py                 voxel grid, tissue contrast, degree-of-freedom map
     vie.py                  body kernels N and K, and their products
+    coupling.py             coil-to-body kernels and the collocation matrix
     sie.py                  coil EFIE matrix, lumped loads, port excitation
     pfft.py                 extended grid, projection, precorrection
     system.py               the coupled operator
@@ -69,12 +70,7 @@ src/mariepy/
     solver.py               drives geometry, operators, solve, network, fields
 
 src/cpp/                    -> mariepy._ext, MIT
-    module.cpp              bindings
-    threads.hpp             partitioning of independent work
-    coupling.cpp            RWG-to-voxel N and K kernels
-    collocation.cpp         voxel-to-collocation-point dyadic kernel
-    sie_nonsingular.cpp     coil matrix, non-singular triangle pairs
-    vie_volume.cpp          body kernel, volume-volume quadrature
+    module.cpp              bindings; a kernel moves here when a profile asks
 
 src/cpp_lgpl/               -> mariepy._directfn, LGPL, notices kept
     NOTICE.md               what is carried, and the two build changes
@@ -84,11 +80,13 @@ src/cpp_lgpl/               -> mariepy._directfn, LGPL, notices kept
     rwg_namespace_*.cpp     one wrapper per RWG source, giving it a namespace
 
 tests/
-    test_quadrature.py  test_tucker.py  test_mesh.py  test_coil.py
-    test_body.py        test_vie.py     test_mie.py   test_sie.py
-    test_pfft.py        test_coupling_kernels.py      test_gmres.py
+    test_quadrature.py  test_tucker.py  test_mesh.py   test_coil.py
+    test_body.py        test_vie.py     test_mie.py    test_sie.py
+    test_pfft.py        test_coupling.py               test_gmres.py
     test_network.py     test_fields.py  test_power_balance.py
-    mie.py              analytic reference, scipy special functions
+    mie.py              analytic reference for a dielectric sphere
+    pec.py              analytic reference for a conducting sphere
+    parity.py           MARIE's coupling sources, compiled without MATLAB
 ```
 
 The two extensions are separate targets in `CMakeLists.txt` and separate
@@ -219,7 +217,7 @@ Dunavant are already listed.
 | `scoil_geometry/geo_scoil.m` | `coil.SurfaceCoil.build(mesh.SurfaceMesh.read_gmsh22(...), coil.read_lumped_elements(...))` |
 | `src_integral_equations/src_vie/src_operators_vie/assembly_N.m` | `vie.kernel_n` |
 | `assembly_K.m` | `vie.kernel_k` |
-| `cubatures/VV_Nop.m`, `VV_Kop.m`, `kernels_*.m`, `coefficients_*.m`, `weights_points.m`, `points_const_4D.m` | `_ext.vie_volume_block` |
+| `cubatures/VV_Nop.m`, `VV_Kop.m`, `kernels_*.m`, `coefficients_*.m`, `weights_points.m`, `points_const_4D.m` | `vie.volume_volume_n`, `vie.volume_volume_k` |
 | `cubatures/surface_surface_*.m` | `vie._surface_surface`, singular parts through `_directfn` |
 | `singular/singular_{ST,EA,VA}_lin.m`, `points_mapping.m` | `vie.singular_block` |
 | `assembly_fft_circ_tucker_pwc.m` | `tucker.circulant_tucker` |
@@ -228,7 +226,7 @@ Dunavant are already listed.
 | `mvp_G_pwc.m`, `mvp_invG_pwc.m` | `vie.apply_g`, `vie.apply_inv_g` |
 | `mvp_vie.m` | `vie.apply_vie`, the body-only operator the Mie test solves |
 | `src_sie/src_operators_sie/Assembly_SIE_par.m` | `sie.impedance` |
-| `assembly_ns_par.m` | `_ext.sie_nonsingular` |
+| `assembly_ns_par.m` | `sie.near_block` |
 | `assembly_{ea,va,st}_par.m` | `sie._edge_adjacent`, `_vertex_adjacent`, `_self`, through `_directfn` |
 | `assembly_le.m` | `sie.lumped_loads` |
 | `excitation_coil.m` | `sie.port_excitation` |
@@ -238,9 +236,9 @@ Dunavant are already listed.
 | `pfft_proj_surface_create_near_lists.m` | `pfft.near_lists` |
 | `src_pfft_supporting/pfft_proj_find_RWG_centers.m` | `coil.rwg_centres` |
 | `pfft_proj_find_nearest_voxel.m`, `pfft_proj_find_expansion_cell.m`, `pfft_proj_get_near_indecies.m` | `pfft._nearest_voxel`, `pfft._expansion_cells`, `pfft._near_cells` |
-| `pfft_proj_pwx_to_collocation.m` | `_ext.collocation_matrix` |
+| `pfft_proj_pwx_to_collocation.m` | `coupling.collocation_matrix` |
 | `pfft_projection_surface_assembly.m` | `pfft.projection`, returning the sparse `P` and `S` blocks |
-| `pfft_surface_assemble_direct_bc.m` | `pfft.direct_coupling`, calling `_ext.coupling_n` and `_ext.coupling_k` |
+| `pfft_surface_assemble_direct_bc.m` | `pfft.direct_coupling`, calling `coupling.coupling_n` and `coupling.coupling_k` |
 | `src_pfft_coil/pfft_assemble_voxel_bc.m` | `pfft.projected_coupling` |
 | `src_pfft_coil/pfft_assemble_voxel_cc.m` | `pfft.coil_precorrection` |
 | `src_wsvie/wsvie_coupling_assembly.m` | `pfft.assemble` |
@@ -305,99 +303,70 @@ variation is exactly two-dimensional — operator N or K, vector component x, y 
 z, basis term constant or linear in x, y or z — which is why one N kernel and
 one K kernel with `component` and `basis_term` arguments reproduce all 24.
 
-`tests/test_coupling_kernels.py` compiles the originals without MATLAB and
-compares. Two obstacles, both handled at test-build time:
+`tests/parity.py` compiles the originals without MATLAB and
+`tests/test_coupling.py` compares. Two obstacles, both handled at test-build
+time:
 
-- `mex.h` is absent. A shim header supplies `mxComplexDouble` as a struct of two
-  doubles, which is the only thing the 24 sources use it for.
+- `mex.h` is absent. A four-line header supplies `mxComplexDouble` as a struct
+  of two doubles, which is the only thing the 24 sources use it for.
 - `get_source_coords_mat`, `vec_norm_l2` and `compute_edge_length_v` are defined
   at file scope with external linkage in all 24, so linking them together is a
-  multiple definition. Each object gets `objcopy --localize-symbol` on those
-  three before the link.
+  multiple definition. Each copy has those three given internal linkage, which
+  needs no `objcopy` and works wherever a compiler does.
 
-The test builds a random RWG geometry and a random voxel set and asserts that
-`_ext.coupling_n(..., component=c, basis_term=b)` reproduces
-`Assemble_rwg_coupling_matrix_N_{x,y,z}{,1,2,3}` to floating-point precision,
-for every `(c, b)` pair, and likewise for K. It carries the `slow` marker, runs
-on CPU, and skips when the environment variable naming a MARIE checkout is unset
-or no C++ compiler is on the path — the sources are not vendored into this
-repository.
+The test builds a random RWG geometry and a random set of cells and asserts
+that `coupling.coupling_n(..., basis_term=b)[:, c]` reproduces
+`Assemble_rwg_coupling_matrix_N_{x,y,z}{,1,2,3}` for every `(c, b)` pair, and
+likewise for K. It carries the `slow` marker, runs on CPU, and skips when
+`MARIEPY_MARIE_TOOLS` does not name a checkout or no C++ compiler is on the
+path — the sources are not vendored into this repository.
 
-## 5. The compiled coupling kernels
+## 5. The coupling kernels
 
-Two functions in `_ext` replace the 24 sources. Both take the RWG geometry for a
-whole batch of basis functions and a set of observation points, both evaluate on
-CPU buffers, and both return an array the caller moves to its device.
+Two functions in `coupling.py` replace the 24 sources. Both take the RWG
+geometry and one observer per basis function, so a near list is a flat list of
+pairs, and both run on either device.
 
-```cpp
-// src/cpp/coupling.cpp
+```python
+def coupling_n(
+    corners,                 # (n, 4, 3): r_p, r_n, r_2, r_3
+    points,                  # (n, 3): the observer paired with each basis function
+    medium,                  # supplies k0 and j omega eps_0
+    *,
+    triangle_order=4,        # degree of the Dunavant rule on each triangle
+    cell_size=None,          # cell pitch, or None to observe at the point
+    cell_order=2,            # points per axis of the Gauss rule over the cell
+    basis_term=0,            # 0 constant, 1-3 linear in the cell's own x, y, z
+) -> torch.Tensor            # (n, 3), complex
 
-py::array_t<std::complex<double>> coupling_n(
-    py::array_t<double, py::array::c_style | py::array::forcecast> observation_points,
-    py::array_t<double, py::array::c_style | py::array::forcecast> rwg_vertices,
-    py::array_t<double, py::array::c_style | py::array::forcecast> triangle_weights,
-    py::array_t<double, py::array::c_style | py::array::forcecast> triangle_points,
-    py::array_t<double, py::array::c_style | py::array::forcecast> voxel_weights,
-    py::array_t<double, py::array::c_style | py::array::forcecast> voxel_nodes,
-    double voxel_size,
-    double wavenumber,
-    int component,
-    int basis_term,
-    int threads);
-
-py::array_t<std::complex<double>> coupling_k(  // same parameters
-    ...);
+def coupling_k(...)          # same parameters, same shape
 ```
 
-| Parameter | Shape and meaning |
-|---|---|
-| `observation_points` | `(n_obs, 3)` — voxel centres for the direct coupling, collocation points for the projection |
-| `rwg_vertices` | `(n_rwg, 4, 3)` — the free vertex of the positive triangle, the free vertex of the negative triangle, and the two shared-edge vertices, in that order. MARIE's `r_p, r_n, r_2, r_3` in one array |
-| `triangle_weights` | `(n_tri,)` — Dunavant weights on the reference triangle |
-| `triangle_points` | `(n_tri, 3)` — the matching barycentric coordinates |
-| `voxel_weights` | `(n_gauss,)` — Gauss-Legendre weights on `[-1, 1]` |
-| `voxel_nodes` | `(n_gauss,)` — the matching nodes; the cubature over the voxel is their tensor cube |
-| `voxel_size` | voxel pitch in metres, MARIE's `res` |
-| `wavenumber` | free-space `k0` in rad/m. The kernel forms `ce = i k0 c0 ε0` from it, as MARIE's sources do, so the scalings `-1/(4π ce)` for N and `-1/(4π)` for K need no further argument |
-| `component` | `0`, `1`, `2` for the x, y or z component of the tested field |
-| `basis_term` | `0` for the constant basis, `1`, `2`, `3` for the term linear in x, y or z within the voxel. Milestone 1 passes `0`; the others are milestone 2's piecewise-linear basis |
-| `threads` | number of worker threads; `0` asks for `std::thread::hardware_concurrency()` |
+MARIE's `res` and `k0` arrive inside `medium` and `cell_size`; its packed
+`sie_quads` and `vie_quads`, whose leading element carried the point count, are
+replaced by the orders, so a mismatch cannot read past the end. The cell
+average is not multiplied by the cell volume: the caller does that when it
+wants the integral, as `pfft_surface_assemble_direct_bc.m` does and
+`pfft_projection_surface_assembly.m` does not.
 
-Returns `(n_rwg, n_obs)` complex128, C-ordered: the batch axis first, as
-`PLAN.md` requires. MARIE's Fortran-ordered `(N_vox, N_rwg)` output is this
-array's transpose, which is why the parity test compares against a transpose.
-The two quadrature arrays replace MARIE's packed `sie_quads` and `vie_quads`
-vectors, whose leading element carried the point count; here the shapes carry
-it, and a mismatch raises rather than reading past the end.
+`collocation_matrix` is the companion that `pfft_proj_pwx_to_collocation.m`
+builds:
 
-The observation-point cubature is not applied: as in
-`pfft_surface_assemble_direct_bc.m`, the caller multiplies by `res³` when it
-wants the voxel integral, and does not when it wants the value at a collocation
-point.
-
-`collocation.cpp` binds the companion kernel, the voxel-to-collocation dyadic
-Green matrix that `pfft_proj_pwx_to_collocation.m` builds:
-
-```cpp
-py::array_t<std::complex<double>> collocation_matrix(
-    py::array_t<double, ...> voxel_centres,      // (n_cells, 3)
-    py::array_t<double, ...> collocation_points, // (n_col, 3)
-    py::array_t<double, ...> voxel_weights,      // (n_gauss,)
-    py::array_t<double, ...> voxel_nodes,        // (n_gauss,)
-    double voxel_size,
-    double wavenumber,
-    int n_basis_terms,                           // 1 for PWC, 4 for PWL
-    int threads);
+```python
+def collocation_matrix(
+    centres,                 # (n_cells, 3)
+    points,                  # (n_points, 3)
+    medium,
+    *,
+    cell_size,
+    cell_order=2,
+    n_basis=1,               # 1 for the piecewise-constant cell basis, 4 for linear
+) -> torch.Tensor            # (3 * n_points, 3 * n_basis * n_cells), complex
 ```
 
-returning `(3 · n_col, 3 · n_basis_terms · n_cells)` complex128, the matrix whose
-least-squares solve gives the projection weights of one RWG function.
-
-Threading in both follows the package template: `threads.hpp` partitions the
-observation-point loop across `std::thread` workers, each writing a disjoint
-slice of the output, replacing MARIE's `#pragma omp parallel for`. No locks and
-no atomics, so the result does not depend on the thread count — a test asserts
-that for one and for many.
+returning the matrix whose least-squares solve gives the projection weights of
+one RWG function. Rows run component-major over the points; columns run
+component-major, then basis term, then cell, as MARIE orders them.
 
 ## 6. Decisions taken
 
@@ -477,6 +446,28 @@ that are design decisions; the rest are recorded here.
 9. **The coil matrix is checked on a closed conductor, not at a port.**
    `PLAN.md`'s **Why the coil matrix is not checked at a port** paragraph and
    its milestone 1 table now carry the reason and the criterion.
+
+10. **The coupling kernels stayed in torch.**
+   `PLAN.md`'s **C++ kernels** constraint keeps in torch the work torch can
+   batch, and moves it to C++ when a profile shows it dominates. The 24 sources
+   are a quadrature over the same `N` and `K` kernels `vie.py` already carries:
+   the coupling of a basis function `f` to a point is
+   `E = 1 / (j omega eps_0) * integral N(r - r') f(r') dS'` and
+   `H = integral K(r - r') x f(r') dS'`, which torch batches over pairs in one
+   contraction. `coupling.py` therefore reuses `vie.green_n` and `vie.green_k`,
+   which the Mie test already validated, and reproduces all 24 originals to
+   3e-14. `src/cpp/` keeps its bindings module for the first kernel a profile
+   sends there.
+
+11. **MARIE halves Burkardt's Dunavant weights, and that is what carries the
+   basis function's own factor.** `dunavant_rule.m` returns `0.5 * w`, so the
+   surface rule sums to the reference triangle's area rather than to one, and
+   the coupling sources multiply by the edge length alone rather than by
+   `L / (2 A)`. `quadrature.dunavant` keeps `PLAN.md`'s convention, weights
+   summing to one, and `coupling.py` halves them where MARIE's rule already is
+   halved. Read the other way round — the rule normalised to one and the basis
+   function written out — the two agree, and a test states the coupling as the
+   field the basis function itself radiates.
 
 A further decision sits in section 4.2 and in `PLAN.md`'s **Excluded** list rather
 than here: `gauss_1d.m` and `getLebedevSphere.m` ship without a licence, so
