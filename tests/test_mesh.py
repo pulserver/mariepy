@@ -171,3 +171,61 @@ def test_a_loop_wider_than_its_diameter_is_refused(device):
         SurfaceMesh.loop(
             radius=RADIUS, width=4 * RADIUS, n_around=8, n_across=1, device=device
         )
+
+
+def test_a_subdivided_sphere_closes_and_every_triangle_faces_outwards(device):
+    mesh = SurfaceMesh.sphere(radius=0.2, subdivisions=2, device=device)
+    assert mesh.n_triangles == 20 * 4**2
+    outward = (mesh.normals() * mesh.centroids()).sum(dim=-1)
+    assert bool((outward > 0).all())
+    occurrences = torch.bincount(
+        torch.cat(
+            [
+                torch.minimum(mesh.triangles[:, first], mesh.triangles[:, second])
+                * mesh.n_nodes
+                + torch.maximum(mesh.triangles[:, first], mesh.triangles[:, second])
+                for first, second in ((0, 1), (1, 2), (2, 0))
+            ]
+        )
+    )
+    assert set(occurrences[occurrences > 0].tolist()) == {2}
+
+
+def test_the_area_of_a_subdivided_sphere_rises_towards_the_sphere_it_inscribes(device):
+    radius = 0.2
+    exact = 4.0 * math.pi * radius**2
+    areas = [
+        float(
+            SurfaceMesh.sphere(radius=radius, subdivisions=level, device=device)
+            .areas()
+            .sum()
+        )
+        for level in range(4)
+    ]
+    assert areas == sorted(areas)
+    assert areas[-1] < exact
+    assert areas[-1] == pytest.approx(exact, rel=0.01)
+
+
+def test_a_sphere_of_no_radius_is_refused(device):
+    with pytest.raises(ValueError, match="positive radius"):
+        SurfaceMesh.sphere(radius=0.0, subdivisions=1, device=device)
+
+
+def test_a_loop_with_more_ports_than_divisions_is_refused(device):
+    with pytest.raises(ValueError, match="ports"):
+        SurfaceMesh.loop(
+            radius=RADIUS, width=WIDTH, n_around=8, n_across=1, ports=9, device=device
+        )
+
+
+def test_each_port_of_a_loop_sits_on_its_own_azimuth(device):
+    mesh = SurfaceMesh.loop(
+        radius=RADIUS, width=WIDTH, n_around=12, n_across=2, ports=3, device=device
+    )
+    assert mesh.line_tags.tolist() == [1, 1, 2, 2, 3, 3]
+    for tag in (1, 2, 3):
+        here = mesh.lines[mesh.line_tags == tag]
+        midpoints = 0.5 * (mesh.nodes[here[:, 0]] + mesh.nodes[here[:, 1]])
+        azimuth = torch.atan2(midpoints[:, 1], midpoints[:, 0])
+        torch.testing.assert_close(azimuth, azimuth[0].expand_as(azimuth))

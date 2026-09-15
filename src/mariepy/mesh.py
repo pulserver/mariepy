@@ -30,6 +30,30 @@ _SECOND_NODE = (1, 2, 0)
 _GMSH_LINE = 1
 _GMSH_TRIANGLE = 2
 
+_GOLDEN = (1.0 + 5.0**0.5) / 2.0
+_ICOSAHEDRON_FACES = (
+    (0, 11, 5),
+    (0, 5, 1),
+    (0, 1, 7),
+    (0, 7, 10),
+    (0, 10, 11),
+    (1, 5, 9),
+    (5, 11, 4),
+    (11, 10, 2),
+    (10, 7, 6),
+    (7, 1, 8),
+    (3, 9, 4),
+    (3, 4, 2),
+    (3, 2, 6),
+    (3, 6, 8),
+    (3, 8, 9),
+    (4, 9, 5),
+    (2, 4, 11),
+    (6, 2, 10),
+    (8, 6, 7),
+    (9, 8, 1),
+)
+
 
 @dataclass(frozen=True)
 class SurfaceMesh:
@@ -326,13 +350,14 @@ class SurfaceMesh:
         width: float,
         n_around: int,
         n_across: int,
+        ports: int = 1,
         device: torch.device | str = "cpu",
     ) -> SurfaceMesh:
         """Build a single-turn loop coil: a flat annular strip in the ``z = 0`` plane.
 
         The strip is closed in the azimuthal direction and open at both rims, so
-        no current crosses them. The radial edges at azimuth zero carry line tag
-        1 and are the coil's one port.
+        no current crosses them. Its ports sit on the radial edges at equally
+        spaced azimuths, tagged 1 upwards, the first at azimuth zero.
 
         Parameters
         ----------
@@ -344,6 +369,9 @@ class SurfaceMesh:
             Number of divisions around the loop; at least three.
         n_across
             Number of divisions across the strip; at least one.
+        ports
+            Number of ports spaced around the loop; at least one, and no more
+            than ``n_around``.
         device
             Device the arrays are built on.
 
@@ -360,6 +388,10 @@ class SurfaceMesh:
         if n_around < 3 or n_across < 1:
             raise ValueError(
                 f"need n_around >= 3 and n_across >= 1; got {n_around}, {n_across}"
+            )
+        if not 1 <= ports <= n_around:
+            raise ValueError(
+                f"need 1 <= ports <= n_around; got {ports} against {n_around}"
             )
         if width <= 0.0 or radius <= 0.5 * width:
             raise ValueError(
@@ -397,18 +429,114 @@ class SurfaceMesh:
                 triangles.append((inner_here, outer_here, outer_next))
                 triangles.append((inner_here, outer_next, inner_next))
 
-        lines = [
-            (number(across, 0), number(across + 1, 0)) for across in range(n_across)
-        ]
+        lines = []
+        tags = []
+        for port in range(ports):
+            around = round(port * n_around / ports)
+            lines += [
+                (number(across, around), number(across + 1, around))
+                for across in range(n_across)
+            ]
+            tags += [port + 1] * n_across
 
         mesh = cls(
             nodes=nodes.to(device),
             triangles=torch.tensor(triangles, dtype=torch.int64, device=device),
             triangle_tags=torch.ones(len(triangles), dtype=torch.int64, device=device),
             lines=torch.tensor(lines, dtype=torch.int64, device=device),
-            line_tags=torch.ones(len(lines), dtype=torch.int64, device=device),
+            line_tags=torch.tensor(tags, dtype=torch.int64, device=device),
         )
         return mesh.align_to_lines()
+
+    @classmethod
+    def sphere(
+        cls,
+        *,
+        radius: float,
+        subdivisions: int,
+        device: torch.device | str = "cpu",
+    ) -> SurfaceMesh:
+        """Build a closed sphere by repeatedly halving the edges of an icosahedron.
+
+        Each pass splits every triangle into four and pushes the new nodes out
+        to the sphere, so the surface has no rim and every triangle is wound
+        outwards. It carries no line elements: the sphere is a scatterer, not a
+        driven coil.
+
+        Parameters
+        ----------
+        radius
+            Sphere radius in metres.
+        subdivisions
+            Number of halving passes; the mesh has ``20 * 4 ** subdivisions``
+            triangles.
+        device
+            Device the arrays are built on.
+
+        Returns
+        -------
+        SurfaceMesh
+            The closed surface.
+
+        Raises
+        ------
+        ValueError
+            If the radius is not positive or the pass count is negative.
+        """
+        if radius <= 0.0:
+            raise ValueError(f"need a positive radius; got {radius}")
+        if subdivisions < 0:
+            raise ValueError(
+                f"need a non-negative number of subdivisions; got {subdivisions}"
+            )
+
+        rectangle = ((-1.0, _GOLDEN), (1.0, _GOLDEN), (-1.0, -_GOLDEN), (1.0, -_GOLDEN))
+        nodes = [[short, long, 0.0] for short, long in rectangle]
+        nodes += [[0.0, short, long] for short, long in rectangle]
+        nodes += [[long, 0.0, short] for short, long in rectangle]
+        faces = [list(face) for face in _ICOSAHEDRON_FACES]
+
+        for _ in range(subdivisions):
+            halves: dict[tuple[int, int], int] = {}
+            split = []
+            for first, second, third in faces:
+                one = _halve(nodes, halves, first, second)
+                two = _halve(nodes, halves, second, third)
+                three = _halve(nodes, halves, third, first)
+                split += [
+                    [first, one, three],
+                    [second, two, one],
+                    [third, three, two],
+                    [one, two, three],
+                ]
+            faces = split
+
+        coordinates = torch.tensor(nodes, dtype=torch.float64, device=device)
+        coordinates = (
+            radius
+            * coordinates
+            / torch.linalg.vector_norm(coordinates, dim=1, keepdim=True)
+        )
+        return cls(
+            nodes=coordinates,
+            triangles=torch.tensor(faces, dtype=torch.int64, device=device),
+            triangle_tags=torch.ones(len(faces), dtype=torch.int64, device=device),
+            lines=torch.empty((0, 2), dtype=torch.int64, device=device),
+            line_tags=torch.empty((0,), dtype=torch.int64, device=device),
+        )
+
+
+def _halve(
+    nodes: list[list[float]], halves: dict[tuple[int, int], int], left: int, right: int
+) -> int:
+    """Return the index of the node halfway along an edge, making it if needed."""
+    key = (min(left, right), max(left, right))
+    if key not in halves:
+        halves[key] = len(nodes)
+        nodes.append(
+            [(nodes[left][axis] + nodes[right][axis]) / 2 for axis in range(3)]
+        )
+    return halves[key]
 
 
 def _section(text: str, name: str) -> list[str] | None:
