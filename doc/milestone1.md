@@ -55,8 +55,8 @@ src/mariepy/
     settings.py             tolerances and quadrature orders
     quadrature.py           Gauss-Legendre, triangle rules, Dunavant, Lebedev
     tucker.py               HOSVD, n-mode product, circulant FFT embedding
-    mesh.py                 GMSH 2.2 reader
-    coil.py                 RWG basis, triangle data, ports, lumped elements
+    mesh.py                 GMSH 2.2 reader, triangle geometry, coil meshes in code
+    coil.py                 RWG basis, ports, lumped elements
     body.py                 voxel grid, tissue contrast, degree-of-freedom map
     vie.py                  body kernels N and K, and their products
     sie.py                  coil EFIE matrix, lumped loads, port excitation
@@ -204,12 +204,13 @@ Dunavant are already listed.
 | `src_geometry/geo_assembly.m` | `solver.build_geometry` |
 | `src_geometry/body_geometry/geo_body_domain.m`, `grid3d.m` | `body.VoxelBody`: grid coordinates, mask, voxel index and degree-of-freedom map |
 | `src_physics/src_electromagnetism/em_assembly.m` | `body.contrast`, returning `Mr`, `Mc`, `Mcr` and the inverses |
-| `src_geometry/scoil_geometry/mesh_geo/Mesh_Parse.m` | `mesh.read_gmsh22` |
-| `Mesh_Permute.m`, `Mesh_PreProc.m`, `ProcessLoops.m` | `coil.rwg_basis`: edges, `etod`, the dof index and the adjacency lists |
-| `Mesh_CLP.m`, `rwg_geo/Triangle_area.m` | `coil.triangle_data` |
-| `rwg_geo/get_rwg_vertices.m` | `coil.rwg_vertices`, shape `(n_rwg, 4, 3)` for `rp, rn, r2, r3` |
+| `src_geometry/scoil_geometry/mesh_geo/Mesh_Parse.m` | `mesh.SurfaceMesh.read_gmsh22` |
+| `Mesh_Permute.m` | `mesh.SurfaceMesh.align_to_lines` |
+| `Mesh_CLP.m`, `rwg_geo/Triangle_area.m` | `mesh.SurfaceMesh.centroids`, `edge_vectors`, `edge_lengths`, `rho`, `areas` |
+| `Mesh_PreProc.m`, `ProcessLoops.m` | `coil.SurfaceCoil.build`: edges, signs, the dof numbering and the adjacency classes |
+| `rwg_geo/get_rwg_vertices.m` | `coil.SurfaceCoil.rwg_vertices`, shape `(n_rwg, 4, 3)` for `rp, rn, r2, r3` |
 | `ports_geo/geo_scoil_lumped_elements.m` | `coil.read_lumped_elements` |
-| `scoil_geometry/geo_scoil.m` | `coil.SurfaceCoil.from_files(mesh_path, elements_path)` |
+| `scoil_geometry/geo_scoil.m` | `coil.SurfaceCoil.build(mesh.SurfaceMesh.read_gmsh22(...), coil.read_lumped_elements(...))` |
 | `src_integral_equations/src_vie/src_operators_vie/assembly_N.m` | `vie.kernel_n` |
 | `assembly_K.m` | `vie.kernel_k` |
 | `cubatures/VV_Nop.m`, `VV_Kop.m`, `kernels_*.m`, `coefficients_*.m`, `weights_points.m`, `points_const_4D.m` | `_ext.vie_volume_block` |
@@ -394,7 +395,7 @@ that for one and for many.
 
 ## 6. Decisions taken
 
-Four points where MARIE's reference leaves a choice. `PLAN.md` carries the ones
+Points where MARIE's reference leaves a choice. `PLAN.md` carries the ones
 that are design decisions; the rest are recorded here.
 
 1. **Two of `PLAN.md`'s milestone 1 validation criteria did not test what they
@@ -430,6 +431,22 @@ that are design decisions; the rest are recorded here.
    value; the `slow` leg checks that the error falls with refinement.
    `PLAN.md`'s **Test layout** now says so.
 
-A fifth decision sits in section 4.2 and in `PLAN.md`'s **Excluded** list rather
+5. **A lumped element is matched to its mesh edges by its own number.**
+   `Mesh_PreProc.m` matches the *i*-th entry of the element file to the *i*-th
+   smallest physical line tag in the mesh, so an element file listed out of tag
+   order silently drives the wrong edges. `coil.SurfaceCoil.build` matches on
+   the element's `number`, which `geo_scoil_lumped_elements.m` already reads and
+   MARIE then ignores, and raises when a number names no interior edge.
+
+6. **Every edge shared by two triangles carries a basis function.**
+   `Mesh_PreProc.m` reaches the same set through a boundary flag `kn` that is
+   0 on a rim edge, the physical tag on a tagged edge and −1 elsewhere, and it
+   would give a half basis function to a tagged edge that lies on a rim. The
+   port takes the geometric rule instead: two triangles, one basis function;
+   one triangle, none. A tag on a rim edge therefore leaves its port empty,
+   which `build` reports rather than solving a coil whose current leaves the
+   sheet.
+
+A further decision sits in section 4.2 and in `PLAN.md`'s **Excluded** list rather
 than here: `gauss_1d.m` and `getLebedevSphere.m` ship without a licence, so
 neither is ported, and the rules they carry are obtained from first principles.
