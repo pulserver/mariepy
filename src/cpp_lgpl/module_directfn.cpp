@@ -19,6 +19,11 @@
  * DIRECTFN takes its Gauss-Legendre nodes and weights from the caller:
  * `GL_1D` is declared by the RWG headers but defined nowhere in that family.
  * `mariepy.quadrature.gauss_legendre_1d` supplies them.
+ *
+ * The voxel family's `kernel_type` selects which reduced kernel is integrated,
+ * and `Kernels.cpp` branches on 0 through 8. It is not the same index as the
+ * four surface-surface kernels the body operator reduces to: MARIE's N
+ * operator reaches for `kernel_type` 1 to 4, and its K operator for 5 and 6.
  */
 
 #include <complex>
@@ -263,8 +268,9 @@ PYBIND11_MODULE(_directfn, module)
                py::arg("n_points"), py::arg("kernel_type"), py::arg("l"),
                py::arg("lp"),
                "Coincident faces of one voxel. `vertices` is (4, 3), ordered as "
-               "DIRECTFN expects. `kernel_type`, `l` and `lp` each run 1 to 4 "
-               "and select the reduced kernel and the two scalar basis terms.");
+               "DIRECTFN expects. `kernel_type` runs 0 to 8 and selects the "
+               "reduced kernel; `l` and `lp` run 0 to 3 and select the scalar "
+               "term of the testing and basis function.");
 
     module.def("voxel_edge", &voxel_edge, py::arg("vertices"),
                py::arg("centre_source"), py::arg("centre_observer"),
