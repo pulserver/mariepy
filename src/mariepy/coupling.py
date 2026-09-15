@@ -154,10 +154,11 @@ def collocation_matrix(
     Returns
     -------
     torch.Tensor
-        Shape ``(3 * n_points, 3 * n_basis * n_cells)``, complex. Rows run
-        component-major over the points; columns run component-major, then
-        basis term, then cell, as ``pfft_proj_pwx_to_collocation.m`` orders
-        them.
+        Shape ``(3 * n_points, 3 * n_basis * n_cells)``, complex, in volts per
+        metre for one ampere per square metre in the cell: the cell volume is
+        carried here. Rows run component-major over the points; columns run
+        component-major, then basis term, then cell, as
+        ``pfft_proj_pwx_to_collocation.m`` orders them.
     """
     weights, nodes, factors = _cell_rule(cell_order, centres.device, centres.dtype)
     offsets = cell_size / 2.0 * nodes
@@ -172,8 +173,9 @@ def collocation_matrix(
         dtype=torch.complex128,
         device=centres.device,
     )
+    volume = cell_size**3
     for term in range(n_basis):
-        weighted = torch.einsum(
+        weighted = volume * torch.einsum(
             "g,pcgd->pcd", (weights * factors[term]).to(torch.complex128), dyadic
         )
         for row in range(3):

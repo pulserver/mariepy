@@ -166,7 +166,7 @@ def test_a_linear_cell_basis_weighs_the_field_by_its_first_moment_across_the_cel
         assert fine == pytest.approx(coarse / 4.0, rel=0.02)
 
 
-def test_the_collocation_matrix_is_the_body_kernel_of_a_cell_small_against_its_distance(
+def test_the_collocation_matrix_is_the_body_kernel_over_a_cell_small_against_its_distance(
     device,
 ):
     medium = _medium()
@@ -176,10 +176,11 @@ def test_the_collocation_matrix_is_the_body_kernel_of_a_cell_small_against_its_d
     points = torch.tensor(
         [[0.3, 0.1, 0.2], [0.2, 0.3, 0.1]], dtype=torch.float64, device=device
     )
-    matrix = coupling.collocation_matrix(centres, points, medium, cell_size=1e-5)
+    size = 1e-5
+    matrix = coupling.collocation_matrix(centres, points, medium, cell_size=size)
 
     separation = points[:, None, :] - centres[None, :, :]
-    dyadic = green_n(separation, medium.wavenumber) / medium.electric_scaling
+    dyadic = size**3 * green_n(separation, medium.wavenumber) / medium.electric_scaling
     for row in range(3):
         for column in range(3):
             block = matrix[row * 2 : (row + 1) * 2, column * 2 : (column + 1) * 2]
