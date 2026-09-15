@@ -121,8 +121,10 @@ package's single `_ext` module, following the package template and pypulseqpp.
   `torch.linalg`), so one code path runs on CPU or CUDA.
 - **GMRES.** MARIE's own GMRES (`is_gmres_svie.m`, `is_iter_gmres_svie.m`) is
   ported to torch together with its split preconditioner: an LU-factored coil
-  block and a diagonal body block. MathWorks' `iterchk.m` and `iterapp.m`, which
-  MARIE calls only to apply the operator, are not ported.
+  block and a diagonal body block. The Arnoldi division by the subdiagonal
+  Hessenberg entry, which MARIE leaves unguarded, exits on a happy breakdown.
+  MathWorks' `iterchk.m` and `iterapp.m`, which MARIE calls only to apply the
+  operator, are not ported.
 - **Loops.** The loops MATLAB runs with `parfor` are the body kernel tensor and
   the coil matrix's non-singular terms. They go to C++ in `_ext` when a profile
   shows they dominate.
@@ -134,11 +136,16 @@ against physics:
 
 1. **Body solver.** A homogeneous sphere, then a layered one, in a plane-wave
    incident field, compared with the analytic Mie series.
-2. **Coil matrix.** Checked by reciprocity (the port impedance matrix equals its
-   transpose) and by convergence as the surface mesh is refined.
+2. **Coil matrix.** Checked by reciprocity of each interaction block, and by
+   convergence as the surface mesh is refined.
 3. **Coupling and fields.** Checked by reciprocity of the coupled port matrix and
    by power balance: the power absorbed in the body, integrated from the fields,
    matches the absorbed power predicted from the port currents.
+
+MARIE symmetrises two of these quantities by construction: `Assembly_SIE_par.m`
+forms `Z + Zᵀ`, and `np_compute.m` forms `(Ip + Ipᵀ)/2`. A reciprocity check
+applied after either step passes whatever the physics says, so both checks are
+made on the quantity before its symmetrisation.
 
 Validation sets the tolerances.
 
@@ -161,8 +168,8 @@ it was measured on.
 | Linear solve | – | Final GMRES relative residual at or below `tol` for every port |
 | Compressed body operator | The uncompressed kernel on a small grid | Operator applied to random currents agrees within `tol_HOSVD` |
 | Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the helper functions each source repeats are made local with `objcopy --localize-symbol` so all variants link into one test binary | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
-| Coil matrix | – | Port impedance matrix symmetric within `tol`; port impedances converge as the mesh is refined |
-| Coupled system | – | Coupled port matrix symmetric within `tol`; body-absorbed power integrated from E equals the absorbed power predicted from the port currents, within `tol` |
+| Coil matrix | – | Each interaction block equals the independently computed transposed pair within `tol`, before `Z + Zᵀ` is formed; port impedances converge as the mesh is refined |
+| Coupled system | – | The port matrix is reciprocal within `tol` before `(Ip + Ipᵀ)/2` is formed; body-absorbed power integrated from E equals the absorbed power predicted from the port currents, within `tol` |
 
 **Milestone 2.**
 
@@ -197,8 +204,27 @@ it was measured on.
 
 **Test layout.** Every check runs on CPU on coarse grids, and the CUDA leg skips
 on a machine without a device. Refinement studies carry the `slow` marker and
-stay out of the default run. A failing check reports the measured error and the
-grid.
+stay out of the default run, so the default run checks the coarsest grid against
+its recorded value and the `slow` leg checks that the error falls with
+refinement. A failing check reports the measured error and the grid.
+
+**Acceptance.** A stage is accepted on the evidence its own checks produce, not
+on a reading of the physics by whoever merges it. Each stage lands as its own
+pull request carrying the checks its table above states, and merges when they
+pass. Where a stage meets something these criteria do not settle — a quantity
+with no reference, a choice between two defensible conventions — the pull
+request states the reading it took and why, in `PLAN.md` where the reading is a
+design decision and in the test name where it is an invariant.
+
+What this leaves uncovered is recorded rather than implied away:
+
+- A port that reproduces MARIE reproduces its errors with it. The Mie series is
+  the one independent reference here, and it reaches the body solver only.
+- Reciprocity and power balance are necessary and not sufficient. A wrong sign
+  or a wrong edge length can satisfy both.
+- Nothing above checks that the inputs are physically sensible: a coil geometry,
+  a tissue property at the working frequency, a body model's labels. Those are
+  checked where they enter, against their own sources.
 
 ## Constraints
 
@@ -210,10 +236,17 @@ grid.
 - **MARIE's LGPL files** stay outside the MIT code:
   - the DIRECTFN singular integrals, built as a separate extension module with
     their notice;
-  - the Dunavant triangle quadrature files, whose rules are taken from the
-    published paper or kept with that extension.
+  - the Dunavant triangle quadrature files, whose rules are taken from Dunavant
+    (1985) and checked by polynomial exactness, so the LGPL files themselves are
+    not carried.
 - **Excluded:** GPL, AGPL, non-commercial or unlicensed code, and model weights
-  under such terms. MathWorks' `iterapp.m` and `iterchk.m` are excluded too.
+  under such terms. MathWorks' `iterapp.m` and `iterchk.m` are excluded too, and
+  so are two quadrature files MARIE ships without a licence: `gauss_1d.m`,
+  Burkardt's `LEGENDRE_SET`, and `getLebedevSphere.m`, a translation of Laikov's
+  routines. Gauss–Legendre nodes and weights come from the Golub–Welsch
+  eigenvalue problem instead, and the 26 Lebedev directions — the only part of
+  that rule the precorrected FFT projection uses, since it discards the weights —
+  are the three octahedral orbits, generated in code.
 
 **Data.**
 
