@@ -116,6 +116,15 @@ def _boxed(centre: torch.Tensor, extent: torch.Tensor, target_mass: float) -> Cu
     )
 
 
+def _cube_root(value: float) -> float:
+    """Give the cube root of a positive number.
+
+    Spelled as a power rather than with ``math.cbrt``, which needs Python 3.11
+    where this package supports 3.10.
+    """
+    return value ** (1.0 / 3.0)
+
+
 def _prefix(grid: torch.Tensor) -> torch.Tensor:
     """Give the inclusive prefix sum of a grid, with a zero plane on each low face."""
     padded = torch.zeros(
@@ -264,7 +273,7 @@ def centred_cubes(
     shape = tuple(mass.shape)
     device = mass.device
     heaviest = float(mass[tissue].max())
-    start = max(0, math.floor((math.cbrt(target_mass / heaviest) - 1) / 2))
+    start = max(0, math.floor((_cube_root(target_mass / heaviest) - 1) / 2))
 
     mass_prefix = _prefix(mass)
     tissue_prefix = _prefix(tissue.to(torch.float64))
@@ -620,7 +629,7 @@ def face_cubes(
     centre = left.nonzero().to(torch.float64)
     prefix = _padded_prefix(mass)
     heaviest = float(mass[tissue].max())
-    start = max(0, math.floor((math.cbrt(target_mass / heaviest) - 1) / 2))
+    start = max(0, math.floor((_cube_root(target_mass / heaviest) - 1) / 2))
 
     sides = []
     for axis, sign in itertools.product(range(3), (1, -1)):
