@@ -45,7 +45,9 @@ def _port(
     }
 
 
-def _element(number, entity, symmetry, load="capacitor", value=1e-11, **bounds):
+def _element(
+    number, entity, symmetry, load="capacitor", value=1e-11, role="TxRx", **bounds
+):
     return {
         "number": number,
         "type": "element",
@@ -59,7 +61,7 @@ def _element(number, entity, symmetry, load="capacitor", value=1e-11, **bounds):
             "symmetry": symmetry,
         },
         "cross_talk": bounds.get("cross_talk", {}),
-        "excitation": {"entity": entity, "TxRx": "TxRx"},
+        "excitation": {"entity": entity, "TxRx": role},
     }
 
 
@@ -101,11 +103,12 @@ def _loops(n_loops, coupling=0.05, seed=0):
 
 
 def _loop_network(tmp_path, n_loops, role="TxRx"):
+    roles = [role] * n_loops if isinstance(role, str) else list(role)
     elements = [
-        _port(i + 1, i + 1, role=role, symmetry=i + 1, network=L_SECTION)
+        _port(i + 1, i + 1, role=roles[i], symmetry=i + 1, network=L_SECTION)
         for i in range(n_loops)
     ] + [
-        _element(n_loops + i + 1, i + 1, symmetry=n_loops + 1 + i)
+        _element(n_loops + i + 1, i + 1, symmetry=n_loops + 1 + i, role=roles[i])
         for i in range(n_loops)
     ]
     return cosim.read_network(_write(tmp_path, elements), tmd=True)
@@ -175,13 +178,6 @@ def test_a_mutual_pair_takes_one_coefficient_bounded_by_its_inductors(tmp_path):
     assert coupling.minimum == pytest.approx(0.1)
     assert coupling.maximum == pytest.approx(0.4)
     assert network.start()[coupling.group] == pytest.approx(0.2)
-
-
-def test_mixed_roles_are_refused(tmp_path):
-    elements = [_port(1, 1, role="Tx"), _port(2, 2, role="Rx", symmetry=2)]
-    network = cosim.read_network(_write(tmp_path, elements), tmd=False)
-    with pytest.raises(NotImplementedError, match="mixed roles"):
-        cosim.co_simulate(network, torch.eye(2, dtype=torch.complex128), OMEGA)
 
 
 def test_an_admittance_of_the_wrong_size_is_refused(tmp_path):
@@ -342,3 +338,94 @@ def test_calibrating_per_port_fields_combines_them_by_the_map():
     torch.testing.assert_close(
         combined[1], (mapping[:, 1, None, None] * per_port).sum(0)
     )
+
+
+# -- mixed roles ----------------------------------------------------------------
+
+
+def _coil_ports(coupling=0.2):
+    return circuit.reduce(
+        circuit.place_tuning(
+            _loops(2, coupling=coupling),
+            [2, 3],
+            ["capacitor"] * 2,
+            torch.tensor([2.5e-11, 2.5e-11]),
+            OMEGA,
+        ),
+        [0, 1],
+        [2, 3],
+    )
+
+
+@pytest.mark.parametrize(
+    ("roles", "transmit", "receive"),
+    [(("Rx", "TxRx"), [1], [0, 1]), (("Tx", "Rx"), [0], [1])],
+    ids=["receive and both", "transmit and receive"],
+)
+def test_each_side_sees_the_other_side_s_own_ports_detuned(
+    tmp_path, roles, transmit, receive
+):
+    elements = [
+        _port(1, 1, role=roles[0], values=[1.2e-11, 7e-12]),
+        _port(2, 2, role=roles[1], values=[2e-11, 5e-12]),
+    ]
+    network = cosim.read_network(_write(tmp_path, elements), tmd=False)
+    coil = _coil_ports()
+    result = cosim.co_simulate(network, coil, OMEGA)
+    assert result.transmit_ports == transmit
+    assert result.receive_ports == receive
+
+    detune = cosim.DETUNING_RESISTANCE
+    for column in range(len(transmit)):
+        voltage = result.transmit[:, column]
+        current = coil @ voltage
+        for other in {0, 1} - set(transmit):
+            torch.testing.assert_close(current[other], -voltage[other] / detune)
+    for column, port in enumerate(receive):
+        voltage = result.receive[:, column]
+        current = coil @ voltage
+        for other in {0, 1} - {port}:
+            load = cosim.PREAMPLIFIER_RESISTANCE if other in receive else detune
+            torch.testing.assert_close(current[other], -voltage[other] / load)
+
+    swept = cosim.sweep(network, coil, OMEGA, result, points=11)
+    torch.testing.assert_close(
+        swept.transmit_scattering[swept.index], result.scattering
+    )
+    torch.testing.assert_close(
+        swept.receive_scattering[swept.index], result.receive_scattering
+    )
+
+
+def test_a_detuned_port_takes_its_share_of_the_transmitted_power(tmp_path):
+    """Lossless networks: the coil and the detuning resistor take what is accepted."""
+    network = cosim.read_network(
+        _write(
+            tmp_path,
+            [
+                _port(1, 1, role="Rx", values=[1.2e-11, 7e-12]),
+                _port(2, 2, role="TxRx", values=[2e-11, 5e-12]),
+            ],
+        ),
+        tmd=False,
+    )
+    coil = _coil_ports(coupling=0.3)
+    result = cosim.co_simulate(network, coil, OMEGA)
+    voltage = result.transmit[:, 0]
+    taken = 0.5 * float((voltage.conj() @ coil @ voltage).real)
+    detuned = 0.5 * float(voltage[0].abs() ** 2) / cosim.DETUNING_RESISTANCE
+    accepted = 0.5 * (1 - float(result.scattering[0, 0].abs() ** 2))
+    assert taken + detuned == pytest.approx(accepted, rel=1e-9)
+
+
+def test_mixed_roles_are_searched_by_role_and_then_together(tmp_path):
+    network = _loop_network(tmp_path, 2, role=("Rx", "TxRx"))
+    admittance = _loops(2, coupling=0.01)
+    result = cosim.co_simulate(
+        network, admittance, OMEGA, tuning=SMALL, matching=SMALL, decoupling=SMALL
+    )
+    assert set(result.costs) == {"tuning", "matching", "split", "final"}
+    assert result.costs["final"] is not None
+    assert result.transmit.shape == (4, 1)
+    assert result.receive.shape == (4, 2)
+    assert float(result.scattering.abs().max()) < 0.2

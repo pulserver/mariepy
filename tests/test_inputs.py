@@ -85,7 +85,7 @@ def test_a_marie_simulation_file_gives_the_body_the_coil_and_the_frequency_it_na
     assert case.coil.n_driven == 1
     assert case.coil.ports[0].dofs.numel() > 0
     assert [t.number for t in case.network.terminals] == [1]
-    assert case.network.role == "Tx"
+    assert case.network.roles == {"Tx"}
     assert not case.network.tmd
 
 
@@ -145,7 +145,7 @@ def test_a_wire_coil_the_simulation_file_names_is_read_with_its_ports(tmp_path):
     assert isinstance(case.coil, WireCoil)
     assert case.coil.n_dof == 12
     assert case.coil.ports[0].dofs.tolist() == [0, 1]
-    assert case.network.role == "Tx"
+    assert case.network.roles == {"Tx"}
 
 
 @pytest.mark.parametrize(("basis", "linear"), [(0, False), (1, True)])

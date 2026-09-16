@@ -144,11 +144,13 @@ A wire coil together with a surface coil, or inside a shield, needs MARIE's
 wire-to-surface coupling and is not supported yet.
 
 **Co-simulation.** `cosim.py` ports MARIE's tuning, matching, decoupling and
-preamplifier-decoupling searches and its calibrations for coils whose ports
-share one role (`Tx`, `Rx` or `TxRx`), with the circuit numerics in
-`circuit.py`. MARIE's index masks become a table of rows read once from the
-element file. Coils that mix roles, which only MARIE's wire-coil files do, wait
-for the wire coils. The port departs from MARIE in six places:
+preamplifier-decoupling searches and its calibrations, with the circuit
+numerics in `circuit.py`. MARIE's index masks become a table of rows read once
+from the element file. MARIE writes one master file per mix of port roles; the
+port writes the idea they share once. The transmit side is every port that
+transmits, with the receive-only ports detuned; the receive side is every port
+that receives, with the transmit-only ports detuned. With one role throughout
+nothing is detuned. The port departs from MARIE in these places:
 
 - `calibration_tune_match_decouple.m` uses `SPs` without defining it, and
   MARIE's `Tx` search with optimisation stops there; the port defines it as
@@ -171,6 +173,13 @@ for the wire coils. The port departs from MARIE in six places:
   search cannot end worse than the per-entity ones.
 - Coupling-coefficient variables are numbered past every other variable,
   where MARIE's numbering can collide with a symmetry-offset one.
+- Where roles mix, MARIE's four cost and calibration copies differ in ways
+  the idea does not explain. The copy for all three roles detunes the
+  receive-only ports on its receive side, where it means the transmit-only
+  ones; the port detunes the other side's own ports throughout. The copy for
+  transmit-only with transmit-and-receive ports weighs no coupling, and the
+  port keeps that. MARIE adds a side's terms to the joint cost when that side's
+  own search found values; the port adds them when the side has ports.
 
 **Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
 package's single `_ext` module, following the package template and pypulseqpp.

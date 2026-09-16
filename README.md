@@ -85,10 +85,12 @@ closed = co_simulate(case.network, result.admittance, case.medium.angular_freque
 electric = calibrate(result.fields.electric, closed.transmit)
 ```
 
-With `"TMD": 0` the file's values are placed as they are. `closed.scattering`
-is the matched ports' reflection and coupling; `closed.receive` is the receive
-calibration of `Rx` and `TxRx` coils; `cosim.sweep` gives the matched ports
-across a band. The searches need scipy: `pip install "mariepy[cosim]"`.
+With `"TMD": 0` the file's values are placed as they are. `closed.transmit`
+has a column per transmitting port and `closed.receive` one per receiving
+port, as the element file assigns `Tx`, `Rx` and `TxRx`; `closed.scattering`
+is the transmitting ports' reflection and coupling; `cosim.sweep` gives the
+matched ports across a band. The searches need scipy:
+`pip install "mariepy[cosim]"`.
 
 ## Development
 

@@ -13,10 +13,12 @@ lumped values found in three searches, each MARIE's:
    without reactance (``runner_T.m``);
 2. matching and tuning, per entity: the matching networks as well, bringing
    the port resistance to the line impedance (``runner_M_T.m``);
-3. all entities together, adding the role's terms: port-to-port coupling for
-   transmit, the impedance each port shows its preamplifier with the others
-   preamplifier-decoupled for receive, both for ``TxRx``
-   (``runner_M_T_D.m``, ``runner_M_T_PD.m``, ``runner_M_T_D_PD.m``).
+3. all entities together, adding each side's terms: port-to-port coupling on
+   the transmit side, the impedance each port shows its preamplifier with the
+   others preamplifier-decoupled on the receive side (``runner_M_T_D.m``,
+   ``runner_M_T_PD.m``, ``runner_M_T_D_PD.m``). With mixed roles, each role's
+   rows are searched on their own first (``runner_M_T_D_PD_split.m``), then all
+   together with the other side detuned (``runner_*_M_T_PD_DT_*_M_T_D.m``).
 
 The searches use scipy's differential evolution where MARIE uses
 ``particleswarm``, with its restarts, growing population and narrowing
@@ -42,6 +44,7 @@ import torch
 from mariepy import circuit
 
 __all__ = [
+    "DETUNING_RESISTANCE",
     "PREAMPLIFIER_RESISTANCE",
     "CoSimulation",
     "Component",
@@ -58,6 +61,9 @@ __all__ = [
 
 PREAMPLIFIER_RESISTANCE = 1500.0
 """MARIE's ``emc.Preamp_res``, in ohms."""
+
+DETUNING_RESISTANCE = 1e5
+"""MARIE's ``emc.Detune_res``, in ohms: what a port of the other role presents."""
 
 ROLES = ("Tx", "Rx", "TxRx")
 
@@ -178,20 +184,9 @@ class Network:
         return [i for i, t in enumerate(self.terminals) if t.kind == "element"]
 
     @property
-    def role(self) -> str:
-        """Return the role every port shares.
-
-        Raises
-        ------
-        NotImplementedError
-            If the ports mix roles.
-        """
-        roles = {self.terminals[i].role for i in self.ports}
-        if len(roles) != 1:
-            raise NotImplementedError(
-                f"ports with mixed roles {sorted(roles)} are not supported yet"
-            )
-        return roles.pop()
+    def roles(self) -> set[str]:
+        """Return the roles the ports take."""
+        return {self.terminals[i].role for i in self.ports}
 
     @property
     def entities(self) -> list[int]:
@@ -674,6 +669,96 @@ def _receive_cost(impedance, optimised, reference):
     return _norm(impedance[..., optimised].real - reference) + _norm(impedance.imag)
 
 
+@dataclass(frozen=True)
+class _Sides:
+    """Say which of a layout's ports transmit, which receive, and which are detuned.
+
+    Positions are among the layout's ports. ``decouple`` is off only where
+    MARIE's own cost for transmit-only and transmit-and-receive ports together
+    weighs no coupling.
+    """
+
+    transmit: list[int]
+    receive: list[int]
+    transmit_only: list[int]
+    receive_only: list[int]
+    decouple: bool
+
+    @classmethod
+    def of(cls, roles: list[str]) -> _Sides:
+        present = set(roles)
+        return cls(
+            transmit=[i for i, r in enumerate(roles) if r in ("Tx", "TxRx")],
+            receive=[i for i, r in enumerate(roles) if r in ("Rx", "TxRx")],
+            transmit_only=[i for i, r in enumerate(roles) if r == "Tx"],
+            receive_only=[i for i, r in enumerate(roles) if r == "Rx"],
+            decouple=present != {"Tx", "TxRx"},
+        )
+
+
+def _detune(admittance, keep, detuned, resistance):
+    """Terminate the detuned ports in the detuning resistance and eliminate them.
+
+    Returns the admittance the kept ports see, and the whole terminated one.
+    """
+    loaded = admittance.clone()
+    if detuned:
+        index = torch.tensor(detuned, dtype=torch.long)
+        loaded[..., index, index] += 1.0 / resistance
+    return circuit.reduce(loaded, keep, detuned), loaded
+
+
+def _subset(stages: tuple, ports: list[int]) -> tuple:
+    """Return the matching stages of some ports, as stages of a smaller network."""
+    index = torch.tensor(ports, dtype=torch.long)
+    return tuple(
+        circuit.Stage(
+            loads=tuple(stage.loads[i] for i in ports),
+            values=stage.values.index_select(-1, index),
+            quality=None if stage.quality is None else stage.quality[index],
+        )
+        for stage in stages
+    )
+
+
+def _positions(side: list[int], optimised: list[int]) -> list[int]:
+    """Return where the optimised ports fall within a side."""
+    chosen = set(optimised)
+    return [k for k, port in enumerate(side) if port in chosen]
+
+
+def _side_cost(layout, x, omega, reference, preamplifier, detuning):
+    """Weigh a layout's candidates as MARIE's ``matching_and_tuning_and_*`` do.
+
+    The transmit side weighs its ports' match and, where MARIE does, their
+    coupling; the receive side weighs the impedance each port shows its
+    preamplifier. Each enters when the side has ports.
+    """
+    sides = _Sides.of(layout.roles)
+    coil = layout.ports_admittance(layout.tuned(x, omega))
+    stages = layout.stages(x)
+    total = torch.zeros(x.shape[0], dtype=torch.float64)
+    if sides.transmit:
+        seen, _ = _detune(coil, sides.transmit, sides.receive_only, detuning)
+        impedance, _ = circuit.place_matching(
+            seen, _subset(stages, sides.transmit), omega
+        )
+        total = total + _matching_cost(
+            impedance, _positions(sides.transmit, layout.optimised), reference
+        )
+        if sides.decouple:
+            total = total + _decoupling_cost(impedance)
+    if sides.receive:
+        seen, _ = _detune(coil, sides.receive, sides.transmit_only, detuning)
+        received = _receive_impedance(
+            seen, _subset(stages, sides.receive), omega, preamplifier
+        )
+        total = total + _receive_cost(
+            received, _positions(sides.receive, layout.optimised), reference
+        )
+    return total
+
+
 # --------------------------------------------------------------------------
 # Search
 # --------------------------------------------------------------------------
@@ -885,53 +970,102 @@ def _match(
     return matched, costs, narrowed
 
 
-def _decouple(
-    network,
-    role,
-    admittance,
-    omega,
-    reference,
-    resistance,
-    seed,
-    search,
-    matched,
-    costs,
-    narrowed,
-):
-    """``runner_M_T_D.m`` and its receive variants: every entity at once."""
-    layout = _Layout.build(
-        network, admittance, list(range(len(network.terminals))), matching=True
-    )
-    if len(layout.ports) <= 1 or not layout.n_variables:
-        return dict(matched), None
-    if sum(costs.values()) > 1:
-        factors = (0.5, 1.5)
-        bounds = [
+def _bounds(layout, around, narrowed, factors, use_narrowed):
+    """MARIE's bounds for a later search: its predecessor's, or around its values."""
+    if use_narrowed:
+        pairs = [
             narrowed.get(g, (layout.lower[i], layout.upper[i]))
             for i, g in enumerate(layout.groups)
         ]
     else:
-        factors = _NARROWING[role]
-        bounds = [_around(matched[g], *factors) for g in layout.groups]
-    lower = np.array([b[0] for b in bounds])
-    upper = np.array([b[1] for b in bounds])
+        pairs = [_around(around[g], *factors) for g in layout.groups]
+    return np.array([b[0] for b in pairs]), np.array([b[1] for b in pairs])
 
-    def cost(x):
-        coil = layout.ports_admittance(layout.tuned(x, omega))
-        stages = layout.stages(x)
-        total = torch.zeros(x.shape[0], dtype=torch.float64)
-        if role in ("Tx", "TxRx"):
-            impedance, _ = circuit.place_matching(coil, stages, omega)
-            total = total + _matching_cost(impedance, layout.optimised, reference)
-            total = total + _decoupling_cost(impedance)
-        if role in ("Rx", "TxRx"):
-            received = _receive_impedance(coil, stages, omega, resistance)
-            total = total + _receive_cost(received, layout.optimised, reference)
-        return total
 
-    start = [matched[g] for g in layout.groups]
+def _decouple(
+    network, admittance, omega, options, seed, search, values, costs, narrowed
+):
+    """``runner_M_T_D.m`` and its receive variants: every entity at once, one role."""
+    (role,) = network.roles
+    layout = _Layout.build(
+        network, admittance, list(range(len(network.terminals))), matching=True
+    )
+    if len(layout.ports) <= 1 or not layout.n_variables:
+        return {}, None
+    failed = sum(costs.values()) > 1
+    factors = (0.5, 1.5) if failed else _NARROWING[role]
+    lower, upper = _bounds(layout, values, narrowed, factors, failed)
     x, best = _minimise(
-        cost, lower, upper, search, seed, narrowing=factors, start=start
+        lambda x: _side_cost(layout, x, omega, *options),
+        lower,
+        upper,
+        search,
+        seed,
+        narrowing=factors,
+        start=[values[g] for g in layout.groups],
+    )
+    return dict(zip(layout.groups, x.tolist(), strict=True)), best
+
+
+def _search_roles(
+    network, admittance, omega, options, seed, search, values, costs, narrowed
+):
+    """``runner_M_T_D_PD_split.m``: each role's rows on their own, the rest open."""
+    port_entities = {
+        role: {
+            e
+            for i in network.ports
+            if network.terminals[i].role == role
+            for e in network.terminals[i].entities
+        }
+        for role in ROLES
+    }
+    found, scores = {}, []
+    for role in ("Rx", "Tx", "TxRx"):
+        rows = [i for i, t in enumerate(network.terminals) if t.role == role]
+        ports = [i for i in rows if network.terminals[i].kind == "port"]
+        if not ports:
+            continue
+        matched = sum(costs.get(e, 0.0) for e in port_entities[role])
+        layout = _Layout.build(network, admittance, rows, matching=True)
+        if not layout.n_variables:
+            scores.append(matched)
+            continue
+        factors = (0.5, 1.5) if matched > 1 else (0.8, 1.2)
+        lower, upper = _bounds(layout, values, narrowed, factors, matched > 50)
+        x, best = _minimise(
+            lambda x, layout=layout: _side_cost(layout, x, omega, *options),
+            lower,
+            upper,
+            search,
+            seed,
+            narrowing=factors,
+            start=[values[g] for g in layout.groups],
+        )
+        found.update(zip(layout.groups, x.tolist(), strict=True))
+        scores.append(best if len(ports) > 1 else matched)
+    return found, sum(scores) / max(1, len(scores))
+
+
+def _search_joint(
+    network, admittance, omega, options, seed, search, values, score, narrowed
+):
+    """``runner_*_M_T_PD_DT_*_M_T_D.m``: every role together, the other side detuned."""
+    layout = _Layout.build(
+        network, admittance, list(range(len(network.terminals))), matching=True
+    )
+    if len(layout.ports) <= 1 or not layout.n_variables:
+        return {}, None
+    factors = (0.5, 1.5) if score > 50 else (0.95, 1.05)
+    lower, upper = _bounds(layout, values, narrowed, factors, score > 100)
+    x, best = _minimise(
+        lambda x: _side_cost(layout, x, omega, *options),
+        lower,
+        upper,
+        search,
+        seed,
+        narrowing=factors,
+        start=[values[g] for g in layout.groups],
     )
     return dict(zip(layout.groups, x.tolist(), strict=True)), best
 
@@ -951,36 +1085,43 @@ class CoSimulation:
         Each terminal's values, in :attr:`Network.terminals` order.
     couplings
         Each coupling's coefficient, by its search variable.
+    transmit_ports, receive_ports
+        The rows of the ports on each side.
     transmit
-        For ``Tx`` and ``TxRx``: the voltage on every solver port per unit wave
-        incident on each matched port's network, shape ``(n_rows, n_ports)``.
-        MARIE's ``M_cal`` (``M_cal.tx`` for ``TxRx``) holds the same map to the
-        wave rather than the voltage. Else None.
+        The voltage on every solver port per unit wave incident on each
+        transmitting port's network, the receive-only ports detuned, shape
+        ``(n_rows, n_transmit)``. MARIE's ``M_cal`` (``M_cal.tx`` where there
+        are two sides) holds the same map to the wave rather than the voltage.
+        None without transmitting ports.
     receive
-        For ``Rx`` and ``TxRx``: the same with every other port terminated in
-        the preamplifier resistance, as MARIE's ``M_cal.rx`` builds it. Else
-        None.
+        The same for each receiving port, the transmit-only ports detuned and
+        the other receiving ports terminated in the preamplifier resistance,
+        as MARIE's ``M_cal.rx`` builds it. None without receiving ports.
     admittance
         The coil ports' admittance with the tuning elements placed, lossy,
         MARIE's returned ``YPm``.
     impedance, scattering
-        The matched ports' impedance and scattering parameters, lossy.
+        The transmitting ports' matched impedance and scattering parameters,
+        lossy, or every port's without transmitting ports.
     receive_scattering
-        Each port's reflection with the others preamplifier-decoupled, for
-        ``Rx`` and ``TxRx``, MARIE's ``SP_check``. Else None.
+        Each receiving port's reflection with the others
+        preamplifier-decoupled, MARIE's ``SP_check``, or None.
     transmit_dissipation, receive_dissipation
         Per port, half the resistance the matching elements' losses add, over
         the squared magnitude of the port impedance: MARIE's
         ``phi_lumped_elements``, which stores the transmit one on a diagonal.
-        The receive one is None for ``Tx``.
+        The receive one is None without receiving ports.
     costs
         The cost each search reached: ``"tuning"`` and ``"matching"`` per
-        entity, ``"final"`` for the joint search (None when it did not run).
-        Empty without a search.
+        entity, ``"split"`` per role group's mean where roles mix, ``"final"``
+        for the joint search (None when it did not run). Empty without a
+        search.
     """
 
     values: tuple[tuple[float, ...], ...]
     couplings: dict[int, float]
+    transmit_ports: list[int]
+    receive_ports: list[int]
     transmit: torch.Tensor | None
     receive: torch.Tensor | None
     admittance: torch.Tensor
@@ -1004,7 +1145,16 @@ def _dissipation(lossy: torch.Tensor, lossless: torch.Tensor) -> torch.Tensor:
     return 0.5 * (lossless - lossy).real.abs() / lossy.abs() ** 2
 
 
-def _calibrate(network, admittance, omega, values, reference, resistance):
+def _detuning_map(loaded, side):
+    """Map a side's voltages to every port's, as ``M_detune_*`` does."""
+    full = torch.linalg.inv(loaded)
+    columns = full[:, side]
+    return torch.linalg.solve(
+        columns[side].transpose(0, 1), columns.transpose(0, 1)
+    ).transpose(0, 1)
+
+
+def _calibrate(network, admittance, omega, values, reference, preamplifier, detuning):
     """``calibration_tune_match_*.m`` and ``calibration_match_*.m``.
 
     Where MARIE maps the incident wave to the coil through
@@ -1012,10 +1162,10 @@ def _calibrate(network, admittance, omega, values, reference, resistance):
     scattering parameters alone, the map here is the exact one through the
     matching elements, :func:`mariepy.circuit.coil_voltage`.
     """
-    role = network.role
     layout = _Layout.build(
         network, admittance, list(range(len(network.terminals))), matching=True
     )
+    sides = _Sides.of(layout.roles)
     x = layout.vector(values)
     placed = layout.tuned(x, omega, lossy=True)[0]
     placed_lossless = layout.tuned(x, omega, lossless=True)[0]
@@ -1025,46 +1175,56 @@ def _calibrate(network, admittance, omega, values, reference, resistance):
         tuning = circuit.tuning_calibration(placed, layout.ports, layout.elements)
     else:
         tuning = torch.eye(len(layout.ports), dtype=torch.complex128)
-
     stages = _first(layout.stages(x, lossy=True))
-    impedance, impedance_lossless = circuit.place_matching(
-        coil, stages, omega, lossless=coil_lossless
-    )
-    scattering = circuit.z_to_s(impedance, reference)
-    transmit_dissipation = _dissipation(
-        _diagonal(impedance), _diagonal(impedance_lossless)
-    )
 
+    shown = sides.transmit or list(range(len(layout.ports)))
+    seen, loaded = _detune(coil, shown, sides.receive_only, detuning)
+    seen_lossless, _ = _detune(coil_lossless, shown, sides.receive_only, detuning)
+    chain = _subset(stages, shown)
+    impedance, impedance_lossless = circuit.place_matching(
+        seen, chain, omega, lossless=seen_lossless
+    )
     transmit = None
-    if role in ("Tx", "TxRx"):
-        transmit = tuning @ circuit.coil_voltage(coil, stages, omega, reference)
+    if sides.transmit:
+        transmit = (
+            tuning
+            @ _detuning_map(loaded, shown)
+            @ circuit.coil_voltage(seen, chain, omega, reference)
+        )
 
     receive = receive_scattering = receive_dissipation = None
-    if role in ("Rx", "TxRx"):
-        n = len(layout.ports)
+    if sides.receive:
+        side, loaded = _detune(coil, sides.receive, sides.transmit_only, detuning)
+        side_lossless, _ = _detune(
+            coil_lossless, sides.receive, sides.transmit_only, detuning
+        )
+        chain = _subset(stages, sides.receive)
+        n = len(sides.receive)
         decoupling = torch.zeros((n, n), dtype=torch.complex128)
         drive = torch.zeros((n, n), dtype=torch.complex128)
         received = torch.zeros(n, dtype=torch.complex128)
         received_lossless = torch.zeros(n, dtype=torch.complex128)
         for port in range(n):
-            loaded, rest = _preamplifier_loaded(coil, port, resistance)
-            loaded_lossless, _ = _preamplifier_loaded(coil_lossless, port, resistance)
-            full = torch.linalg.inv(loaded)
+            terminated, rest = _preamplifier_loaded(side, port, preamplifier)
+            terminated_lossless, _ = _preamplifier_loaded(
+                side_lossless, port, preamplifier
+            )
+            full = torch.linalg.inv(terminated)
             decoupling[:, port] = full[:, port] / full[port, port]
-            single = circuit.reduce(loaded, [port], rest)
-            chain = _single_port_stages(stages, port)
+            single = circuit.reduce(terminated, [port], rest)
+            own = _single_port_stages(chain, port)
             z, z_lossless = circuit.place_matching(
                 single,
-                chain,
+                own,
                 omega,
-                lossless=circuit.reduce(loaded_lossless, [port], rest),
+                lossless=circuit.reduce(terminated_lossless, [port], rest),
             )
-            drive[port, port] = circuit.coil_voltage(single, chain, omega, reference)[
+            drive[port, port] = circuit.coil_voltage(single, own, omega, reference)[
                 0, 0
             ]
             received[port] = z[0, 0]
             received_lossless[port] = z_lossless[0, 0]
-        receive = tuning @ decoupling @ drive
+        receive = tuning @ _detuning_map(loaded, sides.receive) @ decoupling @ drive
         receive_scattering = (received - reference) / (received + reference)
         receive_dissipation = _dissipation(received, received_lossless)
 
@@ -1075,16 +1235,21 @@ def _calibrate(network, admittance, omega, values, reference, resistance):
         )
         for terminal in network.terminals
     )
+    rows = network.ports
     return {
         "values": per_row,
         "couplings": {c.group: values[c.group] for c in network.couplings},
+        "transmit_ports": [rows[i] for i in sides.transmit],
+        "receive_ports": [rows[i] for i in sides.receive],
         "transmit": transmit,
         "receive": receive,
         "admittance": coil,
         "impedance": impedance,
-        "scattering": scattering,
+        "scattering": circuit.z_to_s(impedance, reference),
         "receive_scattering": receive_scattering,
-        "transmit_dissipation": transmit_dissipation,
+        "transmit_dissipation": _dissipation(
+            _diagonal(impedance), _diagonal(impedance_lossless)
+        ),
         "receive_dissipation": receive_dissipation,
     }
 
@@ -1096,6 +1261,7 @@ def co_simulate(
     *,
     reference: float = 50.0,
     preamplifier_resistance: float = PREAMPLIFIER_RESISTANCE,
+    detuning_resistance: float = DETUNING_RESISTANCE,
     seed: int = 0,
     tuning: Search = TUNING,
     matching: Search = MATCHING,
@@ -1103,9 +1269,9 @@ def co_simulate(
 ) -> CoSimulation:
     """Close a solved coil with its lumped values and calibrate its ports.
 
-    Ported from ``co_simulation.m`` and its ``Tx``, ``Rx`` and ``TxRx``
-    masters. With :attr:`Network.tmd` set, the values are searched; otherwise
-    the file's values are used, and only the matching networks are placed.
+    Ported from ``co_simulation.m`` and its masters. With :attr:`Network.tmd`
+    set, the values are searched; otherwise the file's values are used, and
+    only the matching networks are placed.
 
     Parameters
     ----------
@@ -1119,13 +1285,15 @@ def co_simulate(
         Line impedance in ohms, MARIE's ``emc.Z0``.
     preamplifier_resistance
         The resistance a preamplifier presents, MARIE's ``emc.Preamp_res``.
+    detuning_resistance
+        The resistance a detuned port presents, MARIE's ``emc.Detune_res``.
     seed
         Seeds the searches; each restart adds its own count, as MARIE's
         ``rng(counter_repeat)`` does.
     tuning, matching
         How the two per-entity searches run.
     decoupling
-        How the joint search runs; by default as MARIE runs it for the role.
+        How the later searches run; by default as MARIE runs them.
 
     Returns
     -------
@@ -1143,7 +1311,8 @@ def co_simulate(
             f"the admittance has {admittance.shape[-1]} ports, the network "
             f"{len(network.terminals)} terminals: solve with the same TMD flag"
         )
-    role = network.role
+    roles = network.roles
+    options = (reference, preamplifier_resistance, detuning_resistance)
     values = network.start()
     costs: dict = {}
     if network.tmd:
@@ -1161,24 +1330,51 @@ def co_simulate(
             tuning_cost,
         )
         values.update(matched)
-        final, final_cost = _decouple(
-            network,
-            role,
-            admittance,
-            omega,
-            reference,
-            preamplifier_resistance,
-            seed,
-            decoupling or (RECEIVE_DECOUPLING if role == "Rx" else DECOUPLING),
-            values,
-            matching_cost,
-            narrowed,
-        )
+        costs = {"tuning": tuning_cost, "matching": matching_cost}
+        if len(roles) == 1:
+            search = decoupling or (
+                RECEIVE_DECOUPLING if roles == {"Rx"} else DECOUPLING
+            )
+            final, final_cost = _decouple(
+                network,
+                admittance,
+                omega,
+                options,
+                seed,
+                search,
+                values,
+                matching_cost,
+                narrowed,
+            )
+        else:
+            search = decoupling or DECOUPLING
+            split, score = _search_roles(
+                network,
+                admittance,
+                omega,
+                options,
+                seed,
+                search,
+                values,
+                matching_cost,
+                narrowed,
+            )
+            values.update(split)
+            costs["split"] = score
+            final, final_cost = _search_joint(
+                network,
+                admittance,
+                omega,
+                options,
+                seed,
+                search,
+                values,
+                score,
+                narrowed,
+            )
         values.update(final)
-        costs = {"tuning": tuning_cost, "matching": matching_cost, "final": final_cost}
-    calibrated = _calibrate(
-        network, admittance, omega, values, reference, preamplifier_resistance
-    )
+        costs["final"] = final_cost
+    calibrated = _calibrate(network, admittance, omega, values, *options)
     return CoSimulation(costs=costs, **calibrated)
 
 
@@ -1216,9 +1412,10 @@ class Sweep:
     index
         The entry that is the working frequency.
     transmit_impedance, transmit_scattering
-        Shape ``(n_frequencies, n_ports, n_ports)``, or None for ``Rx``.
+        Shape ``(n_frequencies, n_transmit, n_transmit)``, or None without
+        transmitting ports.
     receive_impedance, receive_scattering
-        Shape ``(n_frequencies, n_ports)``, or None for ``Tx``.
+        Shape ``(n_frequencies, n_receive)``, or None without receiving ports.
     """
 
     frequency: torch.Tensor
@@ -1239,12 +1436,13 @@ def sweep(
     points: int = 5000,
     reference: float = 50.0,
     preamplifier_resistance: float = PREAMPLIFIER_RESISTANCE,
+    detuning_resistance: float = DETUNING_RESISTANCE,
 ) -> Sweep:
     """Sweep the lumped elements' frequency around the working one.
 
-    Ported from ``get_ZPm_{Tx,Rx,TxRx}_freq.m``. As there, only the lumped
-    elements see the frequency change: the coil's admittance stays the one
-    solved at ``omega``.
+    Ported from ``get_ZPm_*_freq.m``. As there, only the lumped elements see
+    the frequency change: the coil's admittance stays the one solved at
+    ``omega``.
 
     Parameters
     ----------
@@ -1257,7 +1455,7 @@ def sweep(
     points
         Number of frequencies; the one nearest the working frequency is
         replaced by it.
-    reference, preamplifier_resistance
+    reference, preamplifier_resistance, detuning_resistance
         As given to :func:`co_simulate`.
 
     Returns
@@ -1265,7 +1463,6 @@ def sweep(
     Sweep
         The matched ports' parameters across the band, lossy.
     """
-    role = network.role
     admittance = admittance.detach().to(torch.complex128).cpu()
     centre = omega / (2 * math.pi)
     frequency = torch.linspace(
@@ -1278,18 +1475,23 @@ def sweep(
     layout = _Layout.build(
         network, admittance, list(range(len(network.terminals))), matching=True
     )
+    sides = _Sides.of(layout.roles)
     x = layout.vector(network.values_of(result)).expand(points, -1)
     coil = layout.ports_admittance(layout.tuned(x, omegas, lossy=True))
     stages = layout.stages(x, lossy=True)
 
     transmit_impedance = transmit_scattering = None
     receive_impedance = receive_scattering = None
-    if role in ("Tx", "TxRx"):
-        transmit_impedance, _ = circuit.place_matching(coil, stages, omegas)
+    if sides.transmit:
+        seen, _ = _detune(coil, sides.transmit, sides.receive_only, detuning_resistance)
+        transmit_impedance, _ = circuit.place_matching(
+            seen, _subset(stages, sides.transmit), omegas
+        )
         transmit_scattering = circuit.z_to_s(transmit_impedance, reference)
-    if role in ("Rx", "TxRx"):
+    if sides.receive:
+        seen, _ = _detune(coil, sides.receive, sides.transmit_only, detuning_resistance)
         receive_impedance = _receive_impedance(
-            coil, stages, omegas, preamplifier_resistance
+            seen, _subset(stages, sides.receive), omegas, preamplifier_resistance
         )
         receive_scattering = (receive_impedance - reference) / (
             receive_impedance + reference
