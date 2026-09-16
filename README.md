@@ -61,7 +61,9 @@ b1_plus, b1_minus = circular_components(result.operator, result.fields)
 ```
 
 A wire coil, `WireCoil.read_gmsh22` or `WireCoil.loop`, goes to `solve` in the
-same place; a simulation file naming a `WireFile` reads into one.
+same place, and so does a `CombinedCoil` of a wire coil and a surface coil; a
+simulation file naming a `WireFile`, with or without a `CoilFile`, reads into
+one of them.
 
 `linear=True` gives the body the piecewise-linear basis, twelve unknowns per
 voxel, which carries the field's variation inside each voxel; the fields then

@@ -58,11 +58,13 @@ __all__ = [
 # collocation sphere and the near distance are both sized from it.
 EXPANSION = 3
 
-Coil = SurfaceCoil | wire_module.WireCoil
+Coil = SurfaceCoil | wire_module.WireCoil | wire_module.CombinedCoil
 
 
 def _nodes(coil: Coil) -> torch.Tensor:
     """Every point the coil reaches."""
+    if isinstance(coil, wire_module.CombinedCoil):
+        return torch.cat([_nodes(coil.wire), _nodes(coil.surface)])
     if isinstance(coil, wire_module.WireCoil):
         return coil.points()
     return coil.mesh.nodes
@@ -70,6 +72,8 @@ def _nodes(coil: Coil) -> torch.Tensor:
 
 def _anchors(coil: Coil) -> torch.Tensor:
     """Where each basis function sits: its edge's midpoint, or its wire node."""
+    if isinstance(coil, wire_module.CombinedCoil):
+        return torch.cat([_anchors(coil.wire), _anchors(coil.surface)])
     if isinstance(coil, wire_module.WireCoil):
         return coil.centre
     nodes = coil.mesh.nodes
@@ -82,8 +86,14 @@ def _width_in_cells(coil: Coil, resolution: float) -> int:
 
     A surface basis function is as wide as its widest triangle edge
     (``pfft_surface_domain.m``); a wire one as its rising segment, rounded up
-    before the mean (``pfft_wire_domain.m``).
+    before the mean (``pfft_wire_domain.m``); for both together, the wider of
+    the two (``pfft_wire_surface_domain.m``).
     """
+    if isinstance(coil, wire_module.CombinedCoil):
+        return max(
+            _width_in_cells(coil.wire, resolution),
+            _width_in_cells(coil.surface, resolution),
+        )
     if isinstance(coil, wire_module.WireCoil):
         return math.ceil(float(torch.ceil(coil.left_lengths() / resolution).mean()))
     lengths = coil.mesh.edge_lengths()
@@ -110,6 +120,27 @@ def _field(
     **arguments,
 ) -> torch.Tensor:
     """Return the field each named basis function puts on its observer."""
+    if isinstance(coil, wire_module.CombinedCoil):
+        n_wire = coil.wire.n_dof
+        on_wire = dofs < n_wire
+        out = torch.zeros(
+            (dofs.numel(), 3), dtype=torch.complex128, device=points.device
+        )
+        for part, chosen, shift in (
+            (coil.wire, on_wire, 0),
+            (coil.surface, ~on_wire, n_wire),
+        ):
+            if bool(chosen.any()):
+                out[chosen] = _field(
+                    part,
+                    dofs[chosen] - shift,
+                    points[chosen],
+                    medium,
+                    magnetic=magnetic,
+                    order=order,
+                    **arguments,
+                )
+        return out
     if isinstance(coil, wire_module.WireCoil):
         kernel = wire_module.coupling_k if magnetic else wire_module.coupling_n
         return kernel(coil, dofs, points, medium, order=order, **arguments)

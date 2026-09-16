@@ -26,7 +26,7 @@ from mariepy.coil import SurfaceCoil, read_lumped_elements
 from mariepy.constants import Medium
 from mariepy.cosim import Network, read_network
 from mariepy.mesh import SurfaceMesh
-from mariepy.wire import WireCoil
+from mariepy.wire import CombinedCoil, WireCoil
 
 __all__ = ["Case", "read_case"]
 
@@ -42,7 +42,8 @@ class Case:
     body
         The body model.
     coil
-        The surface or wire coil, its ports and its lumped elements.
+        The surface coil, the wire coil, or both together, with their ports
+        and lumped elements.
     linear
         Whether the file asks for the piecewise-linear body basis; pass it to
         :func:`~mariepy.solver.solve`.
@@ -51,12 +52,13 @@ class Case:
         :func:`~mariepy.solver.solve`.
     network
         The coil's ports and lumped values as co-simulation reads them, with
-        the file's ``TMD`` flag; pass it to :func:`~mariepy.cosim.co_simulate`.
+        the file's ``TMD`` flag, the wire's first; pass it to
+        :func:`~mariepy.cosim.co_simulate`.
     """
 
     medium: Medium
     body: VoxelBody
-    coil: SurfaceCoil | WireCoil
+    coil: SurfaceCoil | WireCoil | CombinedCoil
     linear: bool = False
     shield: SurfaceCoil | None = None
     network: Network | None = None
@@ -89,8 +91,7 @@ def read_case(
     Raises
     ------
     NotImplementedError
-        If the file asks for a wire coil and a surface coil together, or for a
-        precomputed field basis.
+        If the file asks for a precomputed field basis alone.
     ValueError
         If the file names no coil, or a body basis MARIE does not know.
     """
@@ -107,24 +108,31 @@ def read_case(
         raise NotImplementedError(
             f"{path.name} asks for a precomputed field basis, which is milestone 4"
         )
-    if coil_name and wire_name:
-        raise NotImplementedError(
-            f"{path.name} names a wire coil and a surface coil together, "
-            "which is not supported yet"
-        )
     if not (coil_name or wire_name):
         raise ValueError(f"{path.name} names no coil")
 
     tmd = bool(settings.get("TMD", 0))
+    element_files = []
+    wire = surface = None
     if wire_name:
-        coil_file = data / "coils" / "wire_files" / wire_name
-        elements = read_lumped_elements(coil_file.with_suffix(".json"), tmd=tmd)
-        coil = WireCoil.read_gmsh22(coil_file, elements, device=device or "cpu")
-    else:
+        wire_file = data / "coils" / "wire_files" / wire_name
+        element_files.append(wire_file.with_suffix(".json"))
+        wire = WireCoil.read_gmsh22(
+            wire_file,
+            read_lumped_elements(element_files[-1], tmd=tmd),
+            device=device or "cpu",
+        )
+    if coil_name:
         coil_file = data / "coils" / "coil_files" / coil_name
-        mesh = SurfaceMesh.read_gmsh22(coil_file, device=device or "cpu")
-        elements = read_lumped_elements(coil_file.with_suffix(".json"), tmd=tmd)
-        coil = SurfaceCoil.build(mesh, elements)
+        element_files.append(coil_file.with_suffix(".json"))
+        surface = SurfaceCoil.build(
+            SurfaceMesh.read_gmsh22(coil_file, device=device or "cpu"),
+            read_lumped_elements(element_files[-1], tmd=tmd),
+        )
+    if wire is not None and surface is not None:
+        coil = CombinedCoil(wire=wire, surface=surface)
+    else:
+        coil = wire if wire is not None else surface
 
     shield = None
     if settings.get("ShieldFile"):
@@ -145,5 +153,5 @@ def read_case(
         coil=coil,
         linear=basis == 1,
         shield=shield,
-        network=read_network(coil_file.with_suffix(".json"), tmd=tmd),
+        network=read_network(*element_files, tmd=tmd),
     )

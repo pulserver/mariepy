@@ -378,3 +378,68 @@ def test_a_two_port_wire_coil_is_reciprocal_before_it_is_symmetrised():
     )
     asymmetry = (admittance - admittance.T).abs().max()
     assert float(asymmetry) <= 1e-6 * float(admittance.abs().max())
+
+
+# -- a wire coil and a surface coil together -------------------------------------
+
+
+def _pair(separation, *, n_around=32):
+    from mariepy.coil import SurfaceCoil
+    from mariepy.mesh import SurfaceMesh
+
+    surface = SurfaceCoil.build(
+        SurfaceMesh.loop(
+            radius=LOOP_RADIUS, width=0.004, n_around=n_around, n_across=1
+        ),
+        (_port(1),),
+    )
+    loop = WireCoil.loop(
+        LOOP_RADIUS, n_around, (_port(1),), centre=(0.0, 0.0, separation)
+    )
+    return wire.CombinedCoil(wire=loop, surface=surface)
+
+
+def test_a_wire_loop_and_a_surface_loop_share_neumann_s_mutual_inductance():
+    """Two coaxial loops well below resonance: ``M`` from the elliptic integrals.
+
+    The wire port drives its loop anticlockwise and the surface port drives
+    its loop clockwise, so the mutual impedance is ``-j omega M``. At 21 MHz
+    rather than lower: the surface EFIE loses its inductance below a few MHz.
+    """
+    from scipy.special import ellipe, ellipk
+
+    medium = Medium(0.5)
+    separation = 0.03
+    coil = _pair(separation)
+    system = wire.assemble_combined(coil, medium)
+    current = torch.linalg.solve(system.impedance, system.excitation.T).T
+    impedance = torch.linalg.inv(network.port_admittance(system.excitation, current))
+    mutual = -float(impedance[0, 1].imag) / medium.angular_frequency
+
+    m = 4 * LOOP_RADIUS**2 / (4 * LOOP_RADIUS**2 + separation**2)
+    k = math.sqrt(m)
+    neumann = (
+        VACUUM_PERMEABILITY
+        * LOOP_RADIUS
+        * ((2 / k - k) * ellipk(m) - (2 / k) * ellipe(m))
+    )
+    assert mutual == pytest.approx(neumann, rel=0.02)
+    torch.testing.assert_close(impedance[0, 1], impedance[1, 0])
+
+
+def test_a_wire_and_a_surface_coil_solve_together_against_a_body():
+    from mariepy import fields
+
+    medium, body, _ = _small_case()
+    coil = _pair(0.02, n_around=12)
+    result = solve(body, coil, medium, tol=1e-9, **ORDERS)
+    assert all(residual <= 1e-9 for residual in result.ports.residual)
+    admittance = network.port_admittance(
+        result.operator.system.excitation, result.ports.coil
+    )
+    asymmetry = (admittance - admittance.T).abs().max()
+    assert float(asymmetry) <= 1e-5 * float(admittance.abs().max())
+    taken, absorbed, scattered = fields.power_balance(
+        result.operator, result.fields, result.ports.body
+    )
+    torch.testing.assert_close(taken, absorbed + scattered)

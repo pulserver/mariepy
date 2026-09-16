@@ -227,8 +227,8 @@ class Network:
         return values
 
 
-def read_network(path: str | Path, *, tmd: bool) -> Network:
-    """Read the co-simulation settings from MARIE's JSON element file.
+def read_network(*paths: str | Path, tmd: bool) -> Network:
+    """Read the co-simulation settings from MARIE's JSON element files.
 
     Ported from ``geo_scoil_lumped_elements.m`` and the settings MARIE derives
     from it (``co_simulation_tuning_settings.m``,
@@ -247,10 +247,17 @@ def read_network(path: str | Path, *, tmd: bool) -> Network:
     searched values, which can meet a symmetry-offset number; here they are
     numbered past the largest other variable.
 
+    Several files, a wire coil's then a surface coil's, are read as one, as
+    ``co_simulation_coil_optimize_settings.m`` merges them: each later file's
+    numbers follow the earlier file's last, its entities the earlier file's
+    largest, and its searched symmetries the earlier file's largest. MARIE
+    adds the number offset to a mutual inductor's mutual inductance, where it
+    means its partner's number; here the partner's number takes it.
+
     Parameters
     ----------
-    path
-        The element file.
+    *paths
+        The element files.
     tmd
         MARIE's ``TMD`` flag, as the coil was solved with.
 
@@ -264,7 +271,7 @@ def read_network(path: str | Path, *, tmd: bool) -> Network:
     ValueError
         If a role is not one of ``Tx``, ``Rx``, ``TxRx``.
     """
-    elements = json.loads(Path(path).read_text())["coil_configuration"]["elements"]
+    elements = _merged(paths)
 
     def optimised(element):
         return bool(tmd and (element.get("optim") or {}).get("boolean"))
@@ -355,6 +362,43 @@ def read_network(path: str | Path, *, tmd: bool) -> Network:
                 )
             )
     return Network(terminals=tuple(terminals), couplings=tuple(couplings), tmd=tmd)
+
+
+def _merged(paths) -> list[dict]:
+    """Read element files into one list, renumbered as MARIE merges them."""
+    merged: list[dict] = []
+    for path in paths:
+        elements = json.loads(Path(path).read_text())["coil_configuration"]["elements"]
+        if merged:
+            numbers = int(merged[-1]["number"])
+            entities = max(
+                int(np.max(np.atleast_1d(e["excitation"]["entity"]))) for e in merged
+            )
+            symmetries = max(
+                int((e.get("optim") or {}).get("symmetry", 0) or 0) for e in merged
+            )
+            elements = [_shifted(e, numbers, entities, symmetries) for e in elements]
+        merged += elements
+    return merged
+
+
+def _shifted(element: dict, numbers: int, entities: int, symmetries: int) -> dict:
+    """Move one element past an earlier file's numbers, entities and symmetries."""
+    element = json.loads(json.dumps(element))
+    element["number"] = int(element["number"]) + numbers
+    excitation = element["excitation"]
+    excitation["entity"] = (
+        np.atleast_1d(excitation["entity"]).astype(int) + entities
+    ).tolist()
+    optim = element.get("optim") or {}
+    if optim.get("boolean"):
+        optim["symmetry"] = int(optim.get("symmetry", 0) or 0) + symmetries
+    cross_talk = element.get("cross_talk")
+    if isinstance(cross_talk, dict) and "coupled_port" in cross_talk:
+        cross_talk["coupled_port"] = int(cross_talk["coupled_port"]) + numbers
+    elif isinstance(cross_talk, list) and len(cross_talk) == 2:
+        element["cross_talk"] = [int(cross_talk[0]) + numbers, cross_talk[1]]
+    return element
 
 
 def _split(load) -> list[str]:

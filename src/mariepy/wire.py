@@ -26,20 +26,23 @@ from pathlib import Path
 
 import torch
 
-from mariepy.coil import Port
+from mariepy.coil import Port, SurfaceCoil
 from mariepy.constants import COPPER_CONDUCTIVITY, VACUUM_PERMEABILITY, Medium
 from mariepy.coupling import _cell_rule, _electric, _magnetic
 from mariepy.mesh import _section
-from mariepy.quadrature import gauss_legendre_1d
+from mariepy.quadrature import gauss_legendre_1d, gauss_triangle
 from mariepy.sie import CoilSystem
 
 __all__ = [
     "WIRE_RADIUS",
+    "CombinedCoil",
     "WireCoil",
     "assemble",
+    "assemble_combined",
     "coupling_k",
     "coupling_n",
     "impedance",
+    "surface_coupling",
 ]
 
 WIRE_RADIUS = 0.0005
@@ -728,3 +731,208 @@ def _couple(coil, dofs, points, medium, order, cell_size, cell_order, term, kern
     if not pieces:
         return torch.zeros((0, 3), dtype=torch.complex128, device=device)
     return torch.cat(pieces)
+
+
+# --------------------------------------------------------------------------
+# A wire coil and a surface together
+# --------------------------------------------------------------------------
+
+
+def surface_coupling(
+    coil: WireCoil,
+    surface: SurfaceCoil,
+    medium: Medium,
+    *,
+    order: int = 6,
+    triangle_order: int = 4,
+    chunk: int = 1 << 22,
+) -> torch.Tensor:
+    """Assemble the EFIE interaction of a wire with a surface it does not touch.
+
+    Takes the place of MARIE's ``Assembly_WSIE_block_par.m``, which MARIE
+    compresses by adaptive cross approximation. The integrand is the one both
+    self-matrices use, ``jk f . f' + (1/jk) div f div f'`` against
+    ``exp(-jkR)/R``, with the wire's triangle basis and the surface's RWG
+    basis in the surface matrix's own scaling; MARIE's row assembly
+    (``assembly_wire_surf_ns_row.m``) holds the hat at one half on both
+    segments and gives both segments' charge the same sign, which neither
+    self-matrix does.
+
+    Parameters
+    ----------
+    coil
+        The wire.
+    surface
+        The surface: a surface coil or a shield.
+    medium
+        Free-space constants at the working frequency.
+    order
+        Gauss points per wire segment, MARIE's ``Quad_order_wie``.
+    triangle_order
+        Points per axis of the Gauss rule on each triangle.
+    chunk
+        Kernel evaluations held at a time.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(coil.n_dof, surface.n_dof)``, complex, with the sign and scale
+        of :attr:`mariepy.sie.CoilSystem.impedance`, as MARIE's ``Zcw`` has.
+    """
+    k = medium.wavenumber
+    s = _segments(coil, order)
+    device = coil.device
+    weights, barycentric = gauss_triangle(triangle_order, device=device)
+    weights = 0.5 * weights.to(torch.complex128)
+
+    vertices = surface.mesh.vertices()  # (t, 3, 3)
+    points = torch.einsum("pu,tuc->tpc", barycentric, vertices)  # (t, p, 3)
+    arms = points[:, None, :, :] - vertices[:, :, None, :]  # (t, 3, p, 3)
+    scale = (surface.mesh.edge_lengths() * surface.signs).to(torch.complex128)
+    dof = surface.dof_of_triangle()
+
+    # Wire side: every quadrature point of every basis function.
+    wire_points = s.points.reshape(coil.n_dof, -1, 3)  # (w, 2q, 3)
+    current = (s.shape[None, :, :, None] * s.tangent[:, :, None, :]).reshape(
+        coil.n_dof, -1, 3
+    )
+    charge = (
+        s.slope[:, :, None].expand(-1, -1, s.weights.numel()).reshape(coil.n_dof, -1)
+    )
+    line = ((s.length[:, :, None] / 2) * s.weights).reshape(coil.n_dof, -1)
+
+    matrix = torch.zeros(
+        (coil.n_dof, surface.n_dof), dtype=torch.complex128, device=device
+    )
+    n_triangles = surface.mesh.n_triangles
+    per_block = max(
+        1, chunk // max(1, points.shape[1] * wire_points.shape[1] * n_triangles)
+    )
+    for start in range(0, coil.n_dof, per_block):
+        rows = slice(start, min(start + per_block, coil.n_dof))
+        separation = (
+            wire_points[rows, None, :, None, :] - points[None, :, None, :, :]
+        )  # (w, t, 2q, p, 3)
+        distance = torch.linalg.vector_norm(separation, dim=-1)
+        green = torch.exp(-1j * k * distance) / distance * weights  # (w, t, 2q, p)
+        vector = torch.einsum(
+            "wtqp,wqc,tapc,wq->wta",
+            green,
+            current[rows].to(torch.complex128),
+            arms.to(torch.complex128),
+            line[rows].to(torch.complex128),
+        )
+        scalar = torch.einsum(
+            "wtqp,wq->wt",
+            green,
+            (charge[rows] * line[rows]).to(torch.complex128),
+        )
+        block = (1j * k * vector + (2.0 / (1j * k)) * scalar[:, :, None]) * scale
+        column = dof[None, :, :].expand(block.shape[0], -1, -1)
+        row = torch.arange(start, rows.stop, device=device)[:, None, None].expand_as(
+            column
+        )
+        keep = column >= 0
+        matrix.index_put_((row[keep], column[keep]), block[keep], accumulate=True)
+    return -(medium.impedance / (4.0 * math.pi)) * matrix
+
+
+@dataclass(frozen=True)
+class CombinedCoil:
+    """A wire coil and a surface coil solved together, wire unknowns first.
+
+    Attributes
+    ----------
+    wire
+        The wire coil.
+    surface
+        The surface coil.
+    """
+
+    wire: WireCoil
+    surface: SurfaceCoil
+
+    @property
+    def n_dof(self) -> int:
+        """Number of unknowns, the wire's then the surface's."""
+        return self.wire.n_dof + self.surface.n_dof
+
+    @property
+    def n_driven(self) -> int:
+        """Number of driven ports, the wire's then the surface's."""
+        return self.wire.n_driven + self.surface.n_driven
+
+    @property
+    def ports(self) -> tuple[Port, ...]:
+        """The wire's ports, then the surface's."""
+        return self.wire.ports + self.surface.ports
+
+    @property
+    def device(self) -> torch.device:
+        """Device the geometry lives on."""
+        return self.wire.device
+
+
+def assemble_combined(
+    coil: CombinedCoil,
+    medium: Medium,
+    *,
+    order: int = 6,
+    triangle_order: int = 4,
+) -> CoilSystem:
+    """Build the system of a wire coil and a surface coil together.
+
+    Ported from the wire-and-surface branch of ``wsvie_assembly.m``: the two
+    self-systems on the diagonal, the wire-surface interaction and its
+    transpose off it, and the ports in MARIE's order, the wire's first.
+
+    Parameters
+    ----------
+    coil
+        The two coils.
+    medium
+        Free-space constants at the working frequency.
+    order
+        Gauss points per wire segment.
+    triangle_order
+        Points per axis of the Gauss rule on each triangle of the cross block.
+
+    Returns
+    -------
+    CoilSystem
+        Over the wire's unknowns, then the surface's.
+    """
+    from mariepy.sie import assemble as assemble_surface
+
+    wire_system = assemble(coil.wire, medium, order=order)
+    surface_system = assemble_surface(coil.surface, medium)
+    cross = surface_coupling(
+        coil.wire, coil.surface, medium, order=order, triangle_order=triangle_order
+    )
+    n_wire, n_surface = coil.wire.n_dof, coil.surface.n_dof
+
+    def blocks(first, second, off):
+        return torch.cat(
+            [
+                torch.cat([first, off], dim=1),
+                torch.cat([off.transpose(0, 1), second], dim=1),
+            ],
+            dim=0,
+        )
+
+    empty = torch.zeros(
+        (n_wire, n_surface), dtype=torch.complex128, device=cross.device
+    )
+    excitation = torch.cat(
+        [
+            torch.nn.functional.pad(wire_system.excitation, (0, n_surface)),
+            torch.nn.functional.pad(surface_system.excitation, (n_wire, 0)),
+        ],
+        dim=0,
+    )
+    return CoilSystem(
+        impedance=blocks(wire_system.impedance, surface_system.impedance, cross),
+        excitation=excitation,
+        copper_loss=blocks(wire_system.copper_loss, surface_system.copper_loss, empty),
+        lumped_loss=blocks(wire_system.lumped_loss, surface_system.lumped_loss, empty),
+    )

@@ -10,7 +10,7 @@ from mariepy.constants import Medium
 from mariepy.inputs import read_case
 from mariepy.mesh import SurfaceMesh
 from mariepy.solver import solve
-from mariepy.wire import WireCoil
+from mariepy.wire import CombinedCoil, WireCoil
 
 from .marie_files import write_gmsh22, write_marie_body, write_wire_gmsh22
 
@@ -115,19 +115,9 @@ def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
     assert read_case(moved, data=tmp_path / "data").body.n_voxels == 1
 
 
-@pytest.mark.parametrize(
-    ("changes", "reason"),
-    [
-        ({"WireFile": "Loop/wire.msh"}, "wire coil and a surface coil"),
-        ({"CoilFile": "", "BasisFile": "basis.mat"}, "milestone 4"),
-    ],
-    ids=["wire and surface coil", "field basis only"],
-)
-def test_a_simulation_file_this_port_does_not_cover_is_refused_by_name(
-    tmp_path, changes, reason
-):
-    with pytest.raises(NotImplementedError, match=reason):
-        read_case(_data(tmp_path, **changes))
+def test_a_simulation_file_asking_only_for_a_field_basis_is_refused(tmp_path):
+    with pytest.raises(NotImplementedError, match="milestone 4"):
+        read_case(_data(tmp_path, CoilFile="", BasisFile="basis.mat"))
 
 
 def test_a_simulation_file_that_names_no_coil_is_refused(tmp_path):
@@ -146,6 +136,19 @@ def test_a_wire_coil_the_simulation_file_names_is_read_with_its_ports(tmp_path):
     assert case.coil.n_dof == 12
     assert case.coil.ports[0].dofs.tolist() == [0, 1]
     assert case.network.roles == {"Tx"}
+
+
+def test_a_wire_coil_and_a_surface_coil_are_read_together_wire_first(tmp_path):
+    path = _data(tmp_path, WireFile="Loop/wire.msh")
+    wires = path.parent.parent / "coils" / "wire_files" / "Loop"
+    wires.mkdir(parents=True)
+    write_wire_gmsh22(wires / "wire.msh", n_segments=12, port_nodes=[0])
+    (wires / "wire.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert isinstance(case.coil, CombinedCoil)
+    assert case.coil.n_driven == 2
+    assert [t.number for t in case.network.terminals] == [1, 2]
+    assert case.network.terminals[1].entities == (2,)
 
 
 @pytest.mark.parametrize(("basis", "linear"), [(0, False), (1, True)])

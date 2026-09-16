@@ -140,8 +140,14 @@ mismatched size and cannot run. It departs from MARIE in two places:
   functions, the last and the loop's first; MARIE takes the next basis
   function by index, which there is the next loop's first.
 
-A wire coil together with a surface coil, or inside a shield, needs MARIE's
-wire-to-surface coupling and is not supported yet.
+A wire coil goes with a surface coil or inside a shield through its
+interaction with a surface, assembled whole where MARIE compresses it by
+adaptive cross approximation. The port does not follow MARIE's row assembly
+(`assembly_wire_surf_ns_row.m`), which holds the triangle basis at one half on
+both segments and gives both segments' charge the same sign; it integrates the
+integrand both self-matrices share, with each basis as the self-matrices
+define it. A wire loop and a surface loop reproduce Neumann's mutual
+inductance.
 
 **Co-simulation.** `cosim.py` ports MARIE's tuning, matching, decoupling and
 preamplifier-decoupling searches and its calibrations, with the circuit
@@ -173,6 +179,9 @@ nothing is detuned. The port departs from MARIE in these places:
   search cannot end worse than the per-entity ones.
 - Coupling-coefficient variables are numbered past every other variable,
   where MARIE's numbering can collide with a symmetry-offset one.
+- Merging a wire coil's element file with a surface coil's, MARIE adds the
+  wire's element count to each mutual inductor's mutual inductance, where it
+  means the partner's number; the port moves the partner's number.
 - Where roles mix, MARIE's four cost and calibration copies differ in ways
   the idea does not explain. The copy for all three roles detunes the
   receive-only ports on its receive side, where it means the transmit-only

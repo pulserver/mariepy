@@ -21,6 +21,7 @@ import torch
 
 from mariepy import coupling as coupling_kernels
 from mariepy import tt
+from mariepy import wire as wire_module
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
@@ -65,7 +66,7 @@ class Shield:
 
 def assemble(
     surface: SurfaceCoil,
-    coil: SurfaceCoil,
+    coil: SurfaceCoil | wire_module.WireCoil | wire_module.CombinedCoil,
     body: VoxelBody,
     medium: Medium,
     *,
@@ -83,7 +84,7 @@ def assemble(
         The shield's surface. It may carry lumped elements; it may not carry
         driven ports.
     coil
-        The coil it surrounds.
+        The coil it surrounds: a surface coil, a wire coil or both.
     body
         The body it surrounds.
     medium
@@ -95,7 +96,7 @@ def assemble(
     triangle_order, cell_order
         Quadrature orders of the shield-to-body kernels.
     near_order
-        Quadrature order of the coil-to-shield block.
+        Quadrature order of the coil-to-shield block on each triangle.
 
     Returns
     -------
@@ -112,7 +113,7 @@ def assemble(
     return Shield(
         surface=surface,
         system=assemble_system(surface, medium),
-        coil_coupling=coupling_matrix(surface, coil, medium, order=near_order),
+        coil_coupling=_coil_coupling(surface, coil, medium, near_order),
         electric=body_coupling(
             body,
             surface,
@@ -134,6 +135,27 @@ def assemble(
             cell_order=cell_order,
         ),
     )
+
+
+def _coil_coupling(surface, coil, medium, order):
+    """Assemble the shield's interaction with each kind of coil, shield rows first.
+
+    A wire's block is MARIE's ``Zsw``, the transpose of the wire-to-surface
+    interaction, as ``wsvie_coupling_assembly.m`` builds it.
+    """
+    if isinstance(coil, wire_module.CombinedCoil):
+        return torch.cat(
+            [
+                _coil_coupling(surface, coil.wire, medium, order),
+                _coil_coupling(surface, coil.surface, medium, order),
+            ],
+            dim=1,
+        )
+    if isinstance(coil, wire_module.WireCoil):
+        return wire_module.surface_coupling(
+            coil, surface, medium, triangle_order=order
+        ).transpose(0, 1)
+    return coupling_matrix(surface, coil, medium, order=order)
 
 
 def body_coupling(

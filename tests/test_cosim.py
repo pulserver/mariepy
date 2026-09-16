@@ -14,8 +14,8 @@ SMALL = cosim.Search(population=60, iterations=150, restarts=3)
 LOSSLESS = 1e15
 
 
-def _write(tmp_path, elements):
-    path = tmp_path / "coil.json"
+def _write(tmp_path, elements, name="coil.json"):
+    path = tmp_path / name
     path.write_text(json.dumps({"coil_configuration": {"elements": elements}}))
     return path
 
@@ -178,6 +178,48 @@ def test_a_mutual_pair_takes_one_coefficient_bounded_by_its_inductors(tmp_path):
     assert coupling.minimum == pytest.approx(0.1)
     assert coupling.maximum == pytest.approx(0.4)
     assert network.start()[coupling.group] == pytest.approx(0.2)
+
+
+def test_a_second_file_follows_the_first_as_marie_merges_them(tmp_path):
+    """Numbers, entities, searched symmetries and partners all move past the first."""
+    wire = [_port(1, 1, symmetry=1), _element(2, 1, symmetry=4)]
+    bounds = {"minim": 10e-9, "maxim": 40e-9}
+    surface = [
+        _port(1, 1, symmetry=1),
+        _element(
+            2,
+            1,
+            symmetry=2,
+            load="mutual_inductor",
+            value=20e-9,
+            cross_talk={"coupled_port": 3, "coupled_value": 4e-9},
+            **bounds,
+        ),
+        _element(
+            3,
+            1,
+            symmetry=3,
+            load="mutual_inductor",
+            value=20e-9,
+            cross_talk=[2, 4e-9],
+            **bounds,
+        ),
+    ]
+    network = cosim.read_network(
+        _write(tmp_path, wire, "wire.json"),
+        _write(tmp_path, surface, "surface.json"),
+        tmd=True,
+    )
+    assert [t.number for t in network.terminals] == [1, 2, 3, 4, 5]
+    assert [t.entities for t in network.terminals] == [(1,), (1,), (2,), (2,), (2,)]
+    (coupling,) = network.couplings
+    assert (coupling.first, coupling.second) == (3, 4)
+    assert coupling.mutual == pytest.approx(4e-9)
+    groups = [[c.group for c in t.components] for t in network.terminals]
+    # Wire: port 1 + 0, 1 + 1; element 4 + 1. Surface symmetries move by 4:
+    # port 5 + 3, 5 + 4; elements 6 + 4 and 7 + 4; the coupling past them all.
+    assert groups == [[1, 2], [5], [8, 9], [10], [11]]
+    assert coupling.group == 12
 
 
 def test_an_admittance_of_the_wrong_size_is_refused(tmp_path):

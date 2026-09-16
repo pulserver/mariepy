@@ -25,7 +25,7 @@ from mariepy.gmres import Solution, gmres
 from mariepy.preconditioner import body_diagonal
 from mariepy.system import CoupledOperator, ShieldedOperator
 from mariepy.tucker import circulant_tucker
-from mariepy.wire import WireCoil
+from mariepy.wire import CombinedCoil, WireCoil
 
 __all__ = [
     "BodyOperator",
@@ -335,7 +335,7 @@ class Result:
 
 def solve(
     body: VoxelBody,
-    coil: SurfaceCoil | WireCoil,
+    coil: SurfaceCoil | WireCoil | CombinedCoil,
     medium: Medium,
     *,
     tol: float = 1e-5,
@@ -359,7 +359,8 @@ def solve(
     body
         The body and its grid.
     coil
-        The coil, its basis and its ports: a surface coil or a wire coil.
+        The coil, its basis and its ports: a surface coil, a wire coil, or
+        both together.
     medium
         The frequency to solve at.
     tol
@@ -386,14 +387,10 @@ def solve(
     Result
         The port parameters and the fields.
 
-    Raises
-    ------
-    NotImplementedError
-        If a wire coil is given a shield.
     """
-    if isinstance(coil, WireCoil):
-        if shield is not None:
-            raise NotImplementedError("a wire coil inside a shield is not supported")
+    if isinstance(coil, CombinedCoil):
+        system = wire.assemble_combined(coil, medium)
+    elif isinstance(coil, WireCoil):
         system = wire.assemble(coil, medium)
     else:
         system = sie.assemble(coil, medium)
