@@ -112,6 +112,17 @@ matching stage only to the ports whose network carries it, where the top-level
 copy adds it to every port. The two agree when every port has the same matching
 topology. Milestone 3 ports the nested copy alone.
 
+**Shields.** A shield is a surface with no port of its own. Its own matrix is
+the coil's, `sie.assemble`; its coupling to the coil is assembled whole, where
+MARIE compresses it by adaptive cross approximation, since a coil and its shield
+together carry few enough unknowns for the dense block; its coupling to the body
+is a tensor train per body unknown, built by the DMRG cross method ported into
+`tt.py`. The port makes two changes to TT-Toolbox as MARIE carries it:
+`maxvol2.m` never advances its iteration count, so its loop can run without
+end, and here it is bounded; `reort.m` compares squared entries without
+conjugating, which on complex data compares real parts, and here it compares
+squared moduli. A shield with driven ports is not supported.
+
 **Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
 package's single `_ext` module, following the package template and pypulseqpp.
 

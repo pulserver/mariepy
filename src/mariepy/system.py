@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -27,7 +28,10 @@ from mariepy.pfft import Coupling
 from mariepy.preconditioner import body_diagonal
 from mariepy.sie import CoilSystem
 
-__all__ = ["CoupledOperator"]
+if TYPE_CHECKING:
+    from mariepy.shield import Shield
+
+__all__ = ["CoupledOperator", "ShieldedOperator"]
 
 
 @dataclass(frozen=True)
@@ -111,6 +115,21 @@ class CoupledOperator:
         )
         return torch.cat([coil_out, body_out])
 
+    def split(self, vector: torch.Tensor):
+        """Separate a solution vector into its coil, body and shield parts.
+
+        Parameters
+        ----------
+        vector
+            Shape ``(..., n_coil + n_body)``.
+
+        Returns
+        -------
+        tuple
+            The coil part, the body part, and ``None`` for the shield.
+        """
+        return vector[..., : self.n_coil], vector[..., self.n_coil :], None
+
     def right_hand_side(self) -> torch.Tensor:
         """Give the drive of each port over the whole unknown vector.
 
@@ -166,3 +185,168 @@ class CoupledOperator:
 def _apply(matrix: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
     """Multiply a sparse matrix by a vector."""
     return torch.sparse.mm(matrix, vector[:, None])[:, 0]
+
+
+@dataclass(frozen=True)
+class ShieldedOperator:
+    """A coil, a body and a shield around them, solved together.
+
+    Ported from MARIE's ``mvp_svie_pfft_tt.m`` and ``ie_solver_svie_pfft_tt.m``.
+    The unknown is the shield's current, then the coil's, then the body's. The
+    coil and the body interact as in :class:`CoupledOperator`; the shield
+    reaches the coil through its dense block and the body through its tensor
+    trains, with the signs the coil's own coupling to the body carries.
+
+    Attributes
+    ----------
+    coupled
+        The coil and the body.
+    shield
+        The shield and its couplings.
+    """
+
+    coupled: CoupledOperator
+    shield: Shield
+
+    @property
+    def body(self) -> VoxelBody:
+        """The body and its grid."""
+        return self.coupled.body
+
+    @property
+    def coil(self) -> SurfaceCoil:
+        """The coil and its basis."""
+        return self.coupled.coil
+
+    @property
+    def medium(self) -> Medium:
+        """The frequency everything was built at."""
+        return self.coupled.medium
+
+    @property
+    def system(self) -> CoilSystem:
+        """The coil's own matrix and its port drive."""
+        return self.coupled.system
+
+    @property
+    def coupling(self) -> Coupling:
+        """The coil-and-body pieces."""
+        return self.coupled.coupling
+
+    @property
+    def n_shield(self) -> int:
+        """Number of shield unknowns."""
+        return self.shield.n_dof
+
+    @property
+    def n_coil(self) -> int:
+        """Number of coil unknowns."""
+        return self.coupled.n_coil
+
+    @property
+    def n_body(self) -> int:
+        """Number of body unknowns."""
+        return self.coupled.n_body
+
+    def split(self, vector: torch.Tensor):
+        """Separate a solution vector into its coil, body and shield parts.
+
+        Parameters
+        ----------
+        vector
+            Shape ``(..., n_shield + n_coil + n_body)``.
+
+        Returns
+        -------
+        tuple of torch.Tensor
+            The coil part, the body part and the shield part.
+        """
+        shield = vector[..., : self.n_shield]
+        rest = vector[..., self.n_shield :]
+        coil, body, _ = self.coupled.split(rest)
+        return coil, body, shield
+
+    def __call__(self, vector: torch.Tensor) -> torch.Tensor:
+        """Apply the shielded operator to one solution vector.
+
+        Parameters
+        ----------
+        vector
+            Shape ``(n_shield + n_coil + n_body,)``, complex.
+
+        Returns
+        -------
+        torch.Tensor
+            Same shape.
+        """
+        from mariepy import shield as shield_module
+
+        coil_current, body_current, shield_current = self.split(vector)
+        inner = self.coupled(vector[self.n_shield :])
+        coil_out = (
+            inner[: self.n_coil]
+            + self.shield.coil_coupling.transpose(0, 1) @ shield_current
+        )
+        body_out = inner[self.n_coil :] - shield_module.apply(
+            self.shield.electric, shield_current, self.body
+        )
+        shield_out = (
+            self.shield.system.impedance @ shield_current
+            + self.shield.coil_coupling @ coil_current
+            + shield_module.apply_transpose(
+                self.shield.electric, body_current, self.body
+            )
+        )
+        return torch.cat([shield_out, coil_out, body_out])
+
+    def right_hand_side(self) -> torch.Tensor:
+        """Give the drive of each port over the whole unknown vector.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_driven, n_shield + n_coil + n_body)``: the shield takes
+            no drive of its own.
+        """
+        inner = self.coupled.right_hand_side()
+        none = torch.zeros(
+            (inner.shape[0], self.n_shield), dtype=inner.dtype, device=inner.device
+        )
+        return torch.cat([none, inner], dim=1)
+
+    def preconditioner(self) -> Callable[[torch.Tensor], torch.Tensor]:
+        """Build the split left preconditioner.
+
+        Ported from ``prec_wsvie.m``: the shield and the coil together are
+        inverted exactly, by an LU factorisation of their joint matrix, and the
+        body by its Galerkin mass term.
+
+        Returns
+        -------
+        callable
+            Applies the preconditioner to a vector.
+        """
+        joint = torch.cat(
+            [
+                torch.cat(
+                    [self.shield.system.impedance, self.shield.coil_coupling], dim=1
+                ),
+                torch.cat(
+                    [
+                        self.shield.coil_coupling.transpose(0, 1),
+                        self.system.impedance,
+                    ],
+                    dim=1,
+                ),
+            ],
+            dim=0,
+        )
+        factors = torch.linalg.lu_factor(joint)
+        diagonal = body_diagonal(self.body, self.medium, linear=self.coupling.linear)
+        surfaces = self.n_shield + self.n_coil
+
+        def apply(vector: torch.Tensor) -> torch.Tensor:
+            head = torch.linalg.lu_solve(*factors, vector[:surfaces, None])[:, 0]
+            return torch.cat([head, diagonal * vector[surfaces:]])
+
+        return apply

@@ -2,9 +2,11 @@
 
 Ported from MARIE 3.0's ``src_utils/src_loaders/load_inputs.m`` and the file
 paths ``src_geometry/geo_assembly.m`` resolves. A simulation file is a JSON
-object in ``<data>/inputs/``; it names a body under ``<data>/bodies/`` and a
+object in ``<data>/inputs/``; it names a body under ``<data>/bodies/``, a
 surface coil under ``<data>/coils/coil_files/``, whose lumped elements sit
-beside it with the same name and a ``.json`` suffix.
+beside it with the same name and a ``.json`` suffix, and optionally an RF shield
+under ``<data>/coils/shield_files/``, whose lumped elements, if it has any, sit
+beside it in the same way.
 
 Only the cases :func:`mariepy.solver.solve` covers are read: a surface coil
 around a body in either basis. A file that asks for anything else raises, naming
@@ -42,12 +44,16 @@ class Case:
     linear
         Whether the file asks for the piecewise-linear body basis; pass it to
         :func:`~mariepy.solver.solve`.
+    shield
+        The RF shield the file names, or None; pass it to
+        :func:`~mariepy.solver.solve`.
     """
 
     medium: Medium
     body: VoxelBody
     coil: SurfaceCoil
     linear: bool = False
+    shield: SurfaceCoil | None = None
 
 
 def read_case(
@@ -77,8 +83,7 @@ def read_case(
     Raises
     ------
     NotImplementedError
-        If the file asks for a wire coil, an RF shield, or a precomputed field
-        basis.
+        If the file asks for a wire coil or a precomputed field basis.
     ValueError
         If the file names no surface coil, or a body basis MARIE does not know.
     """
@@ -89,10 +94,6 @@ def read_case(
     basis = int(settings.get("Basis_Functions_VIE", 0))
     if basis not in (0, 1):
         raise ValueError(f"{path.name} names body basis {basis}; MARIE knows 0 and 1")
-    if settings.get("ShieldFile"):
-        raise NotImplementedError(
-            f"{path.name} names an RF shield, which is milestone 2"
-        )
     if settings.get("WireFile"):
         raise NotImplementedError(
             f"{path.name} names a wire coil, which is milestone 3"
@@ -111,6 +112,17 @@ def read_case(
         coil_file.with_suffix(".json"), tmd=bool(settings.get("TMD", 0))
     )
 
+    shield = None
+    if settings.get("ShieldFile"):
+        shield_file = data / "coils" / "shield_files" / settings["ShieldFile"]
+        shield_mesh = SurfaceMesh.read_gmsh22(shield_file, device=device or "cpu")
+        shield_elements = ()
+        if shield_file.with_suffix(".json").is_file():
+            shield_elements = read_lumped_elements(
+                shield_file.with_suffix(".json"), tmd=bool(settings.get("TMD", 0))
+            )
+        shield = SurfaceCoil.build(shield_mesh, shield_elements)
+
     return Case(
         medium=Medium(float(settings["B0"]), settings.get("Nucleus", "1H")),
         body=VoxelBody.read_marie(
@@ -118,4 +130,5 @@ def read_case(
         ),
         coil=SurfaceCoil.build(mesh, elements),
         linear=basis == 1,
+        shield=shield,
     )

@@ -24,7 +24,9 @@ its coil in `data/coils/coil_files/` — is read whole:
 from mariepy.inputs import read_case
 
 case = read_case("data/inputs/my_case.json")
-result = solve(case.body, case.coil, case.medium, linear=case.linear)
+result = solve(
+    case.body, case.coil, case.medium, linear=case.linear, shield=case.shield
+)
 ```
 
 `VoxelBody.read_marie`, `SurfaceMesh.read_gmsh22` and `read_lumped_elements`

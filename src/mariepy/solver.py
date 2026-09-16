@@ -16,13 +16,14 @@ from dataclasses import dataclass
 import torch
 
 from mariepy import fields, network, pfft, sie, vie
+from mariepy import shield as shield_module
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
 from mariepy.fields import Fields
 from mariepy.gmres import Solution, gmres
 from mariepy.preconditioner import body_diagonal
-from mariepy.system import CoupledOperator
+from mariepy.system import CoupledOperator, ShieldedOperator
 from mariepy.tucker import circulant_tucker
 
 __all__ = [
@@ -232,21 +233,26 @@ class PortSolution:
     coil
         Surface-current coefficients, shape ``(n_ports, n_dof)``.
     body
-        Polarisation current, shape ``(n_ports, 3 * n_voxels)``.
+        Polarisation current, shape ``(n_ports, c * n_voxels)`` with ``c`` 3 or
+        12.
     residual
         Final relative residual of each port's solve.
     iterations
         Iterations each port's solve took.
+    shield
+        Shield currents, shape ``(n_ports, n_shield)``, or None without a
+        shield.
     """
 
     coil: torch.Tensor
     body: torch.Tensor
     residual: tuple[float, ...]
     iterations: tuple[int, ...]
+    shield: torch.Tensor | None = None
 
 
 def solve_ports(
-    operator: CoupledOperator,
+    operator: CoupledOperator | ShieldedOperator,
     *,
     tol: float = 1e-5,
     restart: int = 50,
@@ -275,7 +281,7 @@ def solve_ports(
     """
     drives = operator.right_hand_side()
     precondition = operator.preconditioner()
-    coil, body, residual, iterations = [], [], [], []
+    solutions, residual, iterations = [], [], []
     for row in range(drives.shape[0]):
         solution = gmres(
             operator,
@@ -285,15 +291,16 @@ def solve_ports(
             tol=tol,
             maxit=maxit,
         )
-        coil.append(solution.x[: operator.n_coil])
-        body.append(solution.x[operator.n_coil :])
+        solutions.append(solution.x)
         residual.append(float(solution.residuals[-1]))
         iterations.append(len(solution.residuals) - 1)
+    coil, body, shield = operator.split(torch.stack(solutions))
     return PortSolution(
-        coil=torch.stack(coil),
-        body=torch.stack(body),
+        coil=coil,
+        body=body,
         residual=tuple(residual),
         iterations=tuple(iterations),
+        shield=shield,
     )
 
 
@@ -338,6 +345,7 @@ def solve(
     medium_order: int = 8,
     near_order: int = 15,
     linear: bool = False,
+    shield: SurfaceCoil | None = None,
 ) -> Result:
     """Drive one coil against one body, and return the port matrices and fields.
 
@@ -365,6 +373,10 @@ def solve(
     linear
         Give the body the piecewise-linear basis, as MARIE does when
         ``Basis_Functions_VIE`` is 1.
+    shield
+        An RF shield around the coil and the body. Its coupling to the body is
+        built as tensor trains to ``tol`` times a hundred, as MARIE's
+        ``load_inputs.m`` sets ``tol_TT``.
 
     Returns
     -------
@@ -388,6 +400,20 @@ def solve(
     operator = CoupledOperator(
         body=body, coil=coil, medium=medium, system=system, coupling=coupling
     )
+    if shield is not None:
+        operator = ShieldedOperator(
+            coupled=operator,
+            shield=shield_module.assemble(
+                shield,
+                coil,
+                body,
+                medium,
+                tol=tol * 1e2,
+                linear=linear,
+                triangle_order=triangle_order,
+                cell_order=cell_order,
+            ),
+        )
     ports = solve_ports(operator, tol=tol)
     admittance = network.symmetrise(
         network.port_admittance(system.excitation, ports.coil)
@@ -399,5 +425,5 @@ def solve(
         admittance=admittance,
         impedance=impedance,
         scattering=network.z_to_s(impedance, reference),
-        fields=fields.compute(operator, ports.coil, ports.body),
+        fields=fields.compute(operator, ports.coil, ports.body, ports.shield),
     )

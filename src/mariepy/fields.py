@@ -21,7 +21,7 @@ from dataclasses import dataclass
 import torch
 
 from mariepy import vie
-from mariepy.system import CoupledOperator
+from mariepy.system import CoupledOperator, ShieldedOperator
 
 __all__ = [
     "Fields",
@@ -59,7 +59,10 @@ class Fields:
 
 
 def compute(
-    operator: CoupledOperator, coil: torch.Tensor, body: torch.Tensor
+    operator: CoupledOperator | ShieldedOperator,
+    coil: torch.Tensor,
+    body: torch.Tensor,
+    shield: torch.Tensor | None = None,
 ) -> Fields:
     """Evaluate the field of every port's solution over the body.
 
@@ -71,6 +74,10 @@ def compute(
         Coil currents, shape ``(n_ports, n_dof)``.
     body
         Body currents, shape ``(n_ports, c * n_voxels)`` with ``c`` 3 or 12.
+    shield
+        Shield currents, shape ``(n_ports, n_shield)``, when the operator has
+        a shield. Its field joins the coil's in the incident part, as MARIE's
+        ``em_efield_svie_pfft_tt.m`` adds it.
 
     Returns
     -------
@@ -96,6 +103,16 @@ def compute(
         + _apply(coupling.magnetic, coil)
         + _test(coupling.scatter, vie.apply_k(coupling.symbols_k, from_body))
     )
+
+    if shield is not None:
+        from mariepy import shield as shield_module
+
+        incident = incident + shield_module.apply(
+            operator.shield.electric, shield, operator.body
+        )
+        magnetic = magnetic + shield_module.apply(
+            operator.shield.magnetic, shield, operator.body
+        )
 
     resolution = grid.resolution
     incident = vie.apply_inverse_g(operator.body.from_dof(incident), resolution)

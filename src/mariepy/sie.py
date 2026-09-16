@@ -35,6 +35,7 @@ from mariepy.quadrature import gauss_legendre_1d, gauss_triangle
 __all__ = [
     "CoilSystem",
     "assemble",
+    "coupling_matrix",
     "edge_block",
     "impedance",
     "lumped_loads",
@@ -225,13 +226,23 @@ def near_block(
     torch.Tensor
         Shape ``(n_pairs, 3, 3)``, complex.
     """
-    device = coil.mesh.device
+    vertices = coil.mesh.vertices()
+    kernel = _disjoint_kernel(
+        vertices[pairs[:, 0]], vertices[pairs[:, 1]], wavenumber, order
+    )
+    return _weigh(coil, pairs, kernel)
+
+
+def _disjoint_kernel(observer, source, wavenumber, order):
+    """Integrate the EFIE kernel over triangle pairs that do not touch.
+
+    Ported from ``assembly_ns_par.m`` and ``assembly_surf_ns.m``, which share
+    the integrand.
+    """
+    device = observer.device
     weights, points = gauss_triangle(order, device=device)
     weights = 0.5 * weights.to(torch.complex128)
 
-    vertices = coil.mesh.vertices()
-    observer = vertices[pairs[:, 0]]
-    source = vertices[pairs[:, 1]]
     quadrature_observer = torch.einsum("pu,nuc->npc", points, observer)
     quadrature_source = torch.einsum("qv,nvc->nqc", points, source)
 
@@ -257,10 +268,76 @@ def near_block(
         arms_source.to(torch.complex128),
     )
 
-    kernel = (
-        1j * wavenumber * vector + (4.0 / (1j * wavenumber)) * scalar[:, None, None]
+    return 1j * wavenumber * vector + (4.0 / (1j * wavenumber)) * scalar[:, None, None]
+
+
+def coupling_matrix(
+    observer: SurfaceCoil,
+    source: SurfaceCoil,
+    medium: Medium,
+    *,
+    order: int = 4,
+) -> torch.Tensor:
+    """Assemble the EFIE interaction of two surfaces that do not touch.
+
+    Ported from MARIE's ``Assembly_SIE_block_par.m``, which MARIE compresses by
+    adaptive cross approximation; here it is assembled whole. It carries the
+    sign and scale of :attr:`CoilSystem.impedance`, as MARIE's ``Zsc`` does.
+
+    Parameters
+    ----------
+    observer
+        The surface whose basis tests, a shield in MARIE's use.
+    source
+        The surface whose basis radiates, a coil in MARIE's use.
+    medium
+        Free-space constants at the working frequency.
+    order
+        Points per axis of the Gauss rule on each triangle.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(observer.n_dof, source.n_dof)``, complex.
+    """
+    device = observer.mesh.device
+    wavenumber = medium.wavenumber
+    matrix = torch.zeros(
+        (observer.n_dof, source.n_dof), dtype=torch.complex128, device=device
     )
-    return _weigh(coil, pairs, kernel)
+    observer_vertices = observer.mesh.vertices()
+    source_vertices = source.mesh.vertices()
+    observer_weight = (observer.mesh.edge_lengths() * observer.signs).to(
+        torch.complex128
+    )
+    source_weight = (source.mesh.edge_lengths() * source.signs).to(torch.complex128)
+    observer_dof = observer.dof_of_triangle()
+    source_dof = source.dof_of_triangle()
+
+    n_source = source.mesh.n_triangles
+    per_row = max(1, _CHUNK_ELEMENTS // (order**4 * n_source))
+    all_sources = torch.arange(n_source, device=device)
+    for start in range(0, observer.mesh.n_triangles, per_row):
+        rows = torch.arange(
+            start, min(start + per_row, observer.mesh.n_triangles), device=device
+        )
+        here = rows.repeat_interleave(n_source)
+        there = all_sources.repeat(rows.numel())
+        kernel = _disjoint_kernel(
+            observer_vertices[here], source_vertices[there], wavenumber, order
+        )
+        block = (
+            kernel
+            * observer_weight[here][:, :, None]
+            * source_weight[there][:, None, :]
+        )
+        row_index = observer_dof[here][:, :, None].expand(-1, 3, 3)
+        column_index = source_dof[there][:, None, :].expand(-1, 3, 3)
+        keep = (row_index >= 0) & (column_index >= 0)
+        matrix.index_put_(
+            (row_index[keep], column_index[keep]), block[keep], accumulate=True
+        )
+    return -(medium.impedance / (4.0 * torch.pi)) * matrix
 
 
 def edge_block(
