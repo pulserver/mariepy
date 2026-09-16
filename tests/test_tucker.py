@@ -135,6 +135,6 @@ def test_circulant_tucker_rejects_a_component_count_it_has_no_parity_for(device)
         tucker.circulant_tucker(kernel)
 
 
-def test_circulant_tucker_rejects_a_kernel_that_is_not_fourth_order():
-    with pytest.raises(ValueError, match="four axes"):
+def test_circulant_tucker_rejects_a_kernel_with_neither_four_nor_five_axes():
+    with pytest.raises(ValueError, match="four or five axes"):
         tucker.circulant_tucker(torch.zeros(2, 2, 2))

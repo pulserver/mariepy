@@ -23,7 +23,7 @@ from mariepy.fields import Fields
 from mariepy.gmres import Solution, gmres
 from mariepy.preconditioner import body_diagonal
 from mariepy.system import CoupledOperator
-from mariepy.tucker import CirculantSymbol, circulant_tucker
+from mariepy.tucker import circulant_tucker
 
 __all__ = [
     "BodyOperator",
@@ -47,11 +47,14 @@ class BodyOperator:
         The frequency the kernel was built at.
     symbols
         The compressed N kernel.
+    linear
+        Whether the current is written in the linear basis.
     """
 
     body: VoxelBody
     medium: Medium
-    symbols: tuple[CirculantSymbol, ...]
+    symbols: tuple
+    linear: bool = False
 
     @classmethod
     def build(
@@ -63,6 +66,7 @@ class BodyOperator:
         far_order: int = 4,
         medium_order: int = 8,
         near_order: int = 15,
+        linear: bool = False,
     ) -> BodyOperator:
         """Assemble and compress the kernel for one body.
 
@@ -76,6 +80,9 @@ class BodyOperator:
             Relative tolerance of the Tucker compression.
         far_order, medium_order, near_order
             Quadrature orders for the three regimes.
+        linear
+            Write the current in the piecewise-linear basis, twelve functions
+            per voxel, as MARIE does when ``Basis_Functions_VIE`` is 1.
 
         Returns
         -------
@@ -89,11 +96,13 @@ class BodyOperator:
             far_order=far_order,
             medium_order=medium_order,
             near_order=near_order,
+            linear=linear,
         )
         return cls(
             body=body,
             medium=medium,
             symbols=circulant_tucker(kernel.to(body.device), tol),
+            linear=linear,
         )
 
     def __call__(self, current: torch.Tensor) -> torch.Tensor:
@@ -105,7 +114,8 @@ class BodyOperator:
         Parameters
         ----------
         current
-            Shape ``(3 * n_voxels,)``.
+            Shape ``(3 * n_voxels,)``, or ``(12 * n_voxels,)`` in the linear
+            basis.
 
         Returns
         -------
@@ -125,12 +135,14 @@ class BodyOperator:
         Parameters
         ----------
         incident
-            Shape ``(3, n1, n2, n3)``, the incident electric field.
+            The incident electric field in the operator's basis: shape
+            ``(3, n1, n2, n3)``, or ``(12, n1, n2, n3)`` in the linear basis, as
+            :func:`mariepy.incident.plane_wave` returns it.
 
         Returns
         -------
         torch.Tensor
-            Shape ``(3 * n_voxels,)``.
+            Shape ``(3 * n_voxels,)`` or ``(12 * n_voxels,)``.
         """
         contrast = self.body.contrast(self.medium)
         scaling = torch.tensor(
@@ -152,14 +164,15 @@ class BodyOperator:
         Parameters
         ----------
         current
-            Shape ``(3 * n_voxels,)``, the solved polarisation current.
+            The solved polarisation current.
         incident
-            Shape ``(3, n1, n2, n3)``, the field that drove it.
+            The field that drove it, in the operator's basis.
 
         Returns
         -------
         torch.Tensor
-            Shape ``(3, n1, n2, n3)``, zero outside the mask.
+            The total field in the operator's basis, shape ``(3, n1, n2, n3)``
+            or ``(12, n1, n2, n3)``, zero outside the mask.
         """
         scaling = torch.tensor(
             self.medium.electric_scaling, device=current.device, dtype=torch.complex128
@@ -188,7 +201,7 @@ def solve_body(
     operator
         The body operator.
     incident
-        Shape ``(3, n1, n2, n3)``, the incident electric field.
+        The incident electric field in the operator's basis.
     tol
         Target for the preconditioned relative residual.
     restart, maxit
@@ -199,7 +212,7 @@ def solve_body(
     mariepy.gmres.Solution
         The solved current and the residual history.
     """
-    diagonal = body_diagonal(operator.body, operator.medium)
+    diagonal = body_diagonal(operator.body, operator.medium, linear=operator.linear)
     return gmres(
         operator,
         operator.right_hand_side(incident),

@@ -1,8 +1,16 @@
 """The volume integral operator on the body grid.
 
 Ported from MARIE 3.0's ``src_integral_equations/src_vie/src_operators_vie/``:
-``cubatures/{G_N,G_K,VV_Nop,VV_Kop,weights_points}.m`` for the kernel, and
-``src_solver/src_mvp/mvp_vie/`` for the products.
+``cubatures/{G_N,G_K,VV_Nop,VV_Kop,weights_points}.m`` and the
+``surface_surface_*`` family for the kernel, and ``src_solver/src_mvp/mvp_vie/``
+for the products.
+
+A cell carries either the piecewise-constant basis or the piecewise-linear one.
+The linear basis has four scalar functions per cell, ``1``, ``x/dx``, ``y/dx`` and
+``z/dx`` about the cell's centre, times each of the three Cartesian directions:
+twelve per cell, ordered direction-major as ``4 * direction + function``. Its
+kernel is stored for the ten (test, source) pairs of :data:`PAIRS`; the other
+six follow from them with the sign of :data:`PAIR_OF`.
 
 Two operators act on the polarisation current in the voxels. N is the
 double-curl dyadic that gives the electric field, symmetric with six distinct
@@ -22,15 +30,17 @@ from __future__ import annotations
 import torch
 
 from mariepy.quadrature import gauss_legendre_1d
-from mariepy.tucker import CirculantSymbol
 
 __all__ = [
+    "PAIRS",
+    "PAIR_OF",
     "apply_g",
     "apply_inverse_g",
     "apply_k",
     "apply_n",
     "green_k",
     "green_n",
+    "mass",
     "volume_volume_k",
     "volume_volume_n",
 ]
@@ -43,6 +53,26 @@ _DYADIC_INDEX = ((0, 1, 2), (1, 3, 4), (2, 4, 5))
 # sign. The diagonal is empty, as a curl has no diagonal.
 _CURL_INDEX = ((None, 2, 1), (2, None, 0), (1, 0, None))
 _CURL_SIGN = ((0.0, -1.0, 1.0), (1.0, 0.0, -1.0), (-1.0, 1.0, 0.0))
+
+# The (test, source) pairs of scalar basis functions the linear kernel stores,
+# in MARIE's order: 0 is the constant, 1 to 3 the functions linear in x, y, z.
+PAIRS = ((0, 0), (1, 1), (2, 2), (3, 3), (0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+
+# For every (test, source) pair, the stored pair that carries it and the sign
+# it carries it with, as MARIE's ``mvp_N_pwl_tucker.m`` tabulates them. Swapping
+# the constant with a linear function is odd; swapping two linear functions is
+# even.
+PAIR_OF = (
+    ((0, +1), (4, +1), (5, +1), (6, +1)),
+    ((4, -1), (1, +1), (7, +1), (8, +1)),
+    ((5, -1), (7, +1), (2, +1), (9, +1)),
+    ((6, -1), (8, +1), (9, +1), (3, +1)),
+)
+
+# The Galerkin mass of each scalar basis function over a cell, in units of the
+# cell volume: the constant integrates to one, each linear function squared to
+# one twelfth.
+_MASS = (1.0, 1.0 / 12.0, 1.0 / 12.0, 1.0 / 12.0)
 
 # How many kernel evaluations to hold at once. The six-dimensional rule has
 # order**6 points, so the offsets are taken in chunks that keep this bounded.
@@ -121,7 +151,12 @@ def green_k(separation: torch.Tensor, wavenumber: float) -> torch.Tensor:
 
 
 def volume_volume_n(
-    offsets: torch.Tensor, resolution: float, wavenumber: float, order: int = 4
+    offsets: torch.Tensor,
+    resolution: float,
+    wavenumber: float,
+    order: int = 4,
+    *,
+    linear: bool = False,
 ) -> torch.Tensor:
     """Integrate the N kernel over two voxels separated by each offset.
 
@@ -136,22 +171,31 @@ def volume_volume_n(
         Free-space wavenumber in rad/m.
     order
         Gauss-Legendre points per axis; the rule has ``order ** 6`` points.
+    linear
+        Weight the integral by each of the :data:`PAIRS` of linear basis
+        functions, rather than by the constant alone.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(n_offsets, 6)``, complex.
+        Shape ``(n_offsets, 6)``, or ``(n_offsets, 10, 6)`` when ``linear``,
+        complex.
 
     Raises
     ------
     ValueError
         An offset is zero, where the kernel is not integrable by this rule.
     """
-    return _volume_volume(offsets, resolution, wavenumber, order, green_n, 6)
+    return _volume_volume(offsets, resolution, wavenumber, order, green_n, 6, linear)
 
 
 def volume_volume_k(
-    offsets: torch.Tensor, resolution: float, wavenumber: float, order: int = 4
+    offsets: torch.Tensor,
+    resolution: float,
+    wavenumber: float,
+    order: int = 4,
+    *,
+    linear: bool = False,
 ) -> torch.Tensor:
     """Integrate the K kernel over two voxels separated by each offset.
 
@@ -165,21 +209,26 @@ def volume_volume_k(
         Free-space wavenumber in rad/m.
     order
         Gauss-Legendre points per axis.
+    linear
+        As in :func:`volume_volume_n`.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(n_offsets, 3)``, complex.
+        Shape ``(n_offsets, 3)``, or ``(n_offsets, 10, 3)`` when ``linear``,
+        complex.
 
     Raises
     ------
     ValueError
         An offset is zero.
     """
-    return _volume_volume(offsets, resolution, wavenumber, order, green_k, 3)
+    return _volume_volume(offsets, resolution, wavenumber, order, green_k, 3, linear)
 
 
-def _volume_volume(offsets, resolution, wavenumber, order, kernel, n_components):
+def _volume_volume(
+    offsets, resolution, wavenumber, order, kernel, n_components, linear=False
+):
     """Run the six-dimensional rule for one kernel, in chunks over the offsets."""
     if offsets.ndim != 2 or offsets.shape[1] != 3:
         raise ValueError(f"offsets must have shape (n, 3), got {tuple(offsets.shape)}")
@@ -220,8 +269,22 @@ def _volume_volume(offsets, resolution, wavenumber, order, kernel, n_components)
     n_points = weight.shape[0]
     chunk = max(1, _CHUNK_ELEMENTS // n_points)
 
+    if linear:
+        # Each scalar basis function is its local coordinate over the pitch,
+        # half the Gauss node, so the pair weight is a product of node halves.
+        observer = [torch.ones_like(grids[0])] + [grids[a] / 2.0 for a in range(3)]
+        source = [torch.ones_like(grids[0])] + [grids[a] / 2.0 for a in range(3, 6)]
+        pair_weight = torch.stack(
+            [
+                (observer[test] * source[basis]).reshape(-1) * weight
+                for test, basis in PAIRS
+            ]
+        )
+    else:
+        pair_weight = weight.unsqueeze(0)
+
     result = torch.zeros(
-        (offsets.shape[0], n_components),
+        (offsets.shape[0], pair_weight.shape[0], n_components),
         device=offsets.device,
         dtype=torch.complex128,
     )
@@ -230,64 +293,124 @@ def _volume_volume(offsets, resolution, wavenumber, order, kernel, n_components)
         separation = block.unsqueeze(1) + separation_nodes.unsqueeze(0)
         values = kernel(separation, wavenumber)
         result[start : start + chunk] = jacobian * torch.einsum(
-            "q,bqc->bc", weight.to(values.dtype), values
+            "pq,bqc->bpc", pair_weight.to(values.dtype), values
         )
-    return result
+    return result if linear else result[:, 0]
 
 
-def apply_n(
-    symbols: tuple[CirculantSymbol, ...], current: torch.Tensor
-) -> torch.Tensor:
+def apply_n(symbols, current: torch.Tensor) -> torch.Tensor:
     """Apply the N operator to a current on the grid.
 
     Parameters
     ----------
     symbols
-        Six compressed symbols from :func:`mariepy.tucker.circulant_tucker`, in
-        the order xx, xy, xz, yy, yz, zz.
+        From :func:`mariepy.tucker.circulant_tucker`: six symbols in the order
+        xx, xy, xz, yy, yz, zz for the constant basis, or ten such sextuples,
+        one per pair of :data:`PAIRS`, for the linear basis.
     current
-        Shape ``(..., 3, n1, n2, n3)``.
+        Shape ``(..., 3, n1, n2, n3)`` for the constant basis, or
+        ``(..., 12, n1, n2, n3)`` for the linear basis.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(..., 3, n1, n2, n3)``.
+        The same shape as ``current``.
 
     Raises
     ------
     ValueError
-        The wrong number of symbols was given.
+        The symbols do not match the basis the current is written in.
     """
+    if _is_linear(current):
+        _check_linear_symbols(symbols, 6)
+        return _apply_linear(symbols, current, _DYADIC_INDEX, None)
     if len(symbols) != 6:
         raise ValueError(f"the N operator takes six symbols, got {len(symbols)}")
     return _apply(symbols, current, _DYADIC_INDEX, None)
 
 
-def apply_k(
-    symbols: tuple[CirculantSymbol, ...], current: torch.Tensor
-) -> torch.Tensor:
+def apply_k(symbols, current: torch.Tensor) -> torch.Tensor:
     """Apply the K operator to a current on the grid.
 
     Parameters
     ----------
     symbols
-        Three compressed symbols, in the order x, y, z.
+        Three symbols in the order x, y, z, or ten such triples for the linear
+        basis.
     current
-        Shape ``(..., 3, n1, n2, n3)``.
+        Shape ``(..., 3, n1, n2, n3)`` or ``(..., 12, n1, n2, n3)``.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(..., 3, n1, n2, n3)``.
+        The same shape as ``current``.
 
     Raises
     ------
     ValueError
-        The wrong number of symbols was given.
+        The symbols do not match the basis the current is written in.
     """
+    if _is_linear(current):
+        _check_linear_symbols(symbols, 3)
+        return _apply_linear(symbols, current, _CURL_INDEX, _CURL_SIGN)
     if len(symbols) != 3:
         raise ValueError(f"the K operator takes three symbols, got {len(symbols)}")
     return _apply(symbols, current, _CURL_INDEX, _CURL_SIGN)
+
+
+def _is_linear(current: torch.Tensor) -> bool:
+    """Say whether a current is written in the linear basis."""
+    if current.ndim < 4 or current.shape[-4] not in (3, 12):
+        raise ValueError(
+            "a current must end in (3, n1, n2, n3) or (12, n1, n2, n3), got "
+            f"{tuple(current.shape)}"
+        )
+    return current.shape[-4] == 12
+
+
+def _check_linear_symbols(symbols, n_components: int) -> None:
+    """Raise unless the symbols are one tuple per stored pair of linear functions."""
+    if len(symbols) != len(PAIRS) or any(len(row) != n_components for row in symbols):
+        raise ValueError(
+            f"the linear basis takes {len(PAIRS)} tuples of {n_components} symbols"
+        )
+
+
+def _apply_linear(symbols, current, index, sign):
+    """Convolve a linear-basis current, expanding one stored symbol at a time.
+
+    Ported from MARIE's ``mvp_N_pwl_tucker.m`` and ``mvp_K_pwl_tucker.m``. Each
+    output entry ``4 * p + l`` gathers every input entry ``4 * q + l'`` through
+    the stored pair and component that carry ``(l, l')`` and ``(p, q)``.
+    """
+    grid = current.shape[-3:]
+    padded = symbols[0][0].shape
+    transformed = torch.fft.fftn(current, s=padded, dim=(-3, -2, -1))
+    out = torch.zeros_like(transformed)
+
+    uses = {}
+    for p in range(3):
+        for q in range(3):
+            which = index[p][q]
+            if which is None:
+                continue
+            component_sign = 1.0 if sign is None else sign[p][q]
+            for test in range(4):
+                for basis in range(4):
+                    pair, pair_sign = PAIR_OF[test][basis]
+                    uses.setdefault((pair, which), []).append(
+                        (4 * p + test, 4 * q + basis, component_sign * pair_sign)
+                    )
+
+    for (pair, which), entries in uses.items():
+        expanded = symbols[pair][which].expand()
+        for row, column, scale in entries:
+            out[..., row, :, :, :] += scale * (
+                expanded * transformed[..., column, :, :, :]
+            )
+
+    field = torch.fft.ifftn(out, dim=(-3, -2, -1))
+    return field[..., : grid[0], : grid[1], : grid[2]]
 
 
 def _apply(symbols, current, index, sign):
@@ -317,22 +440,44 @@ def _apply(symbols, current, index, sign):
     return field[..., : grid[0], : grid[1], : grid[2]]
 
 
-def apply_g(current: torch.Tensor, resolution: float) -> torch.Tensor:
-    """Apply the Galerkin mass matrix of the piecewise-constant basis.
+def mass(n_components: int, resolution: float) -> torch.Tensor:
+    """Return the diagonal Galerkin mass matrix of one cell's basis functions.
+
+    Ported from MARIE's ``mvp_G_pwc.m`` and ``mvp_G_pwl.m``.
 
     Parameters
     ----------
-    current
-        Any shape.
+    n_components
+        3 for the constant basis, 12 for the linear one.
     resolution
         Voxel pitch in metres.
 
     Returns
     -------
     torch.Tensor
-        ``current`` scaled by the voxel volume.
+        Shape ``(n_components,)``, float64.
     """
-    return resolution**3 * current
+    per_direction = _MASS if n_components == 12 else _MASS[:1]
+    return resolution**3 * torch.tensor(per_direction * 3, dtype=torch.float64)
+
+
+def apply_g(current: torch.Tensor, resolution: float) -> torch.Tensor:
+    """Apply the Galerkin mass matrix of the basis a current is written in.
+
+    Parameters
+    ----------
+    current
+        Shape ``(..., 3, n1, n2, n3)`` or ``(..., 12, n1, n2, n3)``.
+    resolution
+        Voxel pitch in metres.
+
+    Returns
+    -------
+    torch.Tensor
+        ``current`` with each basis function scaled by its mass.
+    """
+    weights = mass(current.shape[-4], resolution).to(current.device)
+    return current * weights.to(current.dtype)[:, None, None, None]
 
 
 def apply_inverse_g(current: torch.Tensor, resolution: float) -> torch.Tensor:
@@ -341,16 +486,17 @@ def apply_inverse_g(current: torch.Tensor, resolution: float) -> torch.Tensor:
     Parameters
     ----------
     current
-        Any shape.
+        Shape ``(..., 3, n1, n2, n3)`` or ``(..., 12, n1, n2, n3)``.
     resolution
         Voxel pitch in metres.
 
     Returns
     -------
     torch.Tensor
-        ``current`` divided by the voxel volume.
+        ``current`` with each basis function divided by its mass.
     """
-    return current / resolution**3
+    weights = mass(current.shape[-4], resolution).to(current.device)
+    return current / weights.to(current.dtype)[:, None, None, None]
 
 
 # The eight corners of a cell of side `resolution` centred on the origin, in
@@ -536,6 +682,8 @@ def surface_surface_n(
     resolution: float,
     wavenumber: float,
     order: int = 15,
+    *,
+    linear: bool = False,
 ) -> torch.Tensor:
     """Integrate the N kernel over two cells by their faces.
 
@@ -543,6 +691,8 @@ def surface_surface_n(
     double-curl dyadic to integrals over the twelve faces of the two cells,
     where the remaining singularity is weak enough for DIRECTFN to handle
     exactly; face pairs that do not touch take a plain four-dimensional rule.
+    Ported from ``surface_surface_kernels_Nop.m``, ``surface_surface_coeff_Nop.m``,
+    ``coefficients_Nop.m`` and ``kernels_Nop.m``.
 
     Parameters
     ----------
@@ -554,11 +704,28 @@ def surface_surface_n(
         Free-space wavenumber in rad/m.
     order
         Points per axis, for the four-dimensional rule and for DIRECTFN alike.
+    linear
+        Return every pair of :data:`PAIRS` rather than the constant pair alone.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(6,)``, complex, in the order xx, xy, xz, yy, yz, zz.
+        Shape ``(6,)``, or ``(10, 6)`` when ``linear``, complex, in the order
+        xx, xy, xz, yy, yz, zz.
+    """
+    return _surface_surface(
+        offset_cells, resolution, wavenumber, order, linear, _N_REDUCTION
+    )
+
+
+def _surface_surface(
+    offset_cells, resolution, wavenumber, order, linear, reduction, every_pair=False
+):
+    """Sum the four reduced face kernels of one operator over the 36 face pairs.
+
+    Each reduced kernel is an integral times a constant. The integral depends on
+    the test function, the source function, both or neither, as ``reduction``
+    records; the constant carries whatever dependence the integral does not.
     """
     import numpy as _np
 
@@ -568,17 +735,18 @@ def surface_surface_n(
     weights, nodes = gauss_legendre_1d(order)
     weights, nodes = weights.numpy(), nodes.numpy()
 
+    n_functions = 4 if linear else 1
+    n_components = len(reduction.axes)
     centre_observer = _np.array([resolution * value for value in offset_cells])
     centre_source = _np.zeros(3)
-    total = _np.zeros(6, dtype=complex)
+    total = _np.zeros((n_functions, n_functions, n_components), dtype=complex)
 
     for face_observer in range(6):
         for face_source in range(6):
-            coefficients = _np.array(
-                [
-                    surface_surface_coefficient(face_observer, face_source, component)
-                    for component in range(6)
-                ]
+            normal_observer = _np.array(_FACE_NORMALS[face_observer])
+            normal_source = _np.array(_FACE_NORMALS[face_source])
+            coefficients = reduction.coefficients(
+                normal_observer, normal_source, resolution, wavenumber, n_functions
             )
             if not _np.any(coefficients):
                 continue
@@ -586,66 +754,215 @@ def surface_surface_n(
             kind, points = face_adjacency(
                 offset_cells, face_observer, face_source, resolution
             )
-            normal_source = _np.array(_FACE_NORMALS[face_source])
-            normal_observer = _np.array(_FACE_NORMALS[face_observer])
-
             if kind is None:
-                value = _non_singular_face_pair(
+                observer, source, weight = _face_pair_points(
                     centre_observer + normal_observer * resolution / 2.0,
                     centre_source + normal_source * resolution / 2.0,
                     face_observer // 2,
                     face_source // 2,
                     resolution,
-                    wavenumber,
-                    weights,
                     nodes,
+                    weights,
                 )
             else:
                 vertices = _np.array(points, dtype=float)
                 routine, observer_centre = _singular_call(kind, vertices, directfn)
-                value = routine(
-                    vertices,
-                    (vertices[0] + vertices[2]) / 2.0,
-                    observer_centre,
-                    normal_source,
-                    normal_observer,
-                    wavenumber,
-                    resolution,
-                    order,
-                    _DIRECTFN_KERNEL_N,
-                    0,
-                    0,
+
+            for term in range(4):
+                if not _np.any(coefficients[term]):
+                    continue
+                uses_test, uses_source = reduction.depends[term]
+                for test in range(n_functions if uses_test else 1):
+                    for basis in range(n_functions if uses_source else 1):
+                        if kind is None:
+                            integrand = reduction.integrand(
+                                term,
+                                observer,
+                                source,
+                                centre_observer,
+                                centre_source,
+                                test,
+                                basis,
+                                normal_observer,
+                                normal_source,
+                                resolution,
+                                wavenumber,
+                            )
+                            value = (resolution / 2.0) ** 4 * _np.sum(
+                                weight * integrand
+                            )
+                        else:
+                            value = routine(
+                                vertices,
+                                (vertices[0] + vertices[2]) / 2.0,
+                                observer_centre,
+                                normal_source,
+                                normal_observer,
+                                wavenumber,
+                                resolution,
+                                order,
+                                reduction.directfn_type[term],
+                                test,
+                                basis,
+                            )
+                        tests = [test] if uses_test else range(n_functions)
+                        sources = [basis] if uses_source else range(n_functions)
+                        for row in tests:
+                            for column in sources:
+                                total[row, column] += (
+                                    coefficients[term][:, row, column] * value
+                                )
+
+    if every_pair:
+        return torch.tensor(total, dtype=torch.complex128)
+    stored = (
+        _np.stack([total[row, column] for row, column in PAIRS])
+        if linear
+        else total[0, 0]
+    )
+    return torch.tensor(stored, dtype=torch.complex128)
+
+
+def _step(function: int, resolution: float):
+    """Return the gradient of one scalar basis function: zero for the constant."""
+    import numpy as _np
+
+    gradient = _np.zeros(3)
+    if function:
+        gradient[function - 1] = 1.0 / resolution
+    return gradient
+
+
+def _n_coefficients(normal, normal_source, resolution, wavenumber, n_functions):
+    """Return MARIE's ``coefficients_Nop.m`` for one face pair, every term.
+
+    The result is four arrays of shape ``(6, n_functions, n_functions)``, one
+    per reduced kernel, indexed by component, test function and source function.
+    """
+    import numpy as _np
+
+    del wavenumber
+    unit = _np.eye(3)
+    out = _np.zeros((4, 6, n_functions, n_functions), dtype=complex)
+    for component, (p, q) in enumerate(_COMPONENT_AXES):
+        e_p, e_q = unit[p], unit[q]
+        out[0, component] = _np.dot(
+            _np.cross(normal, e_p), _np.cross(normal_source, e_q)
+        )
+        for test in range(n_functions):
+            h = _step(test, resolution)
+            out[1, component, test, :] = _np.dot(
+                _np.cross(_np.cross(h, e_p), e_q), normal
+            )
+            for basis in range(n_functions):
+                hp = _step(basis, resolution)
+                crossed = _np.cross(h, e_p)
+                out[3, component, test, basis] = sum(
+                    _np.dot(_np.cross(crossed, unit[a]), normal)
+                    * _np.dot(hp * e_q[a], normal_source)
+                    for a in range(3)
                 )
-            total += coefficients * value
+        for basis in range(n_functions):
+            hp = _step(basis, resolution)
+            out[2, component, :, basis] = _np.dot(
+                _np.cross(e_p, _np.cross(hp, e_q)), normal
+            )
+    return out
 
-    return torch.tensor(total, dtype=torch.complex128)
+
+def _face_greens(observer, source, wavenumber):
+    """Return the separation, its length, and the dynamic and static Green functions."""
+    import numpy as _np
+
+    separation = observer - source
+    distance = _np.linalg.norm(separation, axis=1)
+    green = _np.exp(-1j * wavenumber * distance) / (4.0 * _np.pi * distance)
+    static = 1.0 / (4.0 * _np.pi * distance)
+    return separation, distance, green, static
 
 
-def _non_singular_face_pair(
+def _radial_field(separation, distance, green, static, wavenumber):
+    """Return the vector ``F`` of MARIE's reduced kernels, one row per point."""
+    radial = (
+        -1j * wavenumber * green / distance - green / distance**2 + static / distance**2
+    ) / (1j * wavenumber) ** 2
+    return separation * radial[:, None]
+
+
+def _scalar_function(points, centre, function, resolution):
+    """Evaluate one scalar basis function about a cell centre."""
+    import numpy as _np
+
+    if function == 0:
+        return _np.ones(points.shape[0])
+    axis = function - 1
+    return (points[:, axis] - centre[axis]) / resolution
+
+
+def _n_integrand(
+    term,
+    observer,
+    source,
+    centre_observer,
+    centre_source,
+    test,
+    basis,
+    normal,
+    normal_source,
+    resolution,
+    wavenumber,
+):
+    """Return MARIE's ``kernels_Nop.m`` at every point of the face-pair rule."""
+    del normal
+    separation, distance, green, static = _face_greens(observer, source, wavenumber)
+    if term == 0:
+        return (
+            _scalar_function(observer, centre_observer, test, resolution)
+            * _scalar_function(source, centre_source, basis, resolution)
+            * green
+        )
+    if term == 3:
+        return (green - static) / (1j * wavenumber) ** 2
+    projected = (
+        _radial_field(separation, distance, green, static, wavenumber) @ normal_source
+    )
+    if term == 1:
+        return _scalar_function(source, centre_source, basis, resolution) * projected
+    return _scalar_function(observer, centre_observer, test, resolution) * projected
+
+
+def _face_pair_points(
     centre_observer,
     centre_source,
     axis_observer,
     axis_source,
     resolution,
-    wavenumber,
-    weights,
     nodes,
+    weights,
 ):
-    """Integrate the scalar Green function over a pair of faces that do not touch."""
+    """Return the points of the four-dimensional rule on each face, and its weights."""
     import numpy as _np
 
-    separation, weight = _face_pair_separation(
-        centre_observer,
-        centre_source,
-        axis_observer,
-        axis_source,
-        resolution,
-        nodes,
-        weights,
+    def place(centre, axis, first, second):
+        free = [value for value in range(3) if value != axis]
+        point = _np.empty((first.size, 3))
+        point[:, axis] = centre[axis]
+        point[:, free[0]] = centre[free[0]] + resolution / 2.0 * first
+        point[:, free[1]] = centre[free[1]] + resolution / 2.0 * second
+        return point
+
+    a, b, c, d = (
+        grid.reshape(-1) for grid in _np.meshgrid(*([nodes] * 4), indexing="ij")
     )
-    distance = _np.linalg.norm(separation, axis=1)
-    green = _np.exp(-1j * wavenumber * distance) / (4.0 * _np.pi * distance)
-    return (resolution / 2.0) ** 4 * _np.sum(weight * green)
+    weight = _np.ones(a.size)
+    for grid in _np.meshgrid(*([weights] * 4), indexing="ij"):
+        weight = weight * grid.reshape(-1)
+
+    return (
+        place(centre_observer, axis_observer, a, b),
+        place(centre_source, axis_source, c, d),
+        weight,
+    )
 
 
 def _singular_call(kind, vertices, directfn):
@@ -671,6 +988,7 @@ def kernel_n(
     far_order: int = 4,
     medium_order: int = 8,
     near_order: int = 15,
+    linear: bool = False,
 ) -> torch.Tensor:
     """Assemble the N kernel at every offset of a grid.
 
@@ -691,11 +1009,14 @@ def kernel_n(
         Points per axis for the two volume-volume passes.
     near_order
         Points per axis for the surface-surface pass.
+    linear
+        Assemble every pair of :data:`PAIRS` of the linear basis.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(n1, n2, n3, 6)``, complex, in the order xx, xy, xz, yy, yz, zz.
+        Shape ``(n1, n2, n3, 6)``, or ``(n1, n2, n3, 10, 6)`` when ``linear``,
+        complex, in the order xx, xy, xz, yy, yz, zz.
     """
     return _assemble(
         shape,
@@ -707,6 +1028,7 @@ def kernel_n(
         volume_volume_n,
         surface_surface_n,
         6,
+        linear,
     )
 
 
@@ -720,11 +1042,13 @@ def _assemble(
     by_volume,
     by_surface,
     n_components,
+    linear=False,
 ):
     """Fill every offset of a grid from the regime that is valid there."""
     import itertools as _itertools
 
-    kernel = torch.zeros((*shape, n_components), dtype=torch.complex128)
+    trailing = (len(PAIRS), n_components) if linear else (n_components,)
+    kernel = torch.zeros((*shape, *trailing), dtype=torch.complex128)
     near = tuple(_itertools.product(*(range(min(2, n)) for n in shape)))
     offsets = [
         cell
@@ -734,7 +1058,9 @@ def _assemble(
 
     if offsets:
         index = torch.tensor(offsets, dtype=torch.float64)
-        far = by_volume(resolution * index, resolution, wavenumber, far_order)
+        far = by_volume(
+            resolution * index, resolution, wavenumber, far_order, linear=linear
+        )
         for row, cell in enumerate(offsets):
             kernel[cell] = far[row]
 
@@ -744,13 +1070,15 @@ def _assemble(
         if medium:
             index = torch.tensor(medium, dtype=torch.float64)
             refined = by_volume(
-                resolution * index, resolution, wavenumber, medium_order
+                resolution * index, resolution, wavenumber, medium_order, linear=linear
             )
             for row, cell in enumerate(medium):
                 kernel[cell] = refined[row]
 
     for cell in near:
-        kernel[cell] = by_surface(cell, resolution, wavenumber, near_order)
+        kernel[cell] = by_surface(
+            cell, resolution, wavenumber, near_order, linear=linear
+        )
 
     return kernel
 
@@ -759,18 +1087,13 @@ def _assemble(
 # tests. Anti-symmetry leaves three distinct interactions rather than six.
 _CURL_COMPONENT_AXES = ((2, 1), (0, 2), (1, 0))
 
-# Which reduced kernel of DIRECTFN each operator's surviving surface-surface
-# term asks for. `Kernels.cpp` branches on 0 through 8.
-_DIRECTFN_KERNEL_N = 1
-_DIRECTFN_KERNEL_K = 5
-
 
 def curl_surface_coefficient(face_source: int, component: int) -> float:
-    """Return the constant the surface-surface integral of one face pair carries.
+    """Return the constant the first reduced curl kernel of one face pair carries.
 
-    Ported from MARIE's ``coefficients_Kop.m``. As for the N operator, only the
-    first of its four surface-surface kernels survives the piecewise-constant
-    basis, and this one depends on the source face alone.
+    Ported from MARIE's ``coefficients_Kop.m``. It depends on the source face
+    alone, and it is the only constant that survives the piecewise-constant
+    basis.
 
     Parameters
     ----------
@@ -795,17 +1118,123 @@ def curl_surface_coefficient(face_source: int, component: int) -> float:
     )
 
 
+def _k_coefficients(normal, normal_source, resolution, wavenumber, n_functions):
+    """Return MARIE's ``coefficients_Kop.m`` for one face pair, every term."""
+    import numpy as _np
+
+    unit = _np.eye(3)
+    out = _np.zeros((4, 3, n_functions, n_functions), dtype=complex)
+    for component, (p, q) in enumerate(_CURL_COMPONENT_AXES):
+        e_p, e_q = unit[p], unit[q]
+        out[0, component] = _np.dot(_np.cross(e_p, e_q), normal_source)
+        for test in range(n_functions):
+            h = _step(test, resolution)
+            for basis in range(n_functions):
+                hp = _step(basis, resolution)
+                out[1, component, test, basis] = (
+                    _np.dot(normal_source, _np.dot(_np.cross(e_q, e_p), hp) * h)
+                    / (1j * wavenumber) ** 2
+                )
+            out[3, component, test, :] = sum(
+                _np.dot(_np.cross(e_q, unit[a]), normal_source)
+                * _np.dot(h * _np.dot(e_p, unit[a]), normal)
+                for a in range(3)
+            )
+        for basis in range(n_functions):
+            hp = _step(basis, resolution)
+            out[2, component, :, basis] = _np.dot(normal, normal_source) * _np.dot(
+                hp, _np.cross(e_p, e_q)
+            )
+    return out
+
+
+def _k_integrand(
+    term,
+    observer,
+    source,
+    centre_observer,
+    centre_source,
+    test,
+    basis,
+    normal,
+    normal_source,
+    resolution,
+    wavenumber,
+):
+    """Return MARIE's ``kernels_Kop.m`` at every point of the face-pair rule."""
+    del normal_source
+    separation, distance, green, static = _face_greens(observer, source, wavenumber)
+    if term == 0:
+        return (
+            _scalar_function(observer, centre_observer, test, resolution)
+            * _scalar_function(source, centre_source, basis, resolution)
+            * (_radial_field(separation, distance, green, static, wavenumber) @ normal)
+        )
+    if term == 1:
+        field = _radial_field(separation, distance, green, static, wavenumber)
+        return (field - separation / 2.0 * static[:, None]) @ normal
+    difference = (green - static) / (1j * wavenumber) ** 2
+    if term == 2:
+        return (
+            _scalar_function(observer, centre_observer, test, resolution) * difference
+        )
+    return _scalar_function(source, centre_source, basis, resolution) * difference
+
+
+class _Reduction:
+    """How one operator's four reduced face kernels are built.
+
+    Attributes
+    ----------
+    axes
+        The Cartesian pair each stored component tests.
+    depends
+        For each kernel, whether its integral depends on the test function and
+        on the source function.
+    directfn_type
+        The reduced kernel DIRECTFN evaluates for each term; ``Kernels.cpp``
+        branches on 1 through 8.
+    """
+
+    def __init__(self, axes, depends, directfn_type, coefficients, integrand):
+        self.axes = axes
+        self.depends = depends
+        self.directfn_type = directfn_type
+        self.coefficients = coefficients
+        self.integrand = integrand
+
+
+_N_REDUCTION = _Reduction(
+    axes=_COMPONENT_AXES,
+    depends=((True, True), (False, True), (True, False), (False, False)),
+    directfn_type=(1, 2, 3, 4),
+    coefficients=_n_coefficients,
+    integrand=_n_integrand,
+)
+
+_K_REDUCTION = _Reduction(
+    axes=_CURL_COMPONENT_AXES,
+    depends=((True, True), (False, False), (True, False), (False, True)),
+    directfn_type=(5, 6, 7, 8),
+    coefficients=_k_coefficients,
+    integrand=_k_integrand,
+)
+
+
 def surface_surface_k(
     offset_cells,
     resolution: float,
     wavenumber: float,
     order: int = 15,
+    *,
+    linear: bool = False,
 ) -> torch.Tensor:
     """Integrate the K kernel over two cells by their faces.
 
-    The counterpart of :func:`surface_surface_n` for the curl operator. Its
-    integrand contracts the separation with the *observation* face normal where
-    the dyadic operator's contracts with the source's.
+    The counterpart of :func:`surface_surface_n` for the curl operator, ported
+    from ``surface_surface_kernels_Kop.m`` and its companions. Its first kernel
+    contracts the separation with the *observation* face normal where the
+    dyadic operator's contracts with the source's.
 
     Parameters
     ----------
@@ -817,138 +1246,18 @@ def surface_surface_k(
         Free-space wavenumber in rad/m.
     order
         Points per axis, for the four-dimensional rule and for DIRECTFN alike.
+    linear
+        Return every pair of :data:`PAIRS` rather than the constant pair alone.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(3,)``, complex, in the order x, y, z.
+        Shape ``(3,)``, or ``(10, 3)`` when ``linear``, complex, in the order
+        x, y, z.
     """
-    import numpy as _np
-
-    from mariepy import _accelerators
-
-    directfn = _accelerators.require(module="mariepy._directfn")
-    weights, nodes = gauss_legendre_1d(order)
-    weights, nodes = weights.numpy(), nodes.numpy()
-
-    centre_observer = _np.array([resolution * value for value in offset_cells])
-    total = _np.zeros(3, dtype=complex)
-
-    for face_observer in range(6):
-        for face_source in range(6):
-            coefficients = _np.array(
-                [
-                    curl_surface_coefficient(face_source, component)
-                    for component in range(3)
-                ]
-            )
-            if not _np.any(coefficients):
-                continue
-
-            kind, points = face_adjacency(
-                offset_cells, face_observer, face_source, resolution
-            )
-            normal_source = _np.array(_FACE_NORMALS[face_source])
-            normal_observer = _np.array(_FACE_NORMALS[face_observer])
-
-            if kind is None:
-                value = _non_singular_curl_face_pair(
-                    centre_observer + normal_observer * resolution / 2.0,
-                    normal_source * resolution / 2.0,
-                    face_observer // 2,
-                    face_source // 2,
-                    normal_observer,
-                    resolution,
-                    wavenumber,
-                    weights,
-                    nodes,
-                )
-            else:
-                vertices = _np.array(points, dtype=float)
-                routine, observer_centre = _singular_call(kind, vertices, directfn)
-                value = routine(
-                    vertices,
-                    (vertices[0] + vertices[2]) / 2.0,
-                    observer_centre,
-                    normal_source,
-                    normal_observer,
-                    wavenumber,
-                    resolution,
-                    order,
-                    _DIRECTFN_KERNEL_K,
-                    0,
-                    0,
-                )
-            total += coefficients * value
-
-    return torch.tensor(total, dtype=torch.complex128)
-
-
-def _non_singular_curl_face_pair(
-    centre_observer,
-    centre_source,
-    axis_observer,
-    axis_source,
-    normal_observer,
-    resolution,
-    wavenumber,
-    weights,
-    nodes,
-):
-    """Integrate the curl kernel over a pair of faces that do not touch."""
-    import numpy as _np
-
-    separation, weight = _face_pair_separation(
-        centre_observer,
-        centre_source,
-        axis_observer,
-        axis_source,
-        resolution,
-        nodes,
-        weights,
+    return _surface_surface(
+        offset_cells, resolution, wavenumber, order, linear, _K_REDUCTION
     )
-    distance = _np.linalg.norm(separation, axis=1)
-    green = _np.exp(-1j * wavenumber * distance) / (4.0 * _np.pi * distance)
-    static = 1.0 / (4.0 * _np.pi * distance)
-
-    radial = (
-        -1j * wavenumber * green / distance - green / distance**2 + static / distance**2
-    ) / (1j * wavenumber) ** 2
-    contracted = separation @ normal_observer * radial
-    return (resolution / 2.0) ** 4 * _np.sum(weight * contracted)
-
-
-def _face_pair_separation(
-    centre_observer,
-    centre_source,
-    axis_observer,
-    axis_source,
-    resolution,
-    nodes,
-    weights,
-):
-    """Return the separation at every point of the four-dimensional rule."""
-    import numpy as _np
-
-    def place(centre, axis, first, second):
-        free = [value for value in range(3) if value != axis]
-        point = _np.empty((first.size, 3))
-        point[:, axis] = centre[axis]
-        point[:, free[0]] = centre[free[0]] + resolution / 2.0 * first
-        point[:, free[1]] = centre[free[1]] + resolution / 2.0 * second
-        return point
-
-    a, b, c, d = (
-        grid.reshape(-1) for grid in _np.meshgrid(*([nodes] * 4), indexing="ij")
-    )
-    weight = _np.ones(a.size)
-    for grid in _np.meshgrid(*([weights] * 4), indexing="ij"):
-        weight = weight * grid.reshape(-1)
-
-    separation = place(centre_observer, axis_observer, a, b) - place(
-        centre_source, axis_source, c, d
-    )
-    return separation, weight
 
 
 def kernel_k(
@@ -959,6 +1268,7 @@ def kernel_k(
     far_order: int = 4,
     medium_order: int = 8,
     near_order: int = 15,
+    linear: bool = False,
 ) -> torch.Tensor:
     """Assemble the K kernel at every offset of a grid.
 
@@ -976,11 +1286,14 @@ def kernel_k(
         Points per axis for the two volume-volume passes.
     near_order
         Points per axis for the surface-surface pass.
+    linear
+        Assemble every pair of :data:`PAIRS` of the linear basis.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(n1, n2, n3, 3)``, complex, in the order x, y, z.
+        Shape ``(n1, n2, n3, 3)``, or ``(n1, n2, n3, 10, 3)`` when ``linear``,
+        complex, in the order x, y, z.
     """
     return _assemble(
         shape,
@@ -992,4 +1305,5 @@ def kernel_k(
         volume_volume_k,
         surface_surface_k,
         3,
+        linear,
     )

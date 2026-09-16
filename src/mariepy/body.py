@@ -156,17 +156,21 @@ class VoxelBody:
         Parameters
         ----------
         field
-            Shape ``(..., 3, n1, n2, n3)``.
+            Shape ``(..., 3, n1, n2, n3)`` for the constant basis, or
+            ``(..., 12, n1, n2, n3)`` for the linear basis.
 
         Returns
         -------
         torch.Tensor
-            Shape ``(..., 3 * n_voxels)``, the components in order.
+            Shape ``(..., n_components * n_voxels)``, the components in order.
         """
         self._check_field(field)
         leading = field.shape[:-4]
-        flat = field.reshape(*leading, 3, -1)
-        return flat[..., self.mask.reshape(-1)].reshape(*leading, self.n_dof)
+        n_components = field.shape[-4]
+        flat = field.reshape(*leading, n_components, -1)
+        return flat[..., self.mask.reshape(-1)].reshape(
+            *leading, n_components * self.n_voxels
+        )
 
     def from_dof(self, vector: torch.Tensor) -> torch.Tensor:
         """Spread a solution vector back over the grid, zero outside the mask.
@@ -174,33 +178,41 @@ class VoxelBody:
         Parameters
         ----------
         vector
-            Shape ``(..., 3 * n_voxels)``.
+            Shape ``(..., 3 * n_voxels)`` for the constant basis, or
+            ``(..., 12 * n_voxels)`` for the linear basis.
 
         Returns
         -------
         torch.Tensor
-            Shape ``(..., 3, n1, n2, n3)``.
+            Shape ``(..., 3, n1, n2, n3)`` or ``(..., 12, n1, n2, n3)``.
         """
-        if vector.shape[-1] != self.n_dof:
+        n_components, remainder = divmod(vector.shape[-1], self.n_voxels)
+        if remainder or n_components not in (3, 12):
             raise ValueError(
-                f"the solution vector has {vector.shape[-1]} entries, "
-                f"expected {self.n_dof}"
+                f"the solution vector has {vector.shape[-1]} entries, expected "
+                f"3 or 12 per voxel of {self.n_voxels}"
             )
         leading = vector.shape[:-1]
         field = torch.zeros(
-            (*leading, 3, int(torch.tensor(self.shape).prod())),
+            (*leading, n_components, int(torch.tensor(self.shape).prod())),
             device=vector.device,
             dtype=vector.dtype,
         )
-        field[..., self.mask.reshape(-1)] = vector.reshape(*leading, 3, self.n_voxels)
-        return field.reshape(*leading, 3, *self.shape)
+        field[..., self.mask.reshape(-1)] = vector.reshape(
+            *leading, n_components, self.n_voxels
+        )
+        return field.reshape(*leading, n_components, *self.shape)
 
     def _check_field(self, field: torch.Tensor) -> None:
         """Raise unless the field's trailing axes match the grid."""
-        if field.ndim < 4 or tuple(field.shape[-4:]) != (3, *self.shape):
+        if (
+            field.ndim < 4
+            or field.shape[-4] not in (3, 12)
+            or tuple(field.shape[-3:]) != self.shape
+        ):
             raise ValueError(
-                f"a field must end in (3, {', '.join(str(n) for n in self.shape)}); "
-                f"got {tuple(field.shape)}"
+                "a field must end in (3 or 12, "
+                f"{', '.join(str(n) for n in self.shape)}); got {tuple(field.shape)}"
             )
 
     @classmethod
