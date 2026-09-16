@@ -11,6 +11,10 @@ tissue labels and their properties from ``--labels`` and ``--table``, which
 ``mariepy.tissue`` reads; without them the case's own permittivity and
 conductivity are used and the density is whatever ``--density`` says.
 
+``tissue_gabriel.csv`` beside this script shows the table's columns. It holds
+three tissues, not the whole appendix of Gabriel, Lau and Gabriel 1996, and a
+label it does not name is refused rather than turned into air.
+
 The matrices follow PLAN.md's output contract: local SAR for a drive ``v`` at
 peak amplitude is ``v^H Q v`` in W/kg.
 """

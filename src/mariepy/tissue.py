@@ -201,11 +201,13 @@ def build(
     resolution: float,
     *,
     origin: tuple[float, float, float] | None = None,
+    background=(0,),
 ) -> LabelledBody:
     """Turn a label volume into a body at one frequency.
 
-    Voxels whose label the table does not name are background: free space, and
-    no mass.
+    Every label in the volume must be one the table names or one ``background``
+    names, because a tissue left out of the table would quietly become air and
+    take its share of the SAR with it.
 
     Parameters
     ----------
@@ -219,6 +221,8 @@ def build(
         Voxel pitch in metres.
     origin
         Coordinates of voxel ``(0, 0, 0)``; the grid is centred by default.
+    background
+        The labels that mean free space.
 
     Returns
     -------
@@ -228,9 +232,17 @@ def build(
     Raises
     ------
     ValueError
-        No voxel carries a label the table names.
+        A label is neither in the table nor background, or no voxel carries a
+        label the table names.
     """
     shape = tuple(labels.shape)
+    present = {int(value) for value in torch.unique(labels)}
+    unnamed = sorted(present - set(table) - set(background))
+    if unnamed:
+        raise ValueError(
+            f"the volume carries labels the table does not name: "
+            f"{', '.join(str(label) for label in unnamed)}"
+        )
     device = labels.device
     permittivity = torch.ones(shape, dtype=torch.float64, device=device)
     conductivity = torch.zeros(shape, dtype=torch.float64, device=device)

@@ -146,7 +146,7 @@ def _labels(device):
     labels = torch.zeros((4, 4, 4), dtype=torch.long, device=device)
     labels[1:3, 1:3, 1:3] = 1
     labels[0, 0, 0] = 2
-    labels[3, 3, 3] = 7  # a label the table does not name
+    labels[3, 3, 3] = 7  # a label that means free space here
     return labels
 
 
@@ -157,7 +157,7 @@ def test_a_label_volume_becomes_a_body_at_the_working_frequency(tmp_path, device
     )
     table = tissue.read_table(path)
     medium = Medium(3.0)
-    built = tissue.build(_labels(device), table, medium, 0.002)
+    built = tissue.build(_labels(device), table, medium, 0.002, background=(0, 7))
 
     assert built.body.resolution == 0.002
     assert int(built.body.mask.sum()) == 9
@@ -174,12 +174,17 @@ def test_a_label_volume_becomes_a_body_at_the_working_frequency(tmp_path, device
 
 
 def test_a_body_is_centred_on_the_grid_unless_told_otherwise(tmp_path, device):
-    path = _write(tmp_path / "t.csv", [_row(1, "muscle")])
+    path = _write(tmp_path / "t.csv", [_row(1, "muscle"), _row(2, "fat")])
     table = tissue.read_table(path)
-    built = tissue.build(_labels(device), table, Medium(3.0), 0.002)
+    built = tissue.build(_labels(device), table, Medium(3.0), 0.002, background=(0, 7))
     assert built.body.origin == (-0.003, -0.003, -0.003)
     moved = tissue.build(
-        _labels(device), table, Medium(3.0), 0.002, origin=(0.0, 0.0, 0.0)
+        _labels(device),
+        table,
+        Medium(3.0),
+        0.002,
+        origin=(0.0, 0.0, 0.0),
+        background=(0, 7),
     )
     assert moved.body.origin == (0.0, 0.0, 0.0)
 
@@ -188,4 +193,95 @@ def test_a_volume_with_no_named_label_is_refused(tmp_path, device):
     path = _write(tmp_path / "t.csv", [_row(5, "muscle")])
     table = tissue.read_table(path)
     with pytest.raises(ValueError, match="no voxel carries"):
+        tissue.build(
+            _labels(device), table, Medium(3.0), 0.002, background=(0, 1, 2, 7)
+        )
+
+
+def test_a_label_the_table_leaves_out_is_refused(tmp_path, device):
+    """A tissue missing from the table would quietly become air."""
+    path = _write(tmp_path / "t.csv", [_row(1, "muscle"), _row(2, "fat")])
+    table = tissue.read_table(path)
+    with pytest.raises(ValueError, match="does not name: 7"):
         tissue.build(_labels(device), table, Medium(3.0), 0.002)
+
+
+# Muscle, white matter and cortical bone, as the 1996 appendix gives them, with
+# the relaxation times in the paper's own units. These three carry the same
+# properties in Gabriel's fit and in the IT'IS database, so the values MARIE's
+# Hugo head at 3 T stores for them check the model rather than the table.
+VERIFIED = {
+    "muscle": (
+        (
+            4.0,
+            50.0,
+            7.23,
+            0.1,
+            7000.0,
+            353.68,
+            0.1,
+            1.2e6,
+            318.31,
+            0.1,
+            2.5e7,
+            2.274,
+            0.0,
+            0.2,
+        ),
+        (63.5, 0.717),
+    ),
+    "white matter": (
+        (
+            4.0,
+            32.0,
+            7.958,
+            0.1,
+            100.0,
+            7.958,
+            0.1,
+            4.0e4,
+            53.052,
+            0.3,
+            3.5e7,
+            7.958,
+            0.02,
+            0.02,
+        ),
+        (52.5, 0.339),
+    ),
+    "bone cortical": (
+        (
+            2.5,
+            10.0,
+            13.26,
+            0.2,
+            180.0,
+            79.577,
+            0.2,
+            5.0e3,
+            159.155,
+            0.2,
+            1.0e5,
+            15.915,
+            0.0,
+            0.02,
+        ),
+        (14.7, 0.0670),
+    ),
+}
+
+LARMOR_3T = 127.74e6
+
+
+@pytest.mark.parametrize("name", sorted(VERIFIED))
+def test_the_dispersion_gives_the_properties_a_head_model_carries(name):
+    """The model, on published parameters, lands on the numbers a head model uses."""
+    row, (want_permittivity, want_conductivity) = VERIFIED[name]
+    values = list(row)
+    for term, scale in enumerate(tissue._TIME_SCALE):
+        values[2 + 3 * term] *= scale
+    permittivity, conductivity = tissue.dielectric(
+        torch.tensor(values, dtype=torch.float64), LARMOR_3T
+    )
+    assert float(permittivity) == pytest.approx(want_permittivity, rel=5e-3)
+    assert float(conductivity) == pytest.approx(want_conductivity, rel=1e-2)
