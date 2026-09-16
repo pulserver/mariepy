@@ -201,7 +201,7 @@ nothing is detuned. The port departs from MARIE in these places:
 
 **Field bases and performance maps.** `basis.py` ports MARIE's basis and MRGF
 paths: the incident-field basis that a support surface, or a shell of voxel
-currents around the body, spans, its interpolation voxels, the body solved once per basis field, the ultimate intrinsic SNR and
+currents around the body (hugging it or spherical), spans, its interpolation voxels, the body solved once per basis field, the ultimate intrinsic SNR and
 transmit efficiency, and a coil solved through the basis with its coupling
 integrated at the interpolation voxels only. `metrics.py` ports the SNR,
 transmit-efficiency and g-factor maps, and `plot.py` MARIE's figures, with
@@ -222,7 +222,14 @@ places:
   sample's spectrum drops below its tolerance, and on an operator whose
   spectrum never does it never stops; the port stops once the sample has as
   many columns as the operator has columns or rows.
-- MARIE's HDF5 basis files are not read; a basis is built here and saved with
+- MARIE's spherical shell (`geo_spherical_basis.m`) reads its inputs from a
+  variable it never defines, centres its padded grid at the shell's thickness
+  rather than at the body, and sizes the enclosing sphere from the body's
+  position. The port pads the grid about the body and takes the grid's
+  half-diagonal, MARIE's value for a body centred at the origin.
+- MARIE's saved basis files are read with h5py and kept in MARIE's tested
+  form, which the reduced coil solve then follows as MARIE does, piecewise-
+  linear inconsistency included; bases built here are saved with
   `FieldBasis.save`.
 
 On a coarse body the ultimate SNR does not settle as basis fields are added:

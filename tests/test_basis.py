@@ -461,3 +461,60 @@ def test_a_basis_for_another_body_is_refused(solved, tmp_path):
     )
     with pytest.raises(ValueError, match="3 or 12"):
         basis_module.read_marie(tmp_path / "basis.mat", body)
+
+
+def test_the_spherical_shell_lies_between_its_two_spheres():
+    body = VoxelBody.sphere(0.02, 0.01, 52.0, 0.55, padding=1)
+    around, padding = basis_module.shell(
+        body.mask, body.resolution, distance=0.01, thickness=2, shape="sphere"
+    )
+    shape = torch.tensor(body.shape, dtype=torch.float64)
+    centre = torch.ceil(shape / 2) - 1 + padding
+    half = float(torch.linalg.vector_norm((shape - 1) * body.resolution / 2))
+    radius = (around.nonzero().to(torch.float64) - centre).norm(dim=1) * body.resolution
+    assert float(radius.min()) >= half + 0.01 - 1e-12
+    assert float(radius.max()) <= half + 0.01 + 2 * body.resolution + 1e-12
+    inside = torch.nn.functional.pad(body.mask, (padding,) * 6)
+    assert not bool((around & inside).any())
+    # Every direction out of the centre crosses it.
+    for axis in range(3):
+        line = around.movedim(axis, 0)[
+            :, int(centre[(axis + 1) % 3]), int(centre[(axis + 2) % 3])
+        ]
+        assert bool(line[: int(centre[axis])].any()) and bool(
+            line[int(centre[axis]) :].any()
+        )
+
+
+def test_an_unknown_shell_shape_is_refused():
+    with pytest.raises(ValueError, match="cube"):
+        basis_module.shell(
+            torch.ones(2, 2, 2, dtype=torch.bool),
+            0.01,
+            distance=0.01,
+            thickness=1,
+            shape="cube",
+        )
+
+
+def test_a_loop_outside_the_spherical_shell_does_not_beat_its_ultimate_snr():
+    medium = Medium(3.0)
+    body = VoxelBody.sphere(0.03, 0.01, 52.0, 0.55, padding=1)
+    incident = basis_module.dipole_basis(
+        body, medium, distance=0.005, thickness=1, support="sphere", block=400, **ORDERS
+    )
+    field_basis = basis_module.solve(incident, body, medium, tol=TOLERANCE, **ORDERS)
+    assert field_basis.rank < 3 * body.n_voxels
+    port = Port(tag=1, kind="port", load="none", value=0.0, quality=1.0, voltage=1.0)
+    coil = SurfaceCoil.build(
+        SurfaceMesh.loop(radius=0.09, width=0.01, n_around=16, n_across=1), (port,)
+    )
+    electric, magnetic = _dense_fields(coil, body, medium)
+    covariance = metrics.noise_covariance(
+        electric, body.conductivity, body.mask, body.resolution
+    )
+    centres = fields.at_centres(magnetic)
+    b1_minus = medium.permeability * (centres[:, 0] - 1j * centres[:, 1])
+    coil_snr = metrics.snr(b1_minus, covariance, medium, body.resolution, body.mask)
+    ultimate, _ = basis_module.ultimate_maps(field_basis, body, medium)
+    assert bool((coil_snr[body.mask] <= ultimate[body.mask] * 1.05).all())

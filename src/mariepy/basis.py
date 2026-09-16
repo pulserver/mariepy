@@ -366,13 +366,29 @@ def _ball(radius: int):
 
 
 def shell(
-    mask: torch.Tensor, resolution: float, *, distance: float, thickness: int
+    mask: torch.Tensor,
+    resolution: float,
+    *,
+    distance: float,
+    thickness: int,
+    shape: str = "hull",
 ) -> tuple[torch.Tensor, int]:
-    """Place the dipole shell around a body, as ``geo_ultimate_basis.m``.
+    """Place the dipole shell around a body.
 
-    The body's slices along the last axis are filled to their convex hulls;
-    the shell is what dilating that by ``thickness`` voxels more than the
-    distance adds, the object itself left out.
+    With ``shape="hull"``, as ``geo_ultimate_basis.m``: the body's slices along
+    the last axis are filled to their convex hulls, and the shell is what
+    dilating that by ``thickness`` voxels more than the distance adds, the
+    object itself left out.
+
+    With ``shape="sphere"``, as ``geo_spherical_basis.m``: the cells between
+    two spheres about the grid's centre voxel, the inner one the distance
+    beyond the sphere through the grid's corners and the outer one
+    ``thickness`` voxels further. MARIE's file reads its inputs from a
+    variable it never defines, centres its padded grid at the shell's
+    thickness rather than at the body, and sizes the enclosing sphere from
+    the body's position; here the grid is padded about the body and the
+    enclosing sphere is the grid's half-diagonal, which is MARIE's value for a
+    body centred at the origin.
 
     Parameters
     ----------
@@ -385,6 +401,8 @@ def shell(
         ``Basis_distance``.
     thickness
         Shell thickness in voxels, MARIE's ``Basis_thickness``.
+    shape
+        ``"hull"`` or ``"sphere"``.
 
     Returns
     -------
@@ -395,6 +413,10 @@ def shell(
     """
     from scipy.ndimage import binary_dilation
 
+    if shape == "sphere":
+        return _spherical_shell(mask, resolution, distance, thickness)
+    if shape != "hull":
+        raise ValueError(f"unknown shell shape {shape!r}")
     gap = math.floor(distance / resolution)
     padding = gap + thickness
     padded = torch.nn.functional.pad(mask.to(torch.bool), (padding,) * 6, value=False)
@@ -403,6 +425,26 @@ def shell(
     outer = binary_dilation(hull, structure=_ball(gap + thickness))
     result = outer & ~inner & ~hull
     return torch.from_numpy(result).to(mask.device), padding
+
+
+def _spherical_shell(mask, resolution, distance, thickness):
+    """Place the spherical shell of :func:`shell`."""
+    shape = torch.tensor(mask.shape, dtype=torch.float64)
+    centre = torch.ceil(shape / 2) - 1  # MARIE's r(ceil(n/2)), zero-based
+    half_diagonal = float(torch.linalg.vector_norm((shape - 1) * resolution / 2))
+    inner_radius = half_diagonal + distance
+    outer_radius = inner_radius + thickness * resolution
+    room = torch.minimum(centre, shape - 1 - centre)
+    padding = max(math.ceil(float((outer_radius / resolution - room).max())) + 1, 0)
+    size = [int(n) + 2 * padding for n in mask.shape]
+    axes = [
+        (torch.arange(n, dtype=torch.float64) - padding - centre[axis]) * resolution
+        for axis, n in enumerate(size)
+    ]
+    grid = torch.meshgrid(*axes, indexing="ij")
+    radius = torch.sqrt(sum(g**2 for g in grid))
+    result = (radius >= inner_radius) & (radius <= outer_radius)
+    return result.to(mask.device), padding
 
 
 def _range(apply, n_columns, n_rows, tol, block, generator, device):
@@ -437,6 +479,7 @@ def dipole_basis(
     *,
     distance: float = 0.02,
     thickness: int = 3,
+    support: str = "hull",
     tol: float = 1e-3,
     interpolation_tol: float = 1e-4,
     block: int = 1000,
@@ -463,6 +506,9 @@ def dipole_basis(
         Free-space constants at the working frequency.
     distance, thickness
         Where the shell sits, as :func:`shell` takes them.
+    support
+        The shell's shape, ``"hull"`` (MARIE's ``geo_ultimate_basis.m``) or
+        ``"sphere"`` (``geo_spherical_basis.m``).
     tol
         Relative singular value below which fields are dropped, MARIE's
         ``tol_rSVD``.
@@ -485,7 +531,11 @@ def dipole_basis(
         The incident basis, not yet solved.
     """
     around, padding = shell(
-        body.mask, body.resolution, distance=distance, thickness=thickness
+        body.mask,
+        body.resolution,
+        distance=distance,
+        thickness=thickness,
+        shape=support,
     )
     shape = tuple(around.shape)
     inside = torch.nn.functional.pad(body.mask.to(torch.bool), (padding,) * 6)
