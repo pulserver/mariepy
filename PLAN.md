@@ -480,11 +480,17 @@ What this leaves uncovered is recorded rather than implied away:
   torch cannot batch runs in C++ in the pybind11 extension, on CPU buffers, and
   its result moves to the caller's device. Work that torch can batch stays in
   torch, where one code path runs on either device, and moves to C++ when a
-  profile shows it dominates, as **Loops** above says. Milestone 1's own profile names the
-  first candidate: assembling the body kernel takes tens of seconds, nearly all
-  of it the six-dimensional volume-volume rule at `Np_1D_medium_V`, whose cost
-  is set by that order and by the 512 offsets it covers rather than by the size
-  of the grid.
+  profile shows it dominates, as **Loops** above says. Milestone 1's profile
+  named the first: the six-dimensional volume-volume rule at `Np_1D_medium_V`.
+  The kernel sees only the separation of two points, so the port departs from
+  MARIE's `q⁶`-point product rule and integrates over the separation, weighted
+  by the two cells' overlap, with `(2q + 2)³` points; at every order tested
+  its error against a converged product rule is the smaller. It runs in C++
+  on CPU and in torch otherwise, each checked against the other. The DIRECTFN
+  face integrals of touching cells release the GIL and run on threads. A
+  body kernel on a 60³ grid then assembles in about ten seconds for the
+  piecewise-constant basis and half a minute for the piecewise-linear one,
+  a cost set by the near offsets rather than by the grid.
 - **Arrays and units.** Arrays are C-ordered with the batch dimension first:
   (ports, …) and (N, Nc, Nc). Units are SI, and frequencies are in Hz.
 - **Provenance.** Every ported function names its MARIE source file in its

@@ -27,8 +27,11 @@ the offset goes to zero.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 
+from mariepy import _accelerators
 from mariepy.quadrature import gauss_legendre_1d
 
 __all__ = [
@@ -74,8 +77,8 @@ PAIR_OF = (
 # one twelfth.
 _MASS = (1.0, 1.0 / 12.0, 1.0 / 12.0, 1.0 / 12.0)
 
-# How many kernel evaluations to hold at once. The six-dimensional rule has
-# order**6 points, so the offsets are taken in chunks that keep this bounded.
+# How many kernel evaluations to hold at once. A volume rule has thousands of
+# points, so the offsets are taken in chunks that keep this bounded.
 _CHUNK_ELEMENTS = 1 << 22
 
 
@@ -170,7 +173,9 @@ def volume_volume_n(
     wavenumber
         Free-space wavenumber in rad/m.
     order
-        Gauss-Legendre points per axis; the rule has ``order ** 6`` points.
+        Gauss-Legendre points per axis of MARIE's product rule; the overlap
+        rule used here reaches the same polynomial degree with
+        ``(2 * order + 2) ** 3`` points.
     linear
         Weight the integral by each of the :data:`PAIRS` of linear basis
         functions, rather than by the constant alone.
@@ -226,10 +231,138 @@ def volume_volume_k(
     return _volume_volume(offsets, resolution, wavenumber, order, green_k, 3, linear)
 
 
+def _overlap_rule(order, device, dtype):
+    """Return the one-dimensional rule for the difference of two cell coordinates.
+
+    With ``u`` and ``v`` the observer's and the source's coordinate over one
+    cell pitch, each in ``[-1/2, 1/2]``, a kernel of ``d = u - v`` integrates
+    over both as ``integral h(d) f(d) dd``, where ``h`` is the length of the
+    overlap weighted by the basis functions: ``1``, ``u``, ``v`` or ``u v``.
+    Each weight is a polynomial of degree up to three on either side of
+    ``d = 0``. A Gauss rule of ``order + 1`` points on each half integrates
+    it with a polynomial ``f`` to the degree the ``order``-point product rule
+    reaches for the same weight.
+
+    Returns
+    -------
+    nodes : torch.Tensor
+        Shape ``(2 * order + 2,)``, the values of ``d``.
+    weights : torch.Tensor
+        Shape ``(4, 2 * order + 2)``: the rule for the weights ``1``, ``u``,
+        ``v`` and ``u v``, in that order.
+    """
+    base_weights, base_nodes = gauss_legendre_1d(order + 1, device=device, dtype=dtype)
+    half = (base_nodes + 1.0) / 2.0  # on [0, 1]
+    nodes = torch.cat([-half.flip(0), half])
+    gauss = torch.cat([base_weights.flip(0), base_weights]) / 2.0
+    positive = nodes >= 0
+    low = torch.where(positive, nodes - 0.5, torch.full_like(nodes, -0.5))
+    high = torch.where(positive, torch.full_like(nodes, 0.5), nodes + 0.5)
+    constant = high - low
+    first = (high**2 - low**2) / 2.0
+    second = first - nodes * constant
+    both = (high**3 - low**3) / 3.0 - nodes * first
+    return nodes, gauss * torch.stack([constant, first, second, both])
+
+
 def _volume_volume(
     offsets, resolution, wavenumber, order, kernel, n_components, linear=False
 ):
-    """Run the six-dimensional rule for one kernel, in chunks over the offsets."""
+    """Integrate a kernel over two cells, reduced to the difference of their points.
+
+    The kernel depends on the separation alone, so the six-dimensional
+    integral MARIE takes with an ``order ** 6`` product rule is, exactly, a
+    three-dimensional one weighted by the cells' overlap; this takes it with
+    ``(2 order + 2) ** 3`` points and the same polynomial exactness.
+    """
+    if offsets.ndim != 2 or offsets.shape[1] != 3:
+        raise ValueError(f"offsets must have shape (n, 3), got {tuple(offsets.shape)}")
+    if torch.any(torch.linalg.vector_norm(offsets, dim=-1) == 0):
+        raise ValueError(
+            "the volume-volume rule diverges at a zero offset; voxels that touch "
+            "need the surface-surface treatment"
+        )
+
+    nodes, weights = _overlap_rule(order, offsets.device, offsets.dtype)
+    grid = torch.cartesian_prod(nodes, nodes, nodes)  # (m, 3)
+    separation_nodes = resolution * grid
+
+    def along(axis_weights):
+        """Combine one weight per axis into the three-dimensional rule."""
+        return (
+            axis_weights[0][:, None, None]
+            * axis_weights[1][None, :, None]
+            * axis_weights[2][None, None, :]
+        ).reshape(-1)
+
+    pairs = PAIRS if linear else ((0, 0),)
+    rows = []
+    for test, basis in pairs:
+        per_axis = []
+        for axis in range(3):
+            slot = (1 if test == axis + 1 else 0) + (2 if basis == axis + 1 else 0)
+            per_axis.append(weights[slot])
+        rows.append(along(per_axis))
+    pair_weight = torch.stack(rows)
+
+    jacobian = resolution**6
+    if offsets.device.type == "cpu" and kernel in (green_n, green_k):
+        compiled = _accelerators.require("volume_volume")
+        values = compiled(
+            offsets.detach().numpy(),
+            separation_nodes.detach().numpy(),
+            pair_weight.detach().numpy(),
+            wavenumber,
+            kernel is green_n,
+        )
+        result = jacobian * torch.from_numpy(values)
+        return result if linear else result[:, 0]
+    return _volume_volume_torch(
+        offsets,
+        separation_nodes,
+        pair_weight,
+        jacobian,
+        wavenumber,
+        kernel,
+        n_components,
+        linear,
+    )
+
+
+def _volume_volume_torch(
+    offsets,
+    separation_nodes,
+    pair_weight,
+    jacobian,
+    wavenumber,
+    kernel,
+    n_components,
+    linear,
+):
+    """Contract the kernel with the rule in torch, on whichever device holds it.
+
+    The compiled rule in ``_ext`` is checked against this.
+    """
+    chunk = max(1, _CHUNK_ELEMENTS // separation_nodes.shape[0])
+    result = torch.zeros(
+        (offsets.shape[0], pair_weight.shape[0], n_components),
+        device=offsets.device,
+        dtype=torch.complex128,
+    )
+    for start in range(0, offsets.shape[0], chunk):
+        block = offsets[start : start + chunk]
+        separation = block.unsqueeze(1) + separation_nodes.unsqueeze(0)
+        values = kernel(separation, wavenumber)
+        result[start : start + chunk] = jacobian * torch.einsum(
+            "pq,bqc->bpc", pair_weight.to(values.dtype), values
+        )
+    return result if linear else result[:, 0]
+
+
+def _volume_volume_product(
+    offsets, resolution, wavenumber, order, kernel, n_components, linear=False
+):
+    """Run the six-dimensional product rule, as MARIE does; kept as the reference."""
     if offsets.ndim != 2 or offsets.shape[1] != 3:
         raise ValueError(f"offsets must have shape (n, 3), got {tuple(offsets.shape)}")
     if torch.any(torch.linalg.vector_norm(offsets, dim=-1) == 0):
@@ -740,13 +873,19 @@ def _surface_surface(
     centre_observer = _np.array([resolution * value for value in offset_cells])
     centre_source = _np.zeros(3)
     total = _np.zeros((n_functions, n_functions, n_components), dtype=complex)
+    singular = []
 
     for face_observer in range(6):
         for face_source in range(6):
             normal_observer = _np.array(_FACE_NORMALS[face_observer])
             normal_source = _np.array(_FACE_NORMALS[face_source])
-            coefficients = reduction.coefficients(
-                normal_observer, normal_source, resolution, wavenumber, n_functions
+            coefficients = _face_coefficients(
+                reduction.coefficients,
+                face_observer,
+                face_source,
+                resolution,
+                wavenumber,
+                n_functions,
             )
             if not _np.any(coefficients):
                 continue
@@ -791,27 +930,49 @@ def _surface_surface(
                             value = (resolution / 2.0) ** 4 * _np.sum(
                                 weight * integrand
                             )
-                        else:
-                            value = routine(
-                                vertices,
-                                (vertices[0] + vertices[2]) / 2.0,
-                                observer_centre,
-                                normal_source,
-                                normal_observer,
-                                wavenumber,
-                                resolution,
-                                order,
-                                reduction.directfn_type[term],
-                                test,
-                                basis,
-                            )
                         tests = [test] if uses_test else range(n_functions)
                         sources = [basis] if uses_source else range(n_functions)
+                        if kind is not None:
+                            singular.append(
+                                (
+                                    routine,
+                                    (
+                                        vertices,
+                                        (vertices[0] + vertices[2]) / 2.0,
+                                        observer_centre,
+                                        normal_source,
+                                        normal_observer,
+                                        wavenumber,
+                                        resolution,
+                                        order,
+                                        reduction.directfn_type[term],
+                                        test,
+                                        basis,
+                                    ),
+                                    coefficients[term],
+                                    tests,
+                                    sources,
+                                )
+                            )
+                            continue
                         for row in tests:
                             for column in sources:
                                 total[row, column] += (
                                     coefficients[term][:, row, column] * value
                                 )
+
+    # The singular integrals are independent and release the GIL; take them
+    # on every core, and add them in the order they were set up.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor() as pool:
+        values = list(pool.map(lambda job: job[0](*job[1]), singular))
+    for (_, _, coefficient, tests, sources), value in zip(
+        singular, values, strict=True
+    ):
+        for row in tests:
+            for column in sources:
+                total[row, column] += coefficient[:, row, column] * value
 
     if every_pair:
         return torch.tensor(total, dtype=torch.complex128)
@@ -870,15 +1031,46 @@ def _n_coefficients(normal, normal_source, resolution, wavenumber, n_functions):
     return out
 
 
+@functools.lru_cache(maxsize=512)
+def _face_coefficients(
+    coefficients, face_observer, face_source, resolution, wavenumber, n_functions
+):
+    """Return one reduction's constants for a face pair; they depend on the normals only."""
+    import numpy as _np
+
+    return coefficients(
+        _np.array(_FACE_NORMALS[face_observer]),
+        _np.array(_FACE_NORMALS[face_source]),
+        resolution,
+        wavenumber,
+        n_functions,
+    )
+
+
+# The integrands of one face pair share its Green functions. The entry holds the
+# point arrays, so an identity match cannot come from a recycled object.
+_last_greens: list = [None]
+
+
 def _face_greens(observer, source, wavenumber):
     """Return the separation, its length, and the dynamic and static Green functions."""
     import numpy as _np
 
+    cached = _last_greens[0]
+    if (
+        cached is not None
+        and cached[0] is observer
+        and cached[1] is source
+        and cached[2] == wavenumber
+    ):
+        return cached[3]
     separation = observer - source
-    distance = _np.linalg.norm(separation, axis=1)
+    distance = _np.sqrt(_np.einsum("ij,ij->i", separation, separation))
     green = _np.exp(-1j * wavenumber * distance) / (4.0 * _np.pi * distance)
     static = 1.0 / (4.0 * _np.pi * distance)
-    return separation, distance, green, static
+    result = separation, distance, green, static
+    _last_greens[0] = (observer, source, wavenumber, result)
+    return result
 
 
 def _radial_field(separation, distance, green, static, wavenumber):
@@ -1049,32 +1241,34 @@ def _assemble(
 
     trailing = (len(PAIRS), n_components) if linear else (n_components,)
     kernel = torch.zeros((*shape, *trailing), dtype=torch.complex128)
-    near = tuple(_itertools.product(*(range(min(2, n)) for n in shape)))
-    offsets = [
-        cell
-        for cell in _itertools.product(*(range(n) for n in shape))
-        if cell not in near
-    ]
+    cells = torch.stack(
+        torch.meshgrid(*(torch.arange(n) for n in shape), indexing="ij"), dim=-1
+    ).reshape(-1, 3)
+    touching = (cells < 2).all(dim=1)
+    offsets = cells[~touching]
 
-    if offsets:
-        index = torch.tensor(offsets, dtype=torch.float64)
+    if offsets.numel():
         far = by_volume(
-            resolution * index, resolution, wavenumber, far_order, linear=linear
+            resolution * offsets.to(torch.float64),
+            resolution,
+            wavenumber,
+            far_order,
+            linear=linear,
         )
-        for row, cell in enumerate(offsets):
-            kernel[cell] = far[row]
+        kernel[offsets[:, 0], offsets[:, 1], offsets[:, 2]] = far
 
-        medium = [
-            cell for cell in offsets if all(value < medium_order for value in cell)
-        ]
-        if medium:
-            index = torch.tensor(medium, dtype=torch.float64)
+        medium = offsets[(offsets < medium_order).all(dim=1)]
+        if medium.numel():
             refined = by_volume(
-                resolution * index, resolution, wavenumber, medium_order, linear=linear
+                resolution * medium.to(torch.float64),
+                resolution,
+                wavenumber,
+                medium_order,
+                linear=linear,
             )
-            for row, cell in enumerate(medium):
-                kernel[cell] = refined[row]
+            kernel[medium[:, 0], medium[:, 1], medium[:, 2]] = refined
 
+    near = tuple(_itertools.product(*(range(min(2, n)) for n in shape)))
     for cell in near:
         kernel[cell] = by_surface(
             cell, resolution, wavenumber, near_order, linear=linear
