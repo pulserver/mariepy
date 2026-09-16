@@ -732,7 +732,8 @@ class MrgfSolution:
     ----------
     impedance
         The coil's matrix with the body's response added, MARIE's ``Zss`` in
-        ``ie_solver_svie_mrgf.m``.
+        ``ie_solver_svie_mrgf.m``, over the shield's unknowns and then the
+        coil's where there is a shield.
     coil
         Each port's coil currents, shape ``(n_ports, n_dof)``.
     coefficients
@@ -745,6 +746,8 @@ class MrgfSolution:
         ``(n_ports, c, n1, n2, n3)``.
     body
         Each port's body current, shape ``(n_ports, c * n_voxels)``.
+    shield
+        Each port's shield currents, or None without a shield.
     """
 
     impedance: torch.Tensor
@@ -754,6 +757,7 @@ class MrgfSolution:
     electric: torch.Tensor
     magnetic: torch.Tensor
     body: torch.Tensor
+    shield: torch.Tensor | None = None
 
 
 def solve_coil(
@@ -763,10 +767,15 @@ def solve_coil(
     body: VoxelBody,
     medium: Medium,
     *,
+    shield: SurfaceCoil | None = None,
     triangle_order: int = 4,
     cell_order: int = 2,
 ) -> MrgfSolution:
     """Solve a coil against a body through its solved basis, as ``ie_solver_svie_mrgf.m``.
+
+    A shield joins as MARIE joins it there: its unknowns come first, with its
+    own matrix, its interaction with the coil, and its coupling to the body
+    at the samples, and it takes no drive.
 
     Parameters
     ----------
@@ -781,6 +790,8 @@ def solve_coil(
         The body.
     medium
         The same frequency.
+    shield
+        An RF shield around the coil and the body, with no driven port.
     triangle_order, cell_order
         Quadrature orders of the coupling at the samples.
 
@@ -802,19 +813,50 @@ def solve_coil(
         triangle_order=triangle_order,
         cell_order=cell_order,
     )
+    matrix, excitation = system.impedance, system.excitation
+    if shield is not None:
+        from mariepy import shield as shield_module
+        from mariepy.sie import assemble as assemble_surface
+
+        own = assemble_surface(shield, medium).impedance
+        cross = shield_module._coil_coupling(shield, coil, medium, 4)
+        matrix = torch.cat(
+            [torch.cat([own, cross], dim=1), torch.cat([cross.T, matrix], dim=1)]
+        )
+        excitation = torch.nn.functional.pad(excitation, (shield.n_dof, 0))
+        tested = torch.cat(
+            [
+                coupling_at(
+                    shield,
+                    points,
+                    medium,
+                    body.resolution,
+                    linear=basis.linear,
+                    triangle_order=triangle_order,
+                    cell_order=cell_order,
+                ),
+                tested,
+            ],
+            dim=1,
+        )
     inverse = _inverse_mass(
         basis.n_components, points.shape[0], body.resolution, points.device
     )
-    field = inverse[:, None] * tested  # the coil's incident field at the samples
-    impedance = system.impedance + field.T @ basis.response @ field
-    current = torch.linalg.solve(impedance, system.excitation.T).T
+    field = inverse[:, None] * tested  # the incident field at the samples
+    impedance = matrix + field.T @ basis.response @ field
+    current = torch.linalg.solve(impedance, excitation.T).T
     coefficients = (basis.interpolation @ (field @ current.T)).T
+    shield_current = None
+    if shield is not None:
+        shield_current = current[:, : shield.n_dof]
+        current = current[:, shield.n_dof :]
     electric = coefficients @ basis.electric
     magnetic = coefficients @ basis.magnetic
     admittance = network.symmetrise(network.port_admittance(system.excitation, current))
     return MrgfSolution(
         impedance=impedance,
         coil=current,
+        shield=shield_current,
         coefficients=coefficients,
         admittance=admittance,
         electric=torch.stack([body.from_dof(row) for row in electric]),

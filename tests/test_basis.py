@@ -5,6 +5,7 @@ import torch
 
 from mariepy import basis as basis_module
 from mariepy import fields, metrics, network, sie
+from mariepy import shield as shield_module
 from mariepy.body import VoxelBody
 from mariepy.coil import Port, SurfaceCoil
 from mariepy.constants import Medium
@@ -68,8 +69,15 @@ def _dense(coil, system, body, medium, linear):
     tested = basis_module.coupling_at(
         coil, centres, medium, body.resolution, linear=linear
     )
+    return _dense_from(
+        tested, system.impedance, system.excitation, body, medium, linear
+    )
+
+
+def _dense_from(tested, matrix, drive, body, medium, linear):
+    """Add the body's whole response to a matrix, and give the port admittance."""
     inverse = basis_module._inverse_mass(
-        12 if linear else 3, body.n_voxels, body.resolution, centres.device
+        12 if linear else 3, body.n_voxels, body.resolution, tested.device
     )
     operator = BodyOperator.build(body, medium, linear=linear, **ORDERS)
     currents = torch.stack(
@@ -78,9 +86,9 @@ def _dense(coil, system, body, medium, linear):
             for column in tested.T
         ]
     )
-    impedance = system.impedance + tested.T @ currents.T
-    current = torch.linalg.solve(impedance, system.excitation.T).T
-    return network.symmetrise(network.port_admittance(system.excitation, current))
+    impedance = matrix + tested.T @ currents.T
+    current = torch.linalg.solve(impedance, drive.T).T
+    return network.symmetrise(network.port_admittance(drive, current))
 
 
 def test_a_coil_solved_through_the_basis_is_the_coil_coupled_whole(solved):
@@ -101,6 +109,55 @@ def test_a_coil_solved_through_the_basis_is_the_coil_coupled_whole(solved):
     free = torch.linalg.solve(system.impedance, system.excitation.T).T
     bare = network.symmetrise(network.port_admittance(system.excitation, free))
     assert float((dense - bare).abs().max()) > 1e3 * float(error)
+
+
+def test_a_shielded_coil_through_the_basis_is_the_shielded_coil_coupled_whole():
+    """The shield is coupled to the body as the coil is, and takes no drive.
+
+    The basis is built on one support holding both surfaces, so it spans both
+    their fields.
+    """
+    medium, body, coil = _case()
+    shield = SurfaceCoil.build(SurfaceMesh.sphere(radius=0.09, subdivisions=0))
+    shield_mesh, coil_mesh = shield.mesh, coil.mesh
+    support = SurfaceCoil.build(
+        SurfaceMesh(
+            nodes=torch.cat([shield_mesh.nodes, coil_mesh.nodes]),
+            triangles=torch.cat(
+                [shield_mesh.triangles, coil_mesh.triangles + shield_mesh.n_nodes]
+            ),
+            triangle_tags=torch.cat(
+                [shield_mesh.triangle_tags, coil_mesh.triangle_tags]
+            ),
+            lines=torch.zeros((0, 2), dtype=torch.long),
+            line_tags=torch.zeros(0, dtype=torch.long),
+        )
+    )
+    incident = basis_module.surface_basis(
+        body, support, medium, tol=1e-12, interpolation_tol=1e-12
+    )
+    joint = basis_module.solve(incident, body, medium, tol=TOLERANCE, **ORDERS)
+    system = sie.assemble(coil, medium)
+    reduced = basis_module.solve_coil(coil, system, joint, body, medium, shield=shield)
+
+    own = sie.assemble(shield, medium).impedance
+    cross = shield_module._coil_coupling(shield, coil, medium, 4)
+    whole = torch.cat(
+        [torch.cat([own, cross], dim=1), torch.cat([cross.T, system.impedance], dim=1)]
+    )
+    drive = torch.nn.functional.pad(system.excitation, (shield.n_dof, 0))
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    tested = torch.cat(
+        [
+            basis_module.coupling_at(part, centres, medium, body.resolution)
+            for part in (shield, coil)
+        ],
+        dim=1,
+    )
+    dense = _dense_from(tested, whole, drive, body, medium, False)
+    error = (reduced.admittance - dense).abs().max()
+    assert float(error / dense.abs().max()) <= 1e-7
+    assert reduced.shield.shape == (2, shield.n_dof)
 
 
 def test_the_basis_fields_are_the_body_s_own_total_fields(solved):
