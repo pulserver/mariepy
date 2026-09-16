@@ -8,6 +8,7 @@ reproduced below the table at the same time.
 |---|---|---|---|
 | MARIE 3.0, <https://github.com/cloudmrhub/marie-tools> | MIT | Ported to Python and C++ | 1 |
 | MARIE 3.0 coupling sources, `tests/marie/` | MIT | Kept verbatim as the test oracle for the coupling kernels; test-only, never in the wheel | 1 |
+| MARIE 3.0 wire coupling sources, `tests/marie/wire/` | MIT | Kept verbatim as the test oracle for the wire coupling kernels, compiled with the falling-ramp change `PLAN.md` records; test-only, never in the wheel | 3 |
 | DIRECTFN singular integrals, as distributed in MARIE 3.0 | LGPL | Separate extension module, source kept with its notice | 1 |
 | Dunavant triangle quadrature, as distributed in MARIE 3.0 | LGPL | Rules taken from Dunavant (1985); the files themselves are not carried | 1 |
 | TT-Toolbox `dmrg_cross` and the helpers it calls, as distributed in MARIE 3.0 | MIT | Ported to Python in `mariepy/tt.py` | 2 |

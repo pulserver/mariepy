@@ -60,6 +60,9 @@ watts = absorbed_power(result.operator, result.fields)
 b1_plus, b1_minus = circular_components(result.operator, result.fields)
 ```
 
+A wire coil, `WireCoil.read_gmsh22` or `WireCoil.loop`, goes to `solve` in the
+same place; a simulation file naming a `WireFile` reads into one.
+
 `linear=True` gives the body the piecewise-linear basis, twelve unknowns per
 voxel, which carries the field's variation inside each voxel; the fields then
 come back as those coefficients, and `fields.at_centres` gives their values at

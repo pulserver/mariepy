@@ -123,6 +123,26 @@ end, and here it is bounded; `reort.m` compares squared entries without
 conjugating, which on complex data compares real parts, and here it compares
 squared moduli. A shield with driven ports is not supported.
 
+**Wire coils.** `wire.py` ports MARIE's wire coil: its geometry, its own
+matrix with the closed forms for a segment against itself, its lumped loads,
+its port drive and its coupling kernels. The precorrected FFT takes a wire coil
+as it takes a surface one, since the two differ only in where a basis function
+sits, how wide it is and which kernel gives its field. The port reads closed
+loops only: MARIE's open-wire branch of `ProcessLoops.m` assigns rows of
+mismatched size and cannot run. It departs from MARIE in two places:
+
+- MARIE's wire coupling sources sample the falling half of each basis function
+  with the rising ramp, so the current they couple to the body is not the one
+  the wire's own matrix solves for. The torch kernel gives the falling half its
+  falling ramp, and the oracle test compiles MARIE's sources with that one
+  change; a second test shows the sources as shipped differ.
+- A port or element on a loop's last segment spans that segment's two basis
+  functions, the last and the loop's first; MARIE takes the next basis
+  function by index, which there is the next loop's first.
+
+A wire coil together with a surface coil, or inside a shield, needs MARIE's
+wire-to-surface coupling and is not supported yet.
+
 **Co-simulation.** `cosim.py` ports MARIE's tuning, matching, decoupling and
 preamplifier-decoupling searches and its calibrations for coils whose ports
 share one role (`Tx`, `Rx` or `TxRx`), with the circuit numerics in
@@ -164,8 +184,8 @@ package's single `_ext` module, following the package template and pypulseqpp.
   `tests/marie/`. The torch form is assembled from kernels the Mie series
   validated rather than transcribed, so the check between the two is a check
   between independent formulations.
-  The wire-coil sources are checked for the same structure when milestone 3
-  ports them.
+  The 24 wire-coil sources, kept in `tests/marie/wire/`, have the same
+  structure and are checked the same way against the torch wire kernel.
 - **Singular integrals.** The DIRECTFN sources (`direct_ws_*_rwg` for the coil,
   `solve_ea`, `solve_st`, `solve_va` and their headers for the body) carry an
   LGPL notice. They build as a separate extension module with that notice kept,

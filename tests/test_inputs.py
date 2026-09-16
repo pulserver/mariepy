@@ -10,8 +10,9 @@ from mariepy.constants import Medium
 from mariepy.inputs import read_case
 from mariepy.mesh import SurfaceMesh
 from mariepy.solver import solve
+from mariepy.wire import WireCoil
 
-from .marie_files import write_gmsh22, write_marie_body
+from .marie_files import write_gmsh22, write_marie_body, write_wire_gmsh22
 
 ELEMENTS = {
     "coil_configuration": {
@@ -115,23 +116,36 @@ def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("changes", "milestone"),
+    ("changes", "reason"),
     [
-        ({"WireFile": "wire.msh"}, "milestone 3"),
+        ({"WireFile": "Loop/wire.msh"}, "wire coil and a surface coil"),
         ({"CoilFile": "", "BasisFile": "basis.mat"}, "milestone 4"),
     ],
-    ids=["wire coil", "field basis only"],
+    ids=["wire and surface coil", "field basis only"],
 )
-def test_a_simulation_file_milestone_1_does_not_cover_is_refused_by_name(
-    tmp_path, changes, milestone
+def test_a_simulation_file_this_port_does_not_cover_is_refused_by_name(
+    tmp_path, changes, reason
 ):
-    with pytest.raises(NotImplementedError, match=milestone):
+    with pytest.raises(NotImplementedError, match=reason):
         read_case(_data(tmp_path, **changes))
 
 
 def test_a_simulation_file_that_names_no_coil_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="names no surface coil"):
+    with pytest.raises(ValueError, match="names no coil"):
         read_case(_data(tmp_path, CoilFile=""))
+
+
+def test_a_wire_coil_the_simulation_file_names_is_read_with_its_ports(tmp_path):
+    path = _data(tmp_path, CoilFile="", WireFile="Loop/wire.msh")
+    wires = path.parent.parent / "coils" / "wire_files" / "Loop"
+    wires.mkdir(parents=True)
+    write_wire_gmsh22(wires / "wire.msh", n_segments=12, port_nodes=[0])
+    (wires / "wire.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert isinstance(case.coil, WireCoil)
+    assert case.coil.n_dof == 12
+    assert case.coil.ports[0].dofs.tolist() == [0, 1]
+    assert case.network.role == "Tx"
 
 
 @pytest.mark.parametrize(("basis", "linear"), [(0, False), (1, True)])

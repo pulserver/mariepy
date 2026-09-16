@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 import torch
 
-from mariepy import fields, network, pfft, sie, vie
+from mariepy import fields, network, pfft, sie, vie, wire
 from mariepy import shield as shield_module
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
@@ -25,6 +25,7 @@ from mariepy.gmres import Solution, gmres
 from mariepy.preconditioner import body_diagonal
 from mariepy.system import CoupledOperator, ShieldedOperator
 from mariepy.tucker import circulant_tucker
+from mariepy.wire import WireCoil
 
 __all__ = [
     "BodyOperator",
@@ -334,7 +335,7 @@ class Result:
 
 def solve(
     body: VoxelBody,
-    coil: SurfaceCoil,
+    coil: SurfaceCoil | WireCoil,
     medium: Medium,
     *,
     tol: float = 1e-5,
@@ -358,7 +359,7 @@ def solve(
     body
         The body and its grid.
     coil
-        The coil, its basis and its ports.
+        The coil, its basis and its ports: a surface coil or a wire coil.
     medium
         The frequency to solve at.
     tol
@@ -367,7 +368,9 @@ def solve(
     reference
         Line impedance the scattering parameters are referred to, in ohms.
     triangle_order, cell_order
-        Quadrature orders of the coupling kernels.
+        Quadrature orders of the coupling kernels; for a wire coil,
+        ``triangle_order`` is the Gauss points per segment, MARIE's
+        ``Quad_order_wie_coup``.
     far_order, medium_order, near_order
         Quadrature orders of the body kernels.
     linear
@@ -382,8 +385,18 @@ def solve(
     -------
     Result
         The port parameters and the fields.
+
+    Raises
+    ------
+    NotImplementedError
+        If a wire coil is given a shield.
     """
-    system = sie.assemble(coil, medium)
+    if isinstance(coil, WireCoil):
+        if shield is not None:
+            raise NotImplementedError("a wire coil inside a shield is not supported")
+        system = wire.assemble(coil, medium)
+    else:
+        system = sie.assemble(coil, medium)
     coupling = pfft.assemble(
         body,
         coil,

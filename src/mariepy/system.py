@@ -27,6 +27,7 @@ from mariepy.constants import Medium
 from mariepy.pfft import Coupling
 from mariepy.preconditioner import body_diagonal
 from mariepy.sie import CoilSystem
+from mariepy.wire import WireCoil
 
 if TYPE_CHECKING:
     from mariepy.shield import Shield
@@ -53,7 +54,7 @@ class CoupledOperator:
     """
 
     body: VoxelBody
-    coil: SurfaceCoil
+    coil: SurfaceCoil | WireCoil
     medium: Medium
     system: CoilSystem
     coupling: Coupling

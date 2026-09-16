@@ -26,6 +26,7 @@ from mariepy.coil import SurfaceCoil, read_lumped_elements
 from mariepy.constants import Medium
 from mariepy.cosim import Network, read_network
 from mariepy.mesh import SurfaceMesh
+from mariepy.wire import WireCoil
 
 __all__ = ["Case", "read_case"]
 
@@ -41,7 +42,7 @@ class Case:
     body
         The body model.
     coil
-        The surface coil, its ports and its lumped elements.
+        The surface or wire coil, its ports and its lumped elements.
     linear
         Whether the file asks for the piecewise-linear body basis; pass it to
         :func:`~mariepy.solver.solve`.
@@ -55,7 +56,7 @@ class Case:
 
     medium: Medium
     body: VoxelBody
-    coil: SurfaceCoil
+    coil: SurfaceCoil | WireCoil
     linear: bool = False
     shield: SurfaceCoil | None = None
     network: Network | None = None
@@ -88,9 +89,10 @@ def read_case(
     Raises
     ------
     NotImplementedError
-        If the file asks for a wire coil or a precomputed field basis.
+        If the file asks for a wire coil and a surface coil together, or for a
+        precomputed field basis.
     ValueError
-        If the file names no surface coil, or a body basis MARIE does not know.
+        If the file names no coil, or a body basis MARIE does not know.
     """
     path = Path(path)
     data = path.parent.parent if data is None else Path(data)
@@ -99,22 +101,30 @@ def read_case(
     basis = int(settings.get("Basis_Functions_VIE", 0))
     if basis not in (0, 1):
         raise ValueError(f"{path.name} names body basis {basis}; MARIE knows 0 and 1")
-    if settings.get("WireFile"):
-        raise NotImplementedError(
-            f"{path.name} names a wire coil, which is milestone 3"
-        )
-    if settings.get("BasisFile") and not settings.get("CoilFile"):
+    coil_name = settings.get("CoilFile")
+    wire_name = settings.get("WireFile")
+    if settings.get("BasisFile") and not (coil_name or wire_name):
         raise NotImplementedError(
             f"{path.name} asks for a precomputed field basis, which is milestone 4"
         )
-    coil_name = settings.get("CoilFile")
-    if not coil_name:
-        raise ValueError(f"{path.name} names no surface coil")
+    if coil_name and wire_name:
+        raise NotImplementedError(
+            f"{path.name} names a wire coil and a surface coil together, "
+            "which is not supported yet"
+        )
+    if not (coil_name or wire_name):
+        raise ValueError(f"{path.name} names no coil")
 
-    coil_file = data / "coils" / "coil_files" / coil_name
-    mesh = SurfaceMesh.read_gmsh22(coil_file, device=device or "cpu")
     tmd = bool(settings.get("TMD", 0))
-    elements = read_lumped_elements(coil_file.with_suffix(".json"), tmd=tmd)
+    if wire_name:
+        coil_file = data / "coils" / "wire_files" / wire_name
+        elements = read_lumped_elements(coil_file.with_suffix(".json"), tmd=tmd)
+        coil = WireCoil.read_gmsh22(coil_file, elements, device=device or "cpu")
+    else:
+        coil_file = data / "coils" / "coil_files" / coil_name
+        mesh = SurfaceMesh.read_gmsh22(coil_file, device=device or "cpu")
+        elements = read_lumped_elements(coil_file.with_suffix(".json"), tmd=tmd)
+        coil = SurfaceCoil.build(mesh, elements)
 
     shield = None
     if settings.get("ShieldFile"):
@@ -132,7 +142,7 @@ def read_case(
         body=VoxelBody.read_marie(
             data / "bodies" / settings["BodyFile"], device=device
         ),
-        coil=SurfaceCoil.build(mesh, elements),
+        coil=coil,
         linear=basis == 1,
         shield=shield,
         network=read_network(coil_file.with_suffix(".json"), tmd=tmd),
