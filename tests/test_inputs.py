@@ -5,6 +5,7 @@ import json
 import numpy as np
 import pytest
 
+from mariepy import cosim
 from mariepy.constants import Medium
 from mariepy.inputs import read_case
 from mariepy.mesh import SurfaceMesh
@@ -82,6 +83,9 @@ def test_a_marie_simulation_file_gives_the_body_the_coil_and_the_frequency_it_na
     assert case.body.resolution == pytest.approx(0.01)
     assert case.coil.n_driven == 1
     assert case.coil.ports[0].dofs.numel() > 0
+    assert [t.number for t in case.network.terminals] == [1]
+    assert case.network.role == "Tx"
+    assert not case.network.tmd
 
 
 def test_a_case_read_from_marie_files_solves(tmp_path):
@@ -92,6 +96,15 @@ def test_a_case_read_from_marie_files_solves(tmp_path):
     )
     assert all(residual <= 1e-5 for residual in result.ports.residual)
     assert float(result.impedance[0, 0].real) > 0.0
+
+    closed = cosim.co_simulate(
+        case.network, result.admittance, case.medium.angular_frequency
+    )
+    assert closed.values == ((1e-12,),)
+    voltage = closed.transmit[:, 0]
+    taken = 0.5 * float((voltage.conj() @ result.admittance.cpu() @ voltage).real)
+    accepted = 0.5 * (1 - abs(complex(closed.scattering[0, 0])) ** 2)
+    assert taken <= accepted * (1 + 1e-9)
 
 
 def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):

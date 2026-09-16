@@ -14,7 +14,9 @@ those ports leaves the admittance the coil ports see. The matching network is
 then added stage by stage: a parallel stage adds to the admittance, a series
 stage to the impedance.
 
-Every function here works on small dense matrices, one frequency at a time.
+Every function here works on small dense matrices. The placing functions also
+take a leading batch of them, one per candidate or per frequency, with element
+values and the angular frequency broadcast against that batch.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ __all__ = [
     "MutualPair",
     "Stage",
     "abcd_to_s",
+    "coil_voltage",
     "decoupling_weights",
     "element_admittance",
     "matching_calibration",
@@ -226,13 +229,14 @@ def place_tuning(
     Parameters
     ----------
     admittance
-        The multiport admittance, square.
+        The multiport admittance, shape ``(..., n, n)``.
     ports
         The element port of each element.
     loads, values
-        Each element's load type and value.
+        Each element's load type, and its value, shape ``(..., n_elements)``.
     omega
-        Angular frequency in rad/s.
+        Angular frequency in rad/s, a float or a tensor broadcast against the
+        batch.
     quality
         Each element's quality factor, or None for lossless elements.
     pairs
@@ -251,8 +255,8 @@ def place_tuning(
         if without_resistors and load == "resistor":
             continue
         q = None if quality is None else quality[index]
-        placed[port, port] = placed[port, port] + element_admittance(
-            load, values[index], omega, q
+        placed[..., port, port] = placed[..., port, port] + element_admittance(
+            load, values[..., index], omega, q
         )
     for pair in pairs:
         coupling = 1.0 / (
@@ -261,8 +265,8 @@ def place_tuning(
             * pair.coefficient
             * torch.sqrt(pair.first_inductance * pair.second_inductance)
         )
-        placed[pair.first, pair.second] = placed[pair.first, pair.second] + coupling
-        placed[pair.second, pair.first] = placed[pair.second, pair.first] + coupling
+        placed[..., pair.first, pair.second] += coupling
+        placed[..., pair.second, pair.first] += coupling
     return placed
 
 
@@ -272,7 +276,7 @@ def reduce(admittance: torch.Tensor, keep: list[int], drop: list[int]) -> torch.
     Parameters
     ----------
     admittance
-        Square.
+        Shape ``(..., n, n)``.
     keep, drop
         Port indices.
 
@@ -281,12 +285,16 @@ def reduce(admittance: torch.Tensor, keep: list[int], drop: list[int]) -> torch.
     torch.Tensor
         ``Y_kk - Y_kd Y_dd^-1 Y_dk``.
     """
-    if not drop:
-        return admittance[keep][:, keep]
-    y_kk = admittance[keep][:, keep]
-    y_kd = admittance[keep][:, drop]
-    y_dk = admittance[drop][:, keep]
-    y_dd = admittance[drop][:, drop]
+    keep = torch.as_tensor(keep, dtype=torch.long, device=admittance.device)
+    drop = torch.as_tensor(drop, dtype=torch.long, device=admittance.device)
+    rows_kept = admittance.index_select(-2, keep)
+    y_kk = rows_kept.index_select(-1, keep)
+    if drop.numel() == 0:
+        return y_kk
+    rows_dropped = admittance.index_select(-2, drop)
+    y_kd = rows_kept.index_select(-1, drop)
+    y_dk = rows_dropped.index_select(-1, keep)
+    y_dd = rows_dropped.index_select(-1, drop)
     return y_kk - y_kd @ torch.linalg.solve(y_dd, y_dk)
 
 
@@ -300,7 +308,8 @@ class Stage:
         Each port's element in this stage, one of :data:`PARALLEL_LOADS` or
         :data:`SERIES_LOADS`, or ``""`` where the port has no element here.
     values
-        Each port's element value, zero where it has none.
+        Each port's element value, zero where it has none, shape
+        ``(..., n_ports)``.
     quality
         Each port's quality factor, or None for lossless elements.
     """
@@ -327,11 +336,12 @@ def place_matching(
     Parameters
     ----------
     admittance
-        The coil ports' admittance.
+        The coil ports' admittance, shape ``(..., n_ports, n_ports)``.
     stages
         The stages, from the coil outwards.
     omega
-        Angular frequency in rad/s.
+        Angular frequency in rad/s, a float or a tensor broadcast against the
+        batch.
     lossless
         A second admittance carried alongside with lossless elements, as
         ``match.m`` carries ``YPm_loss``, or None.
@@ -353,21 +363,21 @@ def place_matching(
         series = [port for port, load in enumerate(loads) if load in SERIES_LOADS]
         for port in parallel:
             element, element_lossless = _parallel(
-                loads[port], values[port], omega, q, port
+                loads[port], values[..., port], omega, q, port
             )
-            y[port, port] = y[port, port] + element
+            y[..., port, port] += element
             if y_lossless is not None and element_lossless is not None:
-                y_lossless[port, port] = y_lossless[port, port] + element_lossless
+                y_lossless[..., port, port] += element_lossless
         if series:
             z = torch.linalg.inv(y)
             z_lossless = None if y_lossless is None else torch.linalg.inv(y_lossless)
             for port in series:
                 element, element_lossless = _series(
-                    loads[port], values[port], omega, q, port
+                    loads[port], values[..., port], omega, q, port
                 )
-                z[port, port] = z[port, port] + element
+                z[..., port, port] += element
                 if z_lossless is not None and element_lossless is not None:
-                    z_lossless[port, port] = z_lossless[port, port] + element_lossless
+                    z_lossless[..., port, port] += element_lossless
             y = torch.linalg.inv(z)
             if z_lossless is not None:
                 y_lossless = torch.linalg.inv(z_lossless)
@@ -409,6 +419,68 @@ def _series(load, value, omega, quality, port):
         return reactance, None
     loss = omega * value / quality[port]
     return reactance + loss, reactance
+
+
+def coil_voltage(
+    admittance: torch.Tensor,
+    stages: tuple[Stage, ...],
+    omega,
+    reference: float,
+) -> torch.Tensor:
+    """Map the waves incident on the matching networks' inputs to the coil voltages.
+
+    Each port's network is a chain of two-ports, a shunt admittance ``y`` with
+    ABCD matrix ``[[1, 0], [y, 1]]`` and a series impedance ``z`` with
+    ``[[1, z], [0, 1]]``, so the input side is ``A V + B I`` and ``C V + D I``
+    of the coil side. A source of the line impedance sending the wave ``a``
+    sets ``V_in + z0 I_in = 2 sqrt(z0) a``, and the coil draws
+    ``I = Y V``, whence ``V = 2 sqrt(z0) [(A + z0 C) + (B + z0 D) Y]^-1 a``
+    with the diagonal chain matrices.
+
+    Parameters
+    ----------
+    admittance
+        The coil ports' admittance, shape ``(..., n, n)``.
+    stages
+        The matching stages, from the coil outwards, as for
+        :func:`place_matching`; their quality factors, if given, set the loss.
+    omega
+        Angular frequency in rad/s, a float or a tensor broadcast against the
+        batch.
+    reference
+        Line impedance in ohms.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(..., n, n)``: column ``p`` holds the coil voltages when a unit
+        wave arrives at port ``p`` and none at the others.
+    """
+    n = admittance.shape[-1]
+    batch = admittance.shape[:-2]
+    one = torch.ones((*batch, n), dtype=admittance.dtype, device=admittance.device)
+    a, b = one.clone(), torch.zeros_like(one)
+    c, d = torch.zeros_like(one), one.clone()
+    for stage in stages:
+        values = stage.values.to(torch.complex128)
+        q = stage.quality
+        for port, load in enumerate(stage.loads):
+            if load in PARALLEL_LOADS:
+                y, _ = _parallel(load, values[..., port], omega, q, port)
+                # [[1, 0], [y, 1]] @ [[a, b], [c, d]]
+                c[..., port] = c[..., port] + y * a[..., port]
+                d[..., port] = d[..., port] + y * b[..., port]
+            elif load in SERIES_LOADS:
+                z, _ = _series(load, values[..., port], omega, q, port)
+                # [[1, z], [0, 1]] @ [[a, b], [c, d]]
+                a[..., port] = a[..., port] + z * c[..., port]
+                b[..., port] = b[..., port] + z * d[..., port]
+    system = (
+        torch.diag_embed(a + reference * c)
+        + (b + reference * d)[..., :, None] * admittance
+    )
+    eye = torch.eye(n, dtype=admittance.dtype, device=admittance.device)
+    return 2.0 * reference**0.5 * torch.linalg.solve(system, eye.expand_as(system))
 
 
 def tuning_calibration(

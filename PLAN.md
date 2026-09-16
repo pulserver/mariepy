@@ -123,6 +123,35 @@ end, and here it is bounded; `reort.m` compares squared entries without
 conjugating, which on complex data compares real parts, and here it compares
 squared moduli. A shield with driven ports is not supported.
 
+**Co-simulation.** `cosim.py` ports MARIE's tuning, matching, decoupling and
+preamplifier-decoupling searches and its calibrations for coils whose ports
+share one role (`Tx`, `Rx` or `TxRx`), with the circuit numerics in
+`circuit.py`. MARIE's index masks become a table of rows read once from the
+element file. Coils that mix roles, which only MARIE's wire-coil files do, wait
+for the wire coils. The port departs from MARIE in six places:
+
+- `calibration_tune_match_decouple.m` uses `SPs` without defining it, and
+  MARIE's `Tx` search with optimisation stops there; the port defines it as
+  the preamplifier variant does, from the tuned admittance.
+- `toeplitz`, which the decoupling costs call, is not defined anywhere in
+  `marie-tools`; `circuit.toeplitz` builds the matrix it names.
+- `calibration_matching.m` rebuilds a lossless matching network from the
+  scattering parameters alone. Power conservation fixes that network only up
+  to a unitary, which on coupled ports can mix channels, and the map it gives
+  ends at the wave into the coil while the solver's currents are per volt. The
+  port computes the coil voltage per incident wave exactly, from each port's
+  chain of matching elements (`circuit.coil_voltage`). On one port the two
+  agree in magnitude.
+- The preamplifier terminations add `1/R` to every entry of the other ports'
+  admittance block, because MATLAB adds a scalar to a matrix entrywise; the
+  port adds it to the diagonal, one resistor per port.
+- `particleswarm` becomes scipy's differential evolution, with MARIE's swarm
+  size, iteration limit, restarts and bound narrowing. Each search's first
+  population holds the values the previous search handed it, so the joint
+  search cannot end worse than the per-entity ones.
+- Coupling-coefficient variables are numbered past every other variable,
+  where MARIE's numbering can collide with a symmetry-offset one.
+
 **Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
 package's single `_ext` module, following the package template and pypulseqpp.
 

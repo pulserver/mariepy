@@ -68,6 +68,25 @@ the voxel centres.
 The solve runs on either device: build the body and the coil with
 `device="cuda"` and everything downstream follows.
 
+### Tuning, matching and calibration
+
+A coil's lumped elements are closed by co-simulation, as MARIE does it. Solve
+the coil with its tunable elements opened into ports (`"TMD": 1` in the
+simulation file), then search their values, the matching networks' and the
+decoupling, and calibrate the fields to the wave driving each matched port:
+
+```python
+from mariepy.cosim import calibrate, co_simulate
+
+closed = co_simulate(case.network, result.admittance, case.medium.angular_frequency)
+electric = calibrate(result.fields.electric, closed.transmit)
+```
+
+With `"TMD": 0` the file's values are placed as they are. `closed.scattering`
+is the matched ports' reflection and coupling; `closed.receive` is the receive
+calibration of `Rx` and `TxRx` coils; `cosim.sweep` gives the matched ports
+across a band. The searches need scipy: `pip install "mariepy[cosim]"`.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

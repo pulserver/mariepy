@@ -24,6 +24,7 @@ import torch
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil, read_lumped_elements
 from mariepy.constants import Medium
+from mariepy.cosim import Network, read_network
 from mariepy.mesh import SurfaceMesh
 
 __all__ = ["Case", "read_case"]
@@ -47,6 +48,9 @@ class Case:
     shield
         The RF shield the file names, or None; pass it to
         :func:`~mariepy.solver.solve`.
+    network
+        The coil's ports and lumped values as co-simulation reads them, with
+        the file's ``TMD`` flag; pass it to :func:`~mariepy.cosim.co_simulate`.
     """
 
     medium: Medium
@@ -54,6 +58,7 @@ class Case:
     coil: SurfaceCoil
     linear: bool = False
     shield: SurfaceCoil | None = None
+    network: Network | None = None
 
 
 def read_case(
@@ -108,9 +113,8 @@ def read_case(
 
     coil_file = data / "coils" / "coil_files" / coil_name
     mesh = SurfaceMesh.read_gmsh22(coil_file, device=device or "cpu")
-    elements = read_lumped_elements(
-        coil_file.with_suffix(".json"), tmd=bool(settings.get("TMD", 0))
-    )
+    tmd = bool(settings.get("TMD", 0))
+    elements = read_lumped_elements(coil_file.with_suffix(".json"), tmd=tmd)
 
     shield = None
     if settings.get("ShieldFile"):
@@ -119,7 +123,7 @@ def read_case(
         shield_elements = ()
         if shield_file.with_suffix(".json").is_file():
             shield_elements = read_lumped_elements(
-                shield_file.with_suffix(".json"), tmd=bool(settings.get("TMD", 0))
+                shield_file.with_suffix(".json"), tmd=tmd
             )
         shield = SurfaceCoil.build(shield_mesh, shield_elements)
 
@@ -131,4 +135,5 @@ def read_case(
         coil=SurfaceCoil.build(mesh, elements),
         linear=basis == 1,
         shield=shield,
+        network=read_network(coil_file.with_suffix(".json"), tmd=tmd),
     )

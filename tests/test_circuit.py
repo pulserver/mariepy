@@ -171,3 +171,78 @@ def test_marie_s_decoupling_weights_count_every_pair_once(n):
     weights = circuit.decoupling_weights(n)
     expected = torch.tril(torch.ones(n, n, dtype=torch.float64), diagonal=-1)
     torch.testing.assert_close(weights, expected)
+
+
+def _passive_admittance(n, seed):
+    """A passive multiport: positive-definite resistance, symmetric reactance."""
+    generator = torch.Generator().manual_seed(seed)
+    base = torch.randn(n, n, generator=generator, dtype=torch.float64)
+    resistance = base @ base.T + 5 * torch.eye(n, dtype=torch.float64)
+    reactance = torch.randn(n, n, generator=generator, dtype=torch.float64)
+    reactance = 20 * (reactance + reactance.T)
+    return torch.linalg.inv(torch.complex(resistance, reactance))
+
+
+def test_the_matched_l_section_delivers_the_whole_incident_wave_to_its_load():
+    load = torch.tensor([[1.0 / (10.0 - 5.0j)]], dtype=torch.complex128)
+    q = math.sqrt(Z0 / 10.0 - 1.0)
+    stages = (
+        _stage(["inductorSeries"], [(q * 10.0 + 5.0) / OMEGA]),
+        _stage(["capacitorParallel"], [q / Z0 / OMEGA]),
+    )
+    voltage = circuit.coil_voltage(load, stages, OMEGA, Z0)[0, 0]
+    delivered = 0.5 * abs(voltage) ** 2 * float(load[0, 0].real)
+    assert delivered == pytest.approx(0.5, rel=1e-12)
+
+
+def test_the_coil_voltage_conserves_power_through_lossless_coupled_networks():
+    """What the coil takes is what the sources send less what the ports reflect."""
+    admittance = _passive_admittance(3, seed=5)
+    stages = (
+        _stage(["capacitorParallel", "inductorSeries", ""], [2e-11, 3e-8, 0.0]),
+        _stage(["capacitorSeries", "capacitorParallel", ""], [4e-12, 1e-11, 0.0]),
+    )
+    mapping = circuit.coil_voltage(admittance, stages, OMEGA, Z0)
+    matched, _ = circuit.place_matching(admittance, stages, OMEGA)
+    scattering = circuit.z_to_s(matched, Z0)
+    generator = torch.Generator().manual_seed(6)
+    wave = torch.complex(
+        torch.randn(3, generator=generator, dtype=torch.float64),
+        torch.randn(3, generator=generator, dtype=torch.float64),
+    )
+    voltage = mapping @ wave
+    taken = 0.5 * (voltage.conj() @ admittance @ voltage).real
+    sent = 0.5 * (wave.abs().square().sum() - (scattering @ wave).abs().square().sum())
+    torch.testing.assert_close(taken, sent)
+
+
+def test_the_coil_voltage_has_the_magnitude_marie_s_wave_calibration_implies():
+    """On one port the rebuilt network is exact up to a phase."""
+    load = torch.tensor([[0.004 - 0.01j]], dtype=torch.complex128)
+    stages = (
+        _stage(["capacitorParallel"], [1.5e-11]),
+        _stage(["capacitorSeries"], [6e-12]),
+    )
+    unmatched = circuit.z_to_s(torch.linalg.inv(load), Z0)
+    matched = circuit.z_to_s(circuit.place_matching(load, stages, OMEGA)[0], Z0)
+    wave = circuit.matching_calibration(unmatched, matched, Z0)[0, 0]
+    implied = math.sqrt(Z0) * abs(1 + unmatched[0, 0]) * abs(wave)
+    voltage = circuit.coil_voltage(load, stages, OMEGA, Z0)[0, 0]
+    assert abs(voltage) == pytest.approx(float(implied), rel=1e-10)
+
+
+def test_a_batch_of_candidates_places_as_each_candidate_alone():
+    admittance = _passive_admittance(3, seed=7)
+    values = torch.tensor([[1e-11, 2e-11], [3e-11, 4e-12]], dtype=torch.float64)
+    batched = circuit.place_tuning(
+        admittance.expand(2, -1, -1), [1, 2], ["capacitor", "inductor"], values, OMEGA
+    )
+    for row in range(2):
+        alone = circuit.place_tuning(
+            admittance, [1, 2], ["capacitor", "inductor"], values[row], OMEGA
+        )
+        torch.testing.assert_close(batched[row], alone)
+    torch.testing.assert_close(
+        circuit.reduce(batched, [0], [1, 2])[1],
+        circuit.reduce(batched[1], [0], [1, 2]),
+    )
