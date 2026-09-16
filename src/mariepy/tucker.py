@@ -3,9 +3,9 @@
 The volume integral operator couples every voxel to every other through a
 kernel that depends only on the offset between them, so each Cartesian
 component of it is a three-level Toeplitz tensor. Embedding that tensor in a
-circulant of twice the extent along each axis turns its application into three
-FFTs, and a truncated higher-order SVD stores the embedded tensor in a fraction
-of the memory the full grid would take.
+circulant of at least twice the extent along each axis turns its application
+into three FFTs, and a truncated higher-order SVD stores the embedded tensor in
+a fraction of the memory the full grid would take.
 
 Ported from MARIE 3.0's ``src_mathematics/src_numerical_linear_algebra/
 src_tucker/{hosvd,hosvd_to_full,nmp}.m`` and
@@ -27,6 +27,7 @@ __all__ = [
     "mode_product",
     "pair_parity",
     "to_full",
+    "transform_length",
 ]
 
 # Parity of each component of the symmetric dyadic kernel under reflection of
@@ -56,10 +57,11 @@ class CirculantSymbol:
     core
         Tucker core, shape ``(r1, r2, r3)``.
     factors
-        Three factor matrices, of shapes ``(r1, 2 * n1)``, ``(r2, 2 * n2)`` and
-        ``(r3, 2 * n3)``. Each is the circulant extension of a Tucker factor
-        along its axis, already Fourier transformed, so expanding the core
-        through them gives the operator's symbol on the doubled grid.
+        Three factor matrices, of shapes ``(r1, L1)``, ``(r2, L2)`` and
+        ``(r3, L3)`` with ``Li = transform_length(ni)``. Each is the circulant
+        extension of a Tucker factor along its axis, already Fourier
+        transformed, so expanding the core through them gives the operator's
+        symbol on the extended grid.
     """
 
     core: torch.Tensor
@@ -71,7 +73,7 @@ class CirculantSymbol:
         return tuple(factor.shape[1] for factor in self.factors)  # type: ignore[return-value]
 
     def expand(self) -> torch.Tensor:
-        """Return the symbol on the doubled grid, shape ``(2n1, 2n2, 2n3)``."""
+        """Return the symbol on the extended grid, shape :attr:`shape`."""
         return to_full(self.core, *self.factors)
 
 
@@ -275,6 +277,40 @@ def _circulant_tucker(kernel, tol, pair_sign):
     return tuple(symbols)
 
 
+_SMOOTH_PRIMES = (2, 3, 5, 7)
+
+
+def transform_length(n: int) -> int:
+    """Give the transform length the circulant embedding of ``n`` offsets uses.
+
+    A Toeplitz block of ``n`` rows sits inside any circulant of ``2 * n - 1``
+    rows or more, so the length is free above that, and an FFT of a length whose
+    prime factors are all small is several times faster than one of a length
+    with a large prime factor. The shortest length with no prime factor above
+    seven is taken.
+
+    Parameters
+    ----------
+    n
+        Offsets along the axis, the body's extent in voxels.
+
+    Returns
+    -------
+    int
+        The transform length, at least ``2 * n - 1``.
+    """
+    least = max(1, 2 * n - 1)
+    length = least
+    while True:
+        rest = length
+        for prime in _SMOOTH_PRIMES:
+            while rest % prime == 0:
+                rest //= prime
+        if rest == 1:
+            return length
+        length += 1
+
+
 def _circulant_extension(factor: torch.Tensor, sign: int) -> torch.Tensor:
     """Mirror one Tucker factor into a circulant and transform it.
 
@@ -289,11 +325,13 @@ def _circulant_extension(factor: torch.Tensor, sign: int) -> torch.Tensor:
     Returns
     -------
     torch.Tensor
-        Shape ``(rank, 2 * n)``, Fourier transformed along the extended axis.
+        Shape ``(rank, transform_length(n))``, Fourier transformed along the
+        extended axis.
     """
     rank, n = factor.shape
-    extended = torch.zeros((rank, 2 * n), device=factor.device, dtype=factor.dtype)
+    length = transform_length(n)
+    extended = torch.zeros((rank, length), device=factor.device, dtype=factor.dtype)
     extended[:, :n] = factor
     if n > 1:
-        extended[:, n + 1 :] = sign * torch.flip(factor[:, 1:], dims=(1,))
+        extended[:, length - n + 1 :] = sign * torch.flip(factor[:, 1:], dims=(1,))
     return torch.fft.fft(extended, dim=1)

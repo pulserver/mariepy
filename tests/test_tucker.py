@@ -122,11 +122,27 @@ def test_circulant_embedding_reproduces_the_dense_toeplitz_product(
         )
 
 
-def test_circulant_embedding_doubles_every_axis(device):
+def test_the_circulant_embeds_every_axis_at_its_transform_length(device):
     shape = (3, 4, 2)
     kernel = _random_tensor((*shape, 6), device)
     for symbol in tucker.circulant_tucker(kernel, tol=None):
-        assert symbol.shape == tuple(2 * n for n in shape)
+        assert symbol.shape == tuple(tucker.transform_length(n) for n in shape)
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 8, 23, 43, 63, 83, 103, 123, 128])
+def test_the_transform_length_holds_the_toeplitz_block_with_small_factors(n):
+    """A length with a large prime factor costs several times the FFT it needs."""
+
+    def smooth(value):
+        for prime in (2, 3, 5, 7):
+            while value % prime == 0:
+                value //= prime
+        return value == 1
+
+    length = tucker.transform_length(n)
+    assert length >= 2 * n - 1
+    assert smooth(length)
+    assert not any(smooth(shorter) for shorter in range(max(1, 2 * n - 1), length))
 
 
 def test_circulant_tucker_rejects_a_component_count_it_has_no_parity_for(device):
