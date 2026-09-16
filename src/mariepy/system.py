@@ -61,8 +61,8 @@ class CoupledOperator:
 
     @property
     def n_body(self) -> int:
-        """Number of body unknowns."""
-        return self.body.n_dof
+        """Number of body unknowns: 3 or 12 per voxel, by the body's basis."""
+        return self.coupling.n_components * self.body.n_voxels
 
     def __call__(self, vector: torch.Tensor) -> torch.Tensor:
         """Apply the coupled operator to one solution vector.
@@ -83,7 +83,8 @@ class CoupledOperator:
 
         on_body = _apply(self.coupling.scatter, body_current)
         on_grid = _apply(self.coupling.project, coil_current) + on_body
-        field = on_grid.reshape(3, *self.coupling.grid.shape)
+        n_components = self.coupling.n_components
+        field = on_grid.reshape(n_components, *self.coupling.grid.shape)
         applied = (
             vie.apply_n(self.coupling.symbols_n, field)
             - vie.apply_g(field, self.coupling.grid.resolution)
@@ -92,7 +93,7 @@ class CoupledOperator:
         induced = (
             vie.apply_g(
                 self._contrast_inverse()
-                * on_body.reshape(3, *self.coupling.grid.shape),
+                * on_body.reshape(n_components, *self.coupling.grid.shape),
                 self.coupling.grid.resolution,
             ).reshape(-1)
             / scaling
@@ -129,8 +130,8 @@ class CoupledOperator:
         """Build the split left preconditioner.
 
         The coil block is inverted exactly, by an LU factorisation of the coil's
-        own matrix, and the body block by its Galerkin mass term, which the
-        piecewise-constant basis makes diagonal.
+        own matrix, and the body block by its Galerkin mass term, which is
+        diagonal in either basis.
 
         Returns
         -------
@@ -138,7 +139,7 @@ class CoupledOperator:
             Applies the preconditioner to a vector.
         """
         factors = torch.linalg.lu_factor(self.system.impedance)
-        diagonal = body_diagonal(self.body, self.medium)
+        diagonal = body_diagonal(self.body, self.medium, linear=self.coupling.linear)
 
         def apply(vector: torch.Tensor) -> torch.Tensor:
             coil = torch.linalg.lu_solve(*factors, vector[: self.n_coil, None])[:, 0]

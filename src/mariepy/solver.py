@@ -337,8 +337,9 @@ def solve(
     far_order: int = 4,
     medium_order: int = 8,
     near_order: int = 15,
+    linear: bool = False,
 ) -> Result:
-    """Drive one coil against one body and return everything milestone 1 computes.
+    """Drive one coil against one body, and return the port matrices and fields.
 
     Ported from MARIE 3.0's ``src_solver/src_ie_solver/solver_wsvie.m`` and the
     path ``src_runners/MARIE_runner.m`` takes for a surface coil around a voxel
@@ -361,6 +362,9 @@ def solve(
         Quadrature orders of the coupling kernels.
     far_order, medium_order, near_order
         Quadrature orders of the body kernels.
+    linear
+        Give the body the piecewise-linear basis, as MARIE does when
+        ``Basis_Functions_VIE`` is 1.
 
     Returns
     -------
@@ -379,6 +383,7 @@ def solve(
         far_order=far_order,
         medium_order=medium_order,
         near_order=near_order,
+        linear=linear,
     )
     operator = CoupledOperator(
         body=body, coil=coil, medium=medium, system=system, coupling=coupling

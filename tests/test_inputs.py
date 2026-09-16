@@ -104,12 +104,11 @@ def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
 @pytest.mark.parametrize(
     ("changes", "milestone"),
     [
-        ({"Basis_Functions_VIE": 1}, "milestone 2"),
         ({"ShieldFile": "shield.msh"}, "milestone 2"),
         ({"WireFile": "wire.msh"}, "milestone 3"),
         ({"CoilFile": "", "BasisFile": "basis.mat"}, "milestone 4"),
     ],
-    ids=["piecewise-linear basis", "shield", "wire coil", "field basis only"],
+    ids=["shield", "wire coil", "field basis only"],
 )
 def test_a_simulation_file_milestone_1_does_not_cover_is_refused_by_name(
     tmp_path, changes, milestone
@@ -121,3 +120,13 @@ def test_a_simulation_file_milestone_1_does_not_cover_is_refused_by_name(
 def test_a_simulation_file_that_names_no_coil_is_refused(tmp_path):
     with pytest.raises(ValueError, match="names no surface coil"):
         read_case(_data(tmp_path, CoilFile=""))
+
+
+@pytest.mark.parametrize(("basis", "linear"), [(0, False), (1, True)])
+def test_the_simulation_file_names_the_body_basis(tmp_path, basis, linear):
+    assert read_case(_data(tmp_path, Basis_Functions_VIE=basis)).linear is linear
+
+
+def test_a_body_basis_marie_does_not_know_is_refused(tmp_path):
+    with pytest.raises(ValueError, match="body basis 2"):
+        read_case(_data(tmp_path, Basis_Functions_VIE=2))

@@ -30,7 +30,7 @@ from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
 from mariepy.quadrature import lebedev_26_directions
-from mariepy.tucker import CirculantSymbol, circulant_tucker
+from mariepy.tucker import circulant_tucker
 
 __all__ = [
     "Coupling",
@@ -161,18 +161,23 @@ class Coupling:
     near
         The near lists.
     project
-        Coil currents onto the extended grid, sparse ``(3 * n_cells, n_dof)``.
+        Coil currents onto the extended grid, sparse ``(c * n_cells, n_dof)``,
+        with ``c`` the unknowns per cell: 3 for the constant basis, 12 for the
+        linear one.
     scatter
-        Body currents onto the extended grid, sparse ``(3 * n_cells, 3 * n_voxels)``.
+        Body currents onto the extended grid, sparse
+        ``(c * n_cells, c * n_voxels)``.
     electric
         The near correction of the electric coupling, sparse
-        ``(3 * n_voxels, n_dof)``.
+        ``(c * n_voxels, n_dof)``.
     magnetic
         The same for the magnetic coupling.
     coil
         The coil block's near correction, sparse ``(n_dof, n_dof)``.
     symbols_n, symbols_k
         The compressed kernels on the extended grid.
+    linear
+        Whether the body carries the piecewise-linear basis.
     """
 
     grid: ExtendedGrid
@@ -182,8 +187,14 @@ class Coupling:
     electric: torch.Tensor
     magnetic: torch.Tensor
     coil: torch.Tensor
-    symbols_n: tuple[CirculantSymbol, ...]
-    symbols_k: tuple[CirculantSymbol, ...]
+    symbols_n: tuple
+    symbols_k: tuple
+    linear: bool = False
+
+    @property
+    def n_components(self) -> int:
+        """Unknowns per cell: 3 for the constant basis, 12 for the linear one."""
+        return 12 if self.linear else 3
 
 
 def extended_domain(
@@ -311,6 +322,7 @@ def projection(
     *,
     triangle_order: int = 4,
     cell_order: int = 2,
+    linear: bool = False,
 ) -> torch.Tensor:
     """Replace each basis function by cell currents that radiate its own field.
 
@@ -332,20 +344,29 @@ def projection(
         Degree of the Dunavant rule on each triangle.
     cell_order
         Points per axis of the Gauss rule over each cell.
+    linear
+        Fit the cells' piecewise-linear currents rather than constant ones.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(n_dof, 3, expansion ** 3)``, complex: the current each
-        expansion cell carries for a unit coefficient of the basis function.
+        Shape ``(n_dof, c, expansion ** 3)``, complex, with ``c`` 3 or 12: the
+        current each expansion cell carries for a unit coefficient of the basis
+        function.
     """
     device = grid.device
     offsets = (near.expansion[0] - near.centre[0]).to(torch.float64) * grid.resolution
     reach = ((near.span - 1) / 2 + 1) * grid.resolution
     collocation = reach * lebedev_26_directions(device=device)
 
+    n_basis = 4 if linear else 1
     matrix = coupling.collocation_matrix(
-        offsets, collocation, medium, cell_size=grid.resolution, cell_order=cell_order
+        offsets,
+        collocation,
+        medium,
+        cell_size=grid.resolution,
+        cell_order=cell_order,
+        n_basis=n_basis,
     )
 
     corners = coil.rwg_vertices()
@@ -359,7 +380,8 @@ def projection(
         triangle_order=triangle_order,
     ).reshape(n_dof, n_points, 3)
 
-    # The collocation sphere gives 78 equations for 81 cell currents, so the
+    # The collocation sphere gives 78 equations for 81 cell currents, or 324
+    # with the linear basis, so the
     # system is underdetermined and a pseudo-inverse takes the smallest
     # solution. Which solution it is does not reach the answer: every one of
     # them radiates the same field, and the near correction subtracts back
@@ -369,7 +391,7 @@ def projection(
     right = field.permute(0, 2, 1).reshape(n_dof, 3 * n_points).transpose(0, 1)
     weights = torch.linalg.pinv(matrix) @ right
     n_block = near.expansion.shape[1]
-    return weights.reshape(3, n_block, n_dof).permute(2, 0, 1).contiguous()
+    return weights.reshape(3 * n_basis, n_block, n_dof).permute(2, 0, 1).contiguous()
 
 
 def projection_matrix(
@@ -389,23 +411,25 @@ def projection_matrix(
     Returns
     -------
     torch.Tensor
-        Sparse ``(3 * n_cells, n_dof)``, complex.
+        Sparse ``(c * n_cells, n_dof)``, complex.
     """
     device = grid.device
-    n_dof, _, n_block = weights.shape
+    n_dof, n_components, n_block = weights.shape
     cells = grid.flatten(near.expansion)
-    component = torch.arange(3, device=device)
+    component = torch.arange(n_components, device=device)
     rows = (component[None, :, None] * grid.n_cells + cells[:, None, :]).reshape(-1)
-    columns = torch.arange(n_dof, device=device).repeat_interleave(3 * n_block)
+    columns = torch.arange(n_dof, device=device).repeat_interleave(
+        n_components * n_block
+    )
     return torch.sparse_coo_tensor(
         torch.stack([rows, columns]),
         weights.reshape(-1),
-        (3 * grid.n_cells, n_dof),
+        (n_components * grid.n_cells, n_dof),
         check_invariants=False,
     ).coalesce()
 
 
-def scatter_matrix(grid: ExtendedGrid) -> torch.Tensor:
+def scatter_matrix(grid: ExtendedGrid, n_components: int = 3) -> torch.Tensor:
     """Place the body's degrees of freedom on the extended grid.
 
     Parameters
@@ -413,23 +437,25 @@ def scatter_matrix(grid: ExtendedGrid) -> torch.Tensor:
     grid
         The extended grid, whose mask fixes the order of the body's own
         degrees of freedom.
+    n_components
+        Unknowns per cell: 3 for the constant basis, 12 for the linear one.
 
     Returns
     -------
     torch.Tensor
-        Sparse ``(3 * n_cells, 3 * n_voxels)``, complex.
+        Sparse ``(c * n_cells, c * n_voxels)``, complex.
     """
     device = grid.device
     cells = grid.body_cells()
     n_voxels = cells.numel()
-    component = torch.arange(3, device=device)
+    component = torch.arange(n_components, device=device)
     rows = (component[:, None] * grid.n_cells + cells[None, :]).reshape(-1)
-    columns = torch.arange(3 * n_voxels, device=device)
+    columns = torch.arange(n_components * n_voxels, device=device)
     values = torch.ones(rows.numel(), dtype=torch.complex128, device=device)
     return torch.sparse_coo_tensor(
         torch.stack([rows, columns]),
         values,
-        (3 * grid.n_cells, 3 * n_voxels),
+        (n_components * grid.n_cells, n_components * n_voxels),
         check_invariants=False,
     ).coalesce()
 
@@ -443,8 +469,13 @@ def direct_coupling(
     triangle_order: int = 4,
     cell_order: int = 2,
     chunk: int = 4096,
+    linear: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Integrate each basis function against the body cells it comes close to.
+
+    Ported from ``pfft_surface_assemble_direct_bc.m``. With the linear basis
+    each cell takes the four basis terms of every component, ordered
+    component-major, as MARIE stacks its twelve coupling sources.
 
     Parameters
     ----------
@@ -462,11 +493,13 @@ def direct_coupling(
         Points per axis of the Gauss rule over each cell.
     chunk
         Basis-function-and-cell pairs taken at a time.
+    linear
+        Couple to the cells' piecewise-linear basis.
 
     Returns
     -------
     electric : torch.Tensor
-        Sparse ``(3 * n_voxels, n_dof)``, complex.
+        Sparse ``(c * n_voxels, n_dof)``, complex.
     magnetic : torch.Tensor
         The same for the magnetic coupling.
     """
@@ -474,7 +507,9 @@ def direct_coupling(
     volume = grid.resolution**3
     body_dof = body_numbering(grid)
     n_voxels = int(grid.mask.sum())
-    component = torch.arange(3, device=grid.device)
+    terms = range(4) if linear else range(1)
+    n_components = 3 * len(terms)
+    component = torch.arange(n_components, device=grid.device)
 
     rows, columns, electric, magnetic = [], [], [], []
     for dof, cells in near_body_pairs(grid, near, chunk=chunk):
@@ -484,20 +519,24 @@ def direct_coupling(
             "cell_size": grid.resolution,
             "cell_order": cell_order,
         }
-        electric.append(
-            volume
-            * coupling.coupling_n(corners[dof], points, medium, **arguments).reshape(-1)
-        )
-        magnetic.append(
-            volume
-            * coupling.coupling_k(corners[dof], points, medium, **arguments).reshape(-1)
-        )
+        for kernel, out in (
+            (coupling.coupling_n, electric),
+            (coupling.coupling_k, magnetic),
+        ):
+            stacked = torch.stack(
+                [
+                    kernel(corners[dof], points, medium, basis_term=term, **arguments)
+                    for term in terms
+                ],
+                dim=-1,
+            )
+            out.append(volume * stacked.reshape(-1))
         rows.append(
             (component[None, :] * n_voxels + body_dof[cells][:, None]).reshape(-1)
         )
-        columns.append(dof.repeat_interleave(3))
+        columns.append(dof.repeat_interleave(n_components))
 
-    shape = (3 * n_voxels, coil.n_dof)
+    shape = (n_components * n_voxels, coil.n_dof)
     index = torch.stack([torch.cat(rows), torch.cat(columns)])
     return (
         torch.sparse_coo_tensor(
@@ -543,16 +582,17 @@ def projected_coupling(
     Returns
     -------
     electric : torch.Tensor
-        Sparse ``(3 * n_voxels, n_dof)``, complex.
+        Sparse ``(c * n_voxels, n_dof)``, complex.
     magnetic : torch.Tensor
         The same for the magnetic coupling.
     """
     del medium
     block, curl = response
+    n_components = block.shape[1]
     flat_weights = weights.reshape(weights.shape[0], -1)
     body_dof = body_numbering(grid)
     n_voxels = int(grid.mask.sum())
-    component = torch.arange(3, device=grid.device)
+    component = torch.arange(n_components, device=grid.device)
     reach = (near.span - 1) // 2
 
     rows, columns, electric, magnetic = [], [], [], []
@@ -565,9 +605,9 @@ def projected_coupling(
         rows.append(
             (component[None, :] * n_voxels + body_dof[cells][:, None]).reshape(-1)
         )
-        columns.append(dof.repeat_interleave(3))
+        columns.append(dof.repeat_interleave(n_components))
 
-    shape = (3 * n_voxels, coil.n_dof)
+    shape = (n_components * n_voxels, coil.n_dof)
     index = torch.stack([torch.cat(rows), torch.cat(columns)])
     return (
         torch.sparse_coo_tensor(
@@ -619,7 +659,7 @@ def coil_precorrection(
     local = near.expansion[observer] - near.centre[source][:, None, :] + reach
     where = (local[..., 0] * near.span + local[..., 1]) * near.span + local[..., 2]
     picked = block[..., where.reshape(-1)].reshape(
-        block.shape[0], 3, where.shape[0], where.shape[1]
+        block.shape[0], block.shape[1], where.shape[0], where.shape[1]
     )
     projected = torch.einsum(
         "jcpb,pj,pcb->p", picked, flat_weights[source], weights[observer]
@@ -640,7 +680,8 @@ def kernels(
     far_order: int = 4,
     medium_order: int = 8,
     near_order: int = 15,
-) -> tuple[tuple[CirculantSymbol, ...], ...]:
+    linear: bool = False,
+) -> tuple:
     """Build the body kernels once and compress them for both grids they act on.
 
     The near correction subtracts what the convolution over the whole grid puts
@@ -659,6 +700,8 @@ def kernels(
         Relative tolerance of the Tucker compressions.
     far_order, medium_order, near_order
         Quadrature orders of the body kernels.
+    linear
+        Build the kernels of the piecewise-linear basis.
 
     Returns
     -------
@@ -671,6 +714,7 @@ def kernels(
         "far_order": far_order,
         "medium_order": medium_order,
         "near_order": near_order,
+        "linear": linear,
     }
     span = near.span
     pieces = []
@@ -693,10 +737,11 @@ def expansion_response(
     grid: ExtendedGrid,
     near: NearLists,
     medium: Medium,
-    symbols_n: tuple[CirculantSymbol, ...],
-    symbols_k: tuple[CirculantSymbol, ...],
+    symbols_n: tuple,
+    symbols_k: tuple,
     *,
     chunk: int = 8,
+    n_components: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Give the field one expansion block puts on every cell of its near cube.
 
@@ -715,11 +760,13 @@ def expansion_response(
         The kernels compressed for the near cube, from :func:`kernels`.
     chunk
         Unit sources taken at a time.
+    n_components
+        Unknowns per cell: 3 for the constant basis, 12 for the linear one.
 
     Returns
     -------
     electric : torch.Tensor
-        Shape ``(3 * expansion ** 3, 3, span ** 3)``, complex.
+        Shape ``(c * expansion ** 3, c, span ** 3)``, complex.
     magnetic : torch.Tensor
         The same for the magnetic kernel.
     """
@@ -730,14 +777,16 @@ def expansion_response(
     n_block = offsets.shape[0]
 
     sources = torch.zeros(
-        (3, n_block, 3, *shape), dtype=torch.complex128, device=grid.device
+        (n_components, n_block, n_components, *shape),
+        dtype=torch.complex128,
+        device=grid.device,
     )
     place = torch.arange(n_block, device=grid.device)
-    for component in range(3):
+    for component in range(n_components):
         sources[
             component, place, component, offsets[:, 0], offsets[:, 1], offsets[:, 2]
         ] = 1.0
-    sources = sources.reshape(3 * n_block, 3, *shape)
+    sources = sources.reshape(n_components * n_block, n_components, *shape)
 
     electric, magnetic = [], []
     for start in range(0, sources.shape[0], chunk):
@@ -746,8 +795,8 @@ def expansion_response(
         electric.append(applied / medium.electric_scaling)
         magnetic.append(vie.apply_k(symbols_k, piece))
     return (
-        torch.cat(electric).reshape(3 * n_block, 3, -1),
-        torch.cat(magnetic).reshape(3 * n_block, 3, -1),
+        torch.cat(electric).reshape(n_components * n_block, n_components, -1),
+        torch.cat(magnetic).reshape(n_components * n_block, n_components, -1),
     )
 
 
@@ -765,6 +814,7 @@ def assemble(
     far_order: int = 4,
     medium_order: int = 8,
     near_order: int = 15,
+    linear: bool = False,
 ) -> Coupling:
     """Build every piece of the coupled operator.
 
@@ -788,6 +838,8 @@ def assemble(
         Quadrature orders of the coupling kernels.
     far_order, medium_order, near_order
         Quadrature orders of the body kernels.
+    linear
+        Give the body the piecewise-linear basis.
 
     Returns
     -------
@@ -804,14 +856,30 @@ def assemble(
         far_order=far_order,
         medium_order=medium_order,
         near_order=near_order,
+        linear=linear,
     )
+    n_components = 12 if linear else 3
     weights = projection(
-        grid, coil, medium, near, triangle_order=triangle_order, cell_order=cell_order
+        grid,
+        coil,
+        medium,
+        near,
+        triangle_order=triangle_order,
+        cell_order=cell_order,
+        linear=linear,
     )
-    response = expansion_response(grid, near, medium, cube_n, cube_k)
+    response = expansion_response(
+        grid, near, medium, cube_n, cube_k, n_components=n_components
+    )
 
     direct = direct_coupling(
-        grid, coil, medium, near, triangle_order=triangle_order, cell_order=cell_order
+        grid,
+        coil,
+        medium,
+        near,
+        triangle_order=triangle_order,
+        cell_order=cell_order,
+        linear=linear,
     )
     projected = projected_coupling(grid, coil, medium, near, weights, response)
 
@@ -819,12 +887,13 @@ def assemble(
         grid=grid,
         near=near,
         project=projection_matrix(grid, near, weights),
-        scatter=scatter_matrix(grid),
+        scatter=scatter_matrix(grid, n_components),
         electric=(direct[0] - projected[0]).coalesce(),
         magnetic=(direct[1] - projected[1]).coalesce(),
         coil=coil_precorrection(coil, impedance, near, weights, response),
         symbols_n=symbols_n,
         symbols_k=symbols_k,
+        linear=linear,
     )
 
 

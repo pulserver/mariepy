@@ -6,8 +6,10 @@ and its two halves, ``em_efield/em_efield_svie/em_efield_svie_pfft.m`` and
 
 The field is taken the way the operator is applied: the coil's currents and the
 body's own go through the extended grid, the near corrections put back what the
-projection gets wrong, and the result is a cell integral, so dividing by the
-cell volume gives the field itself. The coil's part and the body's are kept
+projection gets wrong, and the result is each basis function's moment of the
+field, so dividing by each function's mass gives the field's coefficients. With
+the piecewise-linear basis the field is kept as those twelve coefficients per
+voxel; the constant ones are its value at the voxel centre. The coil's part and the body's are kept
 apart because the power balance needs both: what the coil delivers to the body
 is what the body absorbs plus what it scatters back.
 """
@@ -24,6 +26,7 @@ from mariepy.system import CoupledOperator
 __all__ = [
     "Fields",
     "absorbed_power",
+    "at_centres",
     "circular_components",
     "compute",
     "delivered_power",
@@ -37,8 +40,9 @@ class Fields:
     Attributes
     ----------
     electric
-        Total electric field, shape ``(n_ports, 3, n1, n2, n3)``, in V/m, zero
-        outside the body.
+        Total electric field, shape ``(n_ports, 3, n1, n2, n3)``, or
+        ``(n_ports, 12, n1, n2, n3)`` as linear-basis coefficients ordered
+        ``4 * direction + function``, in V/m, zero outside the body.
     magnetic
         Total magnetic field, same shape, in A/m.
     incident
@@ -66,7 +70,7 @@ def compute(
     coil
         Coil currents, shape ``(n_ports, n_dof)``.
     body
-        Body currents, shape ``(n_ports, 3 * n_voxels)``.
+        Body currents, shape ``(n_ports, c * n_voxels)`` with ``c`` 3 or 12.
 
     Returns
     -------
@@ -75,11 +79,11 @@ def compute(
     """
     coupling = operator.coupling
     grid = coupling.grid
-    volume = grid.resolution**3
     scaling = operator.medium.electric_scaling
+    n_components = coupling.n_components
 
-    from_coil = _spread(coupling.project, coil, grid.shape)
-    from_body = _spread(coupling.scatter, body, grid.shape)
+    from_coil = _spread(coupling.project, coil, grid.shape, n_components)
+    from_body = _spread(coupling.scatter, body, grid.shape, n_components)
 
     incident = _test(
         coupling.scatter, _electric(coupling, from_coil, grid.resolution) / scaling
@@ -93,11 +97,12 @@ def compute(
         + _test(coupling.scatter, vie.apply_k(coupling.symbols_k, from_body))
     )
 
-    incident = operator.body.from_dof(incident / volume)
-    scattered = operator.body.from_dof(scattered / volume)
+    resolution = grid.resolution
+    incident = vie.apply_inverse_g(operator.body.from_dof(incident), resolution)
+    scattered = vie.apply_inverse_g(operator.body.from_dof(scattered), resolution)
     return Fields(
         electric=incident + scattered,
-        magnetic=operator.body.from_dof(magnetic / volume),
+        magnetic=vie.apply_inverse_g(operator.body.from_dof(magnetic), resolution),
         incident=incident,
         scattered=scattered,
     )
@@ -105,6 +110,11 @@ def compute(
 
 def absorbed_power(operator: CoupledOperator, fields: Fields) -> torch.Tensor:
     """Integrate the ohmic loss of the electric field over the body.
+
+    The basis functions of a voxel are orthogonal, so the integral of
+    ``|E|**2`` is each coefficient's square weighted by its function's mass.
+    This is MARIE's scalar absorbed power in ``em_efield_svie_pfft.m``; its
+    power-density map uses the voxel-centre value alone.
 
     Parameters
     ----------
@@ -119,8 +129,10 @@ def absorbed_power(operator: CoupledOperator, fields: Fields) -> torch.Tensor:
         Shape ``(n_ports,)``, real, in watts.
     """
     body = operator.body
-    density = 0.5 * body.conductivity * (fields.electric.abs() ** 2).sum(dim=-4)
-    return (density * body.mask).sum(dim=(-3, -2, -1)) * body.resolution**3
+    mass = vie.mass(fields.electric.shape[-4], body.resolution).to(body.device)
+    weighted = torch.einsum("c,...cxyz->...xyz", mass, fields.electric.abs() ** 2)
+    density = 0.5 * body.conductivity * weighted
+    return (density * body.mask).sum(dim=(-3, -2, -1))
 
 
 def delivered_power(operator: CoupledOperator, coil: torch.Tensor) -> torch.Tensor:
@@ -161,7 +173,7 @@ def power_balance(
     fields
         The fields the ports drive.
     body
-        Body currents, shape ``(n_ports, 3 * n_voxels)``.
+        Body currents, shape ``(n_ports, c * n_voxels)``.
 
     Returns
     -------
@@ -172,11 +184,11 @@ def power_balance(
     scattered : torch.Tensor
         Power its own current puts back.
     """
-    volume = operator.body.resolution**3
-    incident = operator.body.to_dof(fields.incident)
-    scattered = operator.body.to_dof(fields.scattered)
-    taken = 0.5 * volume * torch.real((body.conj() * incident).sum(dim=-1))
-    given = -0.5 * volume * torch.real((body.conj() * scattered).sum(dim=-1))
+    resolution = operator.body.resolution
+    incident = operator.body.to_dof(vie.apply_g(fields.incident, resolution))
+    scattered = operator.body.to_dof(vie.apply_g(fields.scattered, resolution))
+    taken = 0.5 * torch.real((body.conj() * incident).sum(dim=-1))
+    given = -0.5 * torch.real((body.conj() * scattered).sum(dim=-1))
     return taken, taken - given, given
 
 
@@ -195,22 +207,46 @@ def circular_components(
     Returns
     -------
     plus : torch.Tensor
-        ``B1+``, shape ``(n_ports, n1, n2, n3)``, in tesla.
+        ``B1+``, shape ``(n_ports, n1, n2, n3)``, in tesla, at the voxel
+        centres.
     minus : torch.Tensor
         ``B1-``, same shape.
     """
     permeability = operator.medium.permeability
-    transverse = fields.magnetic[..., 0, :, :, :], fields.magnetic[..., 1, :, :, :]
+    centres = at_centres(fields.magnetic)
+    transverse = centres[..., 0, :, :, :], centres[..., 1, :, :, :]
     return (
         permeability * (transverse[0] + 1j * transverse[1]),
         permeability * (transverse[0] - 1j * transverse[1]),
     )
 
 
-def _spread(matrix: torch.Tensor, current: torch.Tensor, shape) -> torch.Tensor:
+def at_centres(field: torch.Tensor) -> torch.Tensor:
+    """Give a field's three components at the voxel centres.
+
+    Parameters
+    ----------
+    field
+        Shape ``(..., 3, n1, n2, n3)``, or ``(..., 12, n1, n2, n3)`` as
+        linear-basis coefficients.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(..., 3, n1, n2, n3)``: the linear functions vanish at the centre,
+        so the constant coefficients are the field there.
+    """
+    if field.shape[-4] == 3:
+        return field
+    return field[..., 0::4, :, :, :]
+
+
+def _spread(
+    matrix: torch.Tensor, current: torch.Tensor, shape, n_components: int
+) -> torch.Tensor:
     """Put a batch of currents on the extended grid."""
     spread = torch.sparse.mm(matrix, current.transpose(0, 1))
-    return spread.transpose(0, 1).reshape(current.shape[0], 3, *shape)
+    return spread.transpose(0, 1).reshape(current.shape[0], n_components, *shape)
 
 
 def _test(matrix: torch.Tensor, field: torch.Tensor) -> torch.Tensor:
