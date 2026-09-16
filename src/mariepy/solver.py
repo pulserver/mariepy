@@ -31,6 +31,7 @@ __all__ = [
     "BodyOperator",
     "PortSolution",
     "Result",
+    "assemble_coil",
     "solve",
     "solve_body",
     "solve_ports",
@@ -333,6 +334,30 @@ class Result:
     fields: Fields
 
 
+def assemble_coil(
+    coil: SurfaceCoil | WireCoil | CombinedCoil, medium: Medium
+) -> sie.CoilSystem:
+    """Build any coil's own system: surface, wire, or both together.
+
+    Parameters
+    ----------
+    coil
+        The coil.
+    medium
+        Free-space constants at the working frequency.
+
+    Returns
+    -------
+    mariepy.sie.CoilSystem
+        Its matrix, losses and port drive.
+    """
+    if isinstance(coil, CombinedCoil):
+        return wire.assemble_combined(coil, medium)
+    if isinstance(coil, WireCoil):
+        return wire.assemble(coil, medium)
+    return sie.assemble(coil, medium)
+
+
 def solve(
     body: VoxelBody,
     coil: SurfaceCoil | WireCoil | CombinedCoil,
@@ -388,12 +413,7 @@ def solve(
         The port parameters and the fields.
 
     """
-    if isinstance(coil, CombinedCoil):
-        system = wire.assemble_combined(coil, medium)
-    elif isinstance(coil, WireCoil):
-        system = wire.assemble(coil, medium)
-    else:
-        system = sie.assemble(coil, medium)
+    system = assemble_coil(coil, medium)
     coupling = pfft.assemble(
         body,
         coil,

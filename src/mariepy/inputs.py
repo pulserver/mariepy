@@ -3,14 +3,17 @@
 Ported from MARIE 3.0's ``src_utils/src_loaders/load_inputs.m`` and the file
 paths ``src_geometry/geo_assembly.m`` resolves. A simulation file is a JSON
 object in ``<data>/inputs/``; it names a body under ``<data>/bodies/``, a
-surface coil under ``<data>/coils/coil_files/``, whose lumped elements sit
-beside it with the same name and a ``.json`` suffix, and optionally an RF shield
-under ``<data>/coils/shield_files/``, whose lumped elements, if it has any, sit
-beside it in the same way.
+surface coil under ``<data>/coils/coil_files/`` or a wire coil under
+``<data>/coils/wire_files/`` or both, whose lumped elements sit beside each
+with the same name and a ``.json`` suffix, optionally an RF shield under
+``<data>/coils/shield_files/``, whose lumped elements, if it has any, sit
+beside it in the same way, and optionally a basis support surface under
+``<data>/coils/basis_files/``.
 
-Only the cases :func:`mariepy.solver.solve` covers are read: a surface coil
-around a body in either basis. A file that asks for anything else raises, naming
-the milestone that covers it, rather than being solved as something it is not.
+A file that asks for what the port does not read raises, saying so, rather
+than being solved as something it is not: MARIE's HDF5 basis files are not
+read, and a basis is built with :mod:`mariepy.basis` from the support surface
+instead.
 """
 
 from __future__ import annotations
@@ -54,6 +57,10 @@ class Case:
         The coil's ports and lumped values as co-simulation reads them, with
         the file's ``TMD`` flag, the wire's first; pass it to
         :func:`~mariepy.cosim.co_simulate`.
+    basis_support
+        The surface the file names to build a field basis on, MARIE's
+        ``SurfaceBasisSupportFile``, or None; pass it to
+        :func:`~mariepy.basis.surface_basis`.
     """
 
     medium: Medium
@@ -62,6 +69,7 @@ class Case:
     linear: bool = False
     shield: SurfaceCoil | None = None
     network: Network | None = None
+    basis_support: SurfaceCoil | None = None
 
 
 def read_case(
@@ -91,7 +99,7 @@ def read_case(
     Raises
     ------
     NotImplementedError
-        If the file asks for a precomputed field basis alone.
+        If the file asks for MARIE's precomputed basis file alone.
     ValueError
         If the file names no coil, or a body basis MARIE does not know.
     """
@@ -106,7 +114,9 @@ def read_case(
     wire_name = settings.get("WireFile")
     if settings.get("BasisFile") and not (coil_name or wire_name):
         raise NotImplementedError(
-            f"{path.name} asks for a precomputed field basis, which is milestone 4"
+            f"{path.name} asks for MARIE's precomputed basis file, which this port "
+            "does not read; build the basis with mariepy.basis.surface_basis from "
+            "the case's basis_support"
         )
     if not (coil_name or wire_name):
         raise ValueError(f"{path.name} names no coil")
@@ -129,6 +139,15 @@ def read_case(
             SurfaceMesh.read_gmsh22(coil_file, device=device or "cpu"),
             read_lumped_elements(element_files[-1], tmd=tmd),
         )
+    support = None
+    if settings.get("SurfaceBasisSupportFile"):
+        support_file = (
+            data / "coils" / "basis_files" / settings["SurfaceBasisSupportFile"]
+        )
+        support = SurfaceCoil.build(
+            SurfaceMesh.read_gmsh22(support_file, device=device or "cpu")
+        )
+
     if wire is not None and surface is not None:
         coil = CombinedCoil(wire=wire, surface=surface)
     else:
@@ -154,4 +173,5 @@ def read_case(
         linear=basis == 1,
         shield=shield,
         network=read_network(*element_files, tmd=tmd),
+        basis_support=support,
     )

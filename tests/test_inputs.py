@@ -116,8 +116,19 @@ def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
 
 
 def test_a_simulation_file_asking_only_for_a_field_basis_is_refused(tmp_path):
-    with pytest.raises(NotImplementedError, match="milestone 4"):
+    with pytest.raises(NotImplementedError, match="basis file"):
         read_case(_data(tmp_path, CoilFile="", BasisFile="basis.mat"))
+
+
+def test_a_basis_support_the_simulation_file_names_is_read(tmp_path):
+    path = _data(tmp_path, SurfaceBasisSupportFile="Loop/support.msh")
+    supports = path.parent.parent / "coils" / "basis_files" / "Loop"
+    supports.mkdir(parents=True)
+    mesh = SurfaceMesh.loop(radius=0.08, width=0.02, n_around=8, n_across=2)
+    write_gmsh22(supports / "support.msh", mesh)
+    case = read_case(path)
+    assert case.basis_support.n_dof > 0
+    assert case.basis_support.n_driven == 0
 
 
 def test_a_simulation_file_that_names_no_coil_is_refused(tmp_path):

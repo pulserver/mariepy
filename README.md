@@ -94,6 +94,29 @@ is the transmitting ports' reflection and coupling; `cosim.sweep` gives the
 matched ports across a band. The searches need scipy:
 `pip install "mariepy[cosim]"`.
 
+### Field bases, SNR and figures
+
+A body's field basis is built once from a support surface around it
+(`basis.surface_basis`) or from a shell of currents around it
+(`basis.dipole_basis`), and any coil near that support is then solved through
+it:
+
+```python
+from mariepy import basis, metrics, plot
+from mariepy.solver import assemble_coil
+
+incident = basis.surface_basis(case.body, case.basis_support, case.medium)
+solved = basis.solve(incident, case.body, case.medium)
+system = assemble_coil(case.coil, case.medium)
+reduced = basis.solve_coil(case.coil, system, solved, case.body, case.medium)
+ultimate_snr, ultimate_efficiency = basis.ultimate_maps(solved, case.body, case.medium)
+```
+
+`metrics.noise_covariance`, `metrics.snr`, `metrics.transmit_efficiency` and
+`metrics.g_factor` map a coil's performance from its fields; `plot.geometry`,
+`plot.coil_currents`, `plot.scattering`, `plot.sweep` and `plot.slices` draw
+the model and the maps (`pip install "mariepy[plot]"`).
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

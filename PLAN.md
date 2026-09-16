@@ -190,6 +190,37 @@ nothing is detuned. The port departs from MARIE in these places:
   port keeps that. MARIE adds a side's terms to the joint cost when that side's
   own search found values; the port adds them when the side has ports.
 
+**Field bases and performance maps.** `basis.py` ports MARIE's basis and MRGF
+paths: the incident-field basis that a support surface, or a shell of voxel
+currents around the body, spans, its interpolation voxels, the body solved once per basis field, the ultimate intrinsic SNR and
+transmit efficiency, and a coil solved through the basis with its coupling
+integrated at the interpolation voxels only. `metrics.py` ports the SNR,
+transmit-efficiency and g-factor maps, and `plot.py` MARIE's figures, with
+matplotlib as an optional dependency. The port departs from MARIE in three
+places:
+
+- MARIE keeps the incident basis in tested form, the Gram matrix applied, and
+  solves the body with it as if it were a field. For the piecewise-constant
+  basis the Gram matrix is a scalar and the two agree; for the piecewise-linear
+  one the tested vectors do not span the fields a coil puts on the body. The
+  port keeps the basis in field coefficients and carries the Gram matrix where
+  the coupling needs it.
+- MARIE's noise covariance weighs the body by `integral sigma |E|^2`, twice the
+  power it dissipates, and the conductor and lumped elements by half that
+  scale and on the diagonal only. The port weighs all three alike, with their
+  channel-to-channel terms.
+- MARIE's randomised range finder (`rSVD_Q.m`) draws blocks until the
+  sample's spectrum drops below its tolerance, and on an operator whose
+  spectrum never does it never stops; the port stops once the sample has as
+  many columns as the operator has columns or rows.
+- MARIE's HDF5 basis files are not read; a basis is built here and saved with
+  `FieldBasis.save`.
+
+On a coarse body the ultimate SNR does not settle as basis fields are added:
+the discrete electric field under-resolves the high-order fields, which then
+look nearly noiseless. MARIE maps it over a logarithmic run of mode counts for
+that reason, and `ultimate_maps` takes the count.
+
 **Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
 package's single `_ext` module, following the package template and pypulseqpp.
 
