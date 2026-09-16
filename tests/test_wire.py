@@ -443,3 +443,91 @@ def test_a_wire_and_a_surface_coil_solve_together_against_a_body():
         result.operator, result.fields, result.ports.body
     )
     torch.testing.assert_close(taken, absorbed + scattered)
+
+
+# -- a solved coil, tuned and matched --------------------------------------------
+
+
+def test_a_solved_wire_coil_is_tuned_matched_and_its_fields_calibrated(tmp_path):
+    """PLAN.md's milestone 3 criterion on a coil the solver produced.
+
+    The coil is solved with its tuning capacitor opened into a port, as MARIE
+    does with ``TMD`` set; co-simulation closes it and matches the port. With
+    lossless elements the structure takes all the port accepts, and the body
+    no more than that.
+    """
+    import dataclasses
+    import json
+
+    from mariepy import cosim, fields
+    from mariepy.coil import read_lumped_elements
+
+    elements = {
+        "coil_configuration": {
+            "elements": [
+                {
+                    "number": 1,
+                    "type": "port",
+                    "load": "inductorSeries_capacitorParallel",
+                    "value": [1e-8, 1e-10],
+                    "Q": [1e15, 1e15],
+                    "optim": {
+                        "boolean": 1,
+                        "minim": [1e-10, 1e-12],
+                        "maxim": [5e-8, 5e-10],
+                        "symmetry": 1,
+                    },
+                    "cross_talk": {},
+                    "excitation": {"entity": 1, "TxRx": "Tx"},
+                },
+                {
+                    "number": 2,
+                    "type": "element",
+                    "load": "capacitor",
+                    "value": 5e-12,
+                    "Q": 1e15,
+                    "optim": {
+                        "boolean": 1,
+                        "minim": 1e-12,
+                        "maxim": 3e-11,
+                        "symmetry": 2,
+                    },
+                    "cross_talk": {},
+                    "excitation": {"entity": 1, "TxRx": "Tx"},
+                },
+            ]
+        }
+    }
+    path = tmp_path / "loop.json"
+    path.write_text(json.dumps(elements))
+
+    medium, body, _ = _small_case()
+    coil = WireCoil.loop(0.05, 16, read_lumped_elements(path, tmd=True), at=(0, 8))
+    result = solve(body, coil, medium, tol=1e-9, **ORDERS)
+    small = cosim.Search(population=60, iterations=200, restarts=3)
+    closed = cosim.co_simulate(
+        cosim.read_network(path, tmd=True),
+        result.admittance,
+        medium.angular_frequency,
+        tuning=small,
+        matching=small,
+        decoupling=small,
+    )
+    assert closed.costs["tuning"][1] < 1
+    assert closed.costs["matching"][1] < 1
+    assert float(closed.scattering.abs().max()) < 0.05
+
+    voltage = closed.transmit[:, 0]
+    taken = 0.5 * float((voltage.conj() @ result.admittance.cpu() @ voltage).real)
+    accepted = 0.5 * (1 - float(closed.scattering[0, 0].abs() ** 2))
+    assert taken == pytest.approx(accepted, rel=1e-9)
+
+    calibrated = dataclasses.replace(
+        result.fields,
+        **{
+            name: cosim.calibrate(getattr(result.fields, name), closed.transmit)
+            for name in ("electric", "magnetic", "incident", "scattered")
+        },
+    )
+    absorbed = float(fields.absorbed_power(result.operator, calibrated)[0])
+    assert 0 < absorbed <= taken
