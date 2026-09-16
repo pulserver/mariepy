@@ -538,8 +538,10 @@ def _apply_linear(symbols, current, index, sign):
     for (pair, which), entries in uses.items():
         expanded = symbols[pair][which].expand()
         for row, column, scale in entries:
-            out[..., row, :, :, :] += scale * (
-                expanded * transformed[..., column, :, :, :]
+            # Fused, because the padded grid is large and this runs 144 times:
+            # writing it as a sum would allocate two of them per term.
+            out[..., row, :, :, :].addcmul_(
+                expanded, transformed[..., column, :, :, :], value=scale
             )
 
     field = torch.fft.ifftn(out, dim=(-3, -2, -1))
@@ -565,8 +567,8 @@ def _apply(symbols, current, index, sign):
             if which is None:
                 continue
             scale = 1.0 if sign is None else sign[row][column]
-            out[..., row, :, :, :] = out[..., row, :, :, :] + scale * (
-                expanded[which] * transformed[..., column, :, :, :]
+            out[..., row, :, :, :].addcmul_(
+                expanded[which], transformed[..., column, :, :, :], value=scale
             )
 
     field = torch.fft.ifftn(out, dim=(-3, -2, -1))
