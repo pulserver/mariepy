@@ -532,3 +532,124 @@ def test_a_loop_outside_the_spherical_shell_does_not_beat_its_ultimate_snr():
     coil_snr = metrics.snr(b1_minus, covariance, medium, body.resolution, body.mask)
     ultimate, _ = basis_module.ultimate_maps(field_basis, body, medium)
     assert bool((coil_snr[body.mask] <= ultimate[body.mask] * 1.05).all())
+
+
+def test_each_basis_field_is_the_field_its_support_current_puts_on_the_body(solved):
+    medium, body, coil, field_basis, linear = solved
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    inverse = basis_module._inverse_mass(
+        field_basis.n_components, body.n_voxels, body.resolution, "cpu"
+    )
+    tested = basis_module.coupling_at(
+        coil, centres, medium, body.resolution, magnetic=True, linear=linear
+    )
+    driven = (inverse[:, None] * (tested @ field_basis.support_currents.T)).T
+    torch.testing.assert_close(driven, field_basis.incident_magnetic)
+
+
+def test_the_ultimate_weights_give_each_voxel_a_unit_sensitivity(solved):
+    """MARIE normalises the matched filter so the combined channel sees unit B1-."""
+    medium, _, _, field_basis, _ = solved
+    weights = basis_module.ultimate_weights(field_basis, medium)
+    sensitivity = basis_module._receive_sensitivity(
+        field_basis, medium, field_basis.rank
+    )
+    combined = torch.einsum("pv,pv->v", weights, sensitivity)
+    torch.testing.assert_close(combined, torch.ones_like(combined))
+
+
+def _channel_noise(weights, covariance):
+    """The noise the combined channel sees, ``w^T Psi conj(w)``."""
+    return float((weights @ covariance @ weights.conj()).real)
+
+
+def test_no_other_unit_sensitivity_leaves_less_noise_than_the_ultimate_weights(solved):
+    medium, body, _, field_basis, _ = solved
+    voxel = body.n_voxels // 2
+    weights = basis_module.ultimate_weights(field_basis, medium)[:, voxel]
+    sensitivity = basis_module._receive_sensitivity(
+        field_basis, medium, field_basis.rank
+    )[:, voxel]
+    least = _channel_noise(weights, field_basis.covariance)
+    generator = torch.Generator().manual_seed(4)
+    for _ in range(8):
+        step = torch.randn(
+            field_basis.rank, dtype=torch.complex128, generator=generator
+        )
+        step = weights.abs().max() * (step - (step @ sensitivity) * weights)
+        other = weights + step
+        torch.testing.assert_close(other @ sensitivity, torch.ones(()).to(other.dtype))
+        assert _channel_noise(other, field_basis.covariance) >= least
+
+
+def test_the_ultimate_snr_is_what_the_ultimate_weights_achieve(solved):
+    """The map and the weights are the same statement: one channel, matched."""
+    medium, body, _, field_basis, _ = solved
+    voxel = body.n_voxels // 2
+    weights = basis_module.ultimate_weights(field_basis, medium)[:, voxel]
+    noise = _channel_noise(weights, field_basis.covariance)
+    scale = (
+        body.resolution**3
+        * medium.angular_frequency
+        * metrics.equilibrium_magnetisation(medium)
+        / np.sqrt(4 * metrics.BOLTZMANN * metrics.BODY_TEMPERATURE)
+    )
+    ultimate, _ = basis_module.ultimate_maps(field_basis, body, medium)
+    here = body.mask.reshape(-1).nonzero()[voxel, 0]
+    assert float(ultimate.reshape(-1)[here]) == pytest.approx(
+        scale / np.sqrt(noise), rel=1e-9
+    )
+
+
+def test_the_ideal_pattern_is_its_weights_carried_onto_the_support(solved):
+    medium, body, coil, field_basis, _ = solved
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    voxel = body.n_voxels // 2
+    modes = field_basis.rank
+    pattern = basis_module.ideal_currents(
+        field_basis, body, medium, centres[voxel], modes=modes
+    )
+    weights = basis_module.ultimate_weights(field_basis, medium, modes=modes)[:, voxel]
+    assert pattern.shape == (1, coil.n_dof)
+    torch.testing.assert_close(pattern[0], weights @ field_basis.support_currents)
+
+
+def test_the_default_mode_count_keeps_the_share_of_the_snr_it_promises(solved):
+    """Truncation is what keeps the pattern smooth, so it has to be paid for."""
+    medium, body, _, field_basis, _ = solved
+    voxel = body.n_voxels // 2
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    sensitivity = basis_module._receive_sensitivity(
+        field_basis, medium, field_basis.rank
+    )[:, voxel]
+    count = basis_module._chosen_modes(field_basis, sensitivity, 0.95)
+    assert 1 <= count <= field_basis.rank
+
+    def gain(modes):
+        inverse = torch.linalg.inv(
+            field_basis.covariance[:modes, :modes].to(sensitivity.dtype)
+        )
+        head = sensitivity[:modes]
+        return float((head.conj() @ (inverse @ head)).real)
+
+    assert np.sqrt(gain(count)) >= 0.95 * np.sqrt(gain(field_basis.rank))
+    if count > 1:
+        earlier = basis_module._mode_ladder(field_basis.rank)
+        before = max(m for m in earlier if m < count)
+        assert np.sqrt(gain(before)) < 0.95 * np.sqrt(gain(field_basis.rank))
+    truncated = basis_module.ideal_currents(field_basis, body, medium, centres[voxel])
+    assert truncated.shape == (1, field_basis.support_currents.shape[1])
+
+
+def test_a_basis_without_a_support_surface_has_no_ideal_pattern():
+    body = VoxelBody.sphere(0.02, 0.01, 52.0, 0.55, padding=1)
+    basis = basis_module.FieldBasis(
+        incident_electric=None,
+        incident_magnetic=None,
+        samples=torch.zeros(1, dtype=torch.long),
+        interpolation=torch.zeros((1, 3), dtype=torch.complex128),
+        singular_values=None,
+        electric=torch.zeros((1, 3 * body.n_voxels), dtype=torch.complex128),
+    )
+    with pytest.raises(ValueError, match="support surface"):
+        basis_module.ideal_currents(basis, body, Medium(3.0), torch.zeros(3))

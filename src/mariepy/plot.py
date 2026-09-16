@@ -2,13 +2,16 @@
 
 Ported in intent from MARIE 3.0's ``src_visualizer``: ``visualize_geometry.m``,
 ``visualize_coil_currents.m``, ``visualize_s_parameters.m``,
-``visualize_z_parameters.m`` and ``visualize_ZPm_SPm_freq_sweep.m``, with
+``visualize_z_parameters.m``, ``visualize_ZPm_SPm_freq_sweep.m`` and
+``visualize_ideal_current_patterns.m``, with
 ``slices`` for any voxel map (SNR, transmit efficiency, ``B1``, SAR). Each
 function draws on an axes it is given, or on a new figure, and returns the
 figure. matplotlib is an optional dependency: ``pip install "mariepy[plot]"``.
 """
 
 from __future__ import annotations
+
+import cmath
 
 import torch
 
@@ -19,6 +22,7 @@ __all__ = [
     "coil_currents",
     "current_density",
     "geometry",
+    "ideal_current_patterns",
     "impedance",
     "scattering",
     "slices",
@@ -211,6 +215,86 @@ def coil_currents(coil, current: torch.Tensor, ax=None):
         ),
     )
     figure.colorbar(cm.ScalarMappable(norm=norm, cmap="viridis"), ax=ax, label="|J|")
+    return figure
+
+
+def ideal_current_patterns(
+    support: SurfaceCoil,
+    current: torch.Tensor,
+    body: VoxelBody | None = None,
+    target=None,
+    *,
+    phases=(0.0, cmath.pi / 2),
+):
+    """Draw a surface current at two phases of the carrier.
+
+    The figure of ``visualize_ideal_current_patterns.m``: the support's
+    triangles carry an arrow of the instantaneous current at their centroid, one
+    panel per phase, over the body and the target point the pattern was formed
+    for.
+
+    Parameters
+    ----------
+    support
+        The surface the current lives on, the basis's own support.
+    current
+        Its basis coefficients, shape ``(n_dof,)``, as
+        :func:`mariepy.basis.ideal_currents` gives them.
+    body
+        Drawn as points behind the support, or None.
+    target
+        The point the pattern was formed for, shape ``(3,)``, marked in red, or
+        None.
+    phases
+        The carrier phases in radians, one panel each.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        One panel per phase.
+    """
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    pyplot = _pyplot()
+    density = current_density(support, current)
+    centroids = support.mesh.vertices().mean(dim=1)
+    nodes = support.mesh.nodes
+    span = float((nodes.max(dim=0).values - nodes.min(dim=0).values).max())
+    peak = float(torch.linalg.vector_norm(density, dim=-1).max())
+    reach = 0.12 * span / peak if peak else 0.0
+
+    figure = pyplot.figure(figsize=(5.5 * len(phases), 5.0))
+    for panel, phase in enumerate(phases):
+        ax = figure.add_subplot(1, len(phases), panel + 1, projection="3d")
+        if body is not None:
+            centres = body.coordinates().reshape(3, -1)[:, body.mask.reshape(-1)]
+            x, y, z = _numpy(centres)
+            ax.scatter(x, y, z, s=2, color=(224 / 255, 177 / 255, 164 / 255))
+        ax.add_collection3d(
+            Poly3DCollection(
+                _numpy(support.mesh.vertices()),
+                facecolor=(255 / 255, 238 / 255, 117 / 255),
+                alpha=0.3,
+            )
+        )
+        if target is not None:
+            point = _numpy(torch.as_tensor(target, dtype=torch.float64).reshape(3))
+            ax.scatter(*point, s=60, marker="s", color=(1.0, 44 / 255, 44 / 255))
+        arrows = (density * cmath.exp(1j * phase)).real * reach
+        base, tip = _numpy(centroids), _numpy(arrows)
+        ax.quiver(
+            base[:, 0],
+            base[:, 1],
+            base[:, 2],
+            tip[:, 0],
+            tip[:, 1],
+            tip[:, 2],
+            color="k",
+            linewidth=0.6,
+        )
+        ax.set_title(f"$\\omega t = {phase:.2f}$")
+        ax.set_axis_off()
+        _limits(ax, _numpy(nodes))
     return figure
 
 

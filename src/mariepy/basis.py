@@ -43,12 +43,14 @@ __all__ = [
     "MrgfSolution",
     "coupling_at",
     "dipole_basis",
+    "ideal_currents",
     "read_marie",
     "shell",
     "solve",
     "solve_coil",
     "surface_basis",
     "ultimate_maps",
+    "ultimate_weights",
 ]
 
 
@@ -73,6 +75,10 @@ class FieldBasis:
         ``(r, c * n_samples)``.
     singular_values
         The kept singular values of the magnetic coupling, MARIE's ``SK``.
+    support_currents
+        The support-surface current that puts each basis field on the body,
+        MARIE's ``VK/SK``, shape ``(r, n_dof)``. Only a basis built from a
+        support surface carries one.
     linear
         Whether the body carries the piecewise-linear basis.
     electric, magnetic
@@ -99,6 +105,7 @@ class FieldBasis:
     samples: torch.Tensor
     interpolation: torch.Tensor
     singular_values: torch.Tensor | None
+    support_currents: torch.Tensor | None = None
     linear: bool = False
     electric: torch.Tensor | None = None
     magnetic: torch.Tensor | None = None
@@ -324,6 +331,7 @@ def surface_basis(
         samples=samples,
         interpolation=interpolation,
         singular_values=values[:kept],
+        support_currents=combine.transpose(0, 1).contiguous(),
         linear=linear,
     )
 
@@ -782,6 +790,140 @@ def ultimate_maps(
         metrics.snr(b1_minus, covariance, medium, body.resolution, body.mask),
         metrics.transmit_efficiency(b1_plus, covariance, body.mask),
     )
+
+
+def _receive_sensitivity(basis: FieldBasis, medium: Medium, count: int) -> torch.Tensor:
+    """Give each basis field's ``B1-`` at every voxel, shape ``(count, n_voxels)``."""
+    magnetic = basis.magnetic[:count]
+    components = magnetic.reshape(count, basis.n_components, -1)
+    centres = components[:, 0::4] if basis.linear else components
+    return medium.permeability * (centres[:, 0] - 1j * centres[:, 1])
+
+
+def ultimate_weights(
+    basis: FieldBasis, medium: Medium, *, modes: int | None = None
+) -> torch.Tensor:
+    """Give the channel weights that reach the ultimate SNR at every voxel.
+
+    MARIE's ``wUISNR`` in ``em_ehfield_vie.m``: the matched filter of the basis
+    fields' ``B1-`` against their noise covariance,
+    ``w = Psi^-T conj(S) / (S^H Psi^-1 S)``, normalised so that ``w^T S`` is one.
+
+    Parameters
+    ----------
+    basis
+        A solved basis, carrying its total fields and their covariance.
+    medium
+        The same frequency.
+    modes
+        Use the first this many basis fields; all by default.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(modes, n_voxels)``, complex, the voxels in the body's own
+        order.
+    """
+    count = basis.rank if modes is None else modes
+    sensitivity = _receive_sensitivity(basis, medium, count)
+    inverse = torch.linalg.inv(basis.covariance[:count, :count].to(sensitivity.dtype))
+    filtered = inverse @ sensitivity
+    gain = torch.einsum("pv,pv->v", sensitivity.conj(), filtered)
+    return (inverse.transpose(0, 1) @ sensitivity.conj()) / gain
+
+
+def _mode_ladder(rank: int, steps: int = 50) -> list[int]:
+    """MARIE's logarithmic run of mode counts, ``nmodes`` in ``em_ehfield_vie.m``."""
+    spaced = torch.logspace(0.0, math.log10(rank), steps, dtype=torch.float64)
+    return sorted({min(rank, max(1, int(value))) for value in spaced.floor()})
+
+
+def ideal_currents(
+    basis: FieldBasis,
+    body: VoxelBody,
+    medium: Medium,
+    target,
+    *,
+    modes: int | None = None,
+    fraction: float = 0.95,
+) -> torch.Tensor:
+    """Give the support current that reaches the ultimate SNR at a target point.
+
+    The pattern of ``visualize_ideal_current_patterns.m``: the receive weights
+    of the voxel nearest the target, carried back through the basis onto the
+    support surface's own RWG functions.
+
+    Truncating the basis matters, because the last modes buy a fraction of a
+    percent of SNR with currents that oscillate from triangle to triangle. With
+    ``modes`` unset, the fewest modes reaching ``fraction`` of the full-rank SNR
+    at that voxel are used, over the same logarithmic ladder MARIE maps its
+    convergence on.
+
+    Parameters
+    ----------
+    basis
+        A solved basis built by :func:`surface_basis`.
+    body
+        The body it was built for.
+    medium
+        The same frequency.
+    target
+        A point in metres, shape ``(3,)``, or several, shape ``(n, 3)``.
+    modes
+        Use exactly this many basis fields.
+    fraction
+        The share of the full-rank SNR the mode count must reach.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(n, n_dof)``, complex, the support's basis coefficients, one row
+        per target point. A single point still gives one row.
+
+    Raises
+    ------
+    ValueError
+        If the basis was not built from a support surface.
+    """
+    if basis.support_currents is None:
+        raise ValueError(
+            "the ideal pattern is a current on a support surface, and this basis "
+            "carries none; build it with surface_basis"
+        )
+    points = torch.as_tensor(target, dtype=torch.float64, device=body.device).reshape(
+        -1, 3
+    )
+    centres = body.coordinates().reshape(3, -1)[:, body.mask.reshape(-1)]
+    voxels = torch.cdist(points, centres.transpose(0, 1)).argmin(dim=1)
+
+    sensitivity = _receive_sensitivity(basis, medium, basis.rank)[:, voxels]
+    rows = []
+    for column, voxel in enumerate(voxels):
+        count = (
+            modes
+            if modes is not None
+            else _chosen_modes(basis, sensitivity[:, column], fraction)
+        )
+        weights = ultimate_weights(basis, medium, modes=count)[:, voxel]
+        rows.append(weights @ basis.support_currents[:count])
+    return torch.stack(rows)
+
+
+def _chosen_modes(basis: FieldBasis, sensitivity: torch.Tensor, fraction: float) -> int:
+    """Give the fewest modes on MARIE's ladder reaching ``fraction`` of the SNR."""
+    ladder = _mode_ladder(basis.rank)
+    gains = []
+    for count in ladder:
+        inverse = torch.linalg.inv(
+            basis.covariance[:count, :count].to(sensitivity.dtype)
+        )
+        head = sensitivity[:count]
+        gains.append(float((head.conj() @ (inverse @ head)).real.clamp(min=0)))
+    full = math.sqrt(gains[-1])
+    for count, gain in zip(ladder, gains, strict=True):
+        if full == 0.0 or math.sqrt(gain) >= fraction * full:
+            return count
+    return ladder[-1]
 
 
 @dataclass(frozen=True)
