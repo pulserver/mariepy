@@ -67,6 +67,7 @@ src/mariepy/
     network.py              Y, Z and S at the ports
     fields.py               E and H on the body grid
     solver.py               drives geometry, operators, solve, network, fields
+    inputs.py               a MARIE simulation file, read into body, coil and medium
 
 src/cpp/                    -> mariepy._ext, MIT
     module.cpp              bindings
@@ -80,13 +81,15 @@ src/cpp_lgpl/               -> mariepy._directfn, LGPL, notices kept
     rwg_namespace_*.cpp     one wrapper per RWG source, giving it a namespace
 
 tests/
-    test_quadrature.py  test_tucker.py  test_mesh.py   test_coil.py
-    test_body.py        test_vie.py     test_mie.py    test_sie.py
-    test_pfft.py        test_coupling.py               test_gmres.py
-    test_network.py     test_fields.py  test_power_balance.py
+    test_quadrature.py  test_tucker.py  test_directfn.py  test_mesh.py
+    test_coil.py        test_body.py    test_vie.py       test_near.py
+    test_mie.py         test_sie.py     test_network.py   test_pfft.py
+    test_coupling.py    test_gmres.py   test_system.py    test_fields.py
+    test_inputs.py      test_constants.py
     mie.py              analytic reference for a dielectric sphere
     pec.py              analytic reference for a conducting sphere
     parity.py           MARIE's coupling sources, compiled without MATLAB
+    marie_files.py      MARIE's body and mesh formats, written from arrays
 ```
 
 The two extensions are separate targets in `CMakeLists.txt` and separate
@@ -205,18 +208,20 @@ Dunavant are already listed.
 
 | MARIE | mariepy |
 |---|---|
-| `src_utils/src_loaders/load_inputs.m` | not ported as a file: MARIE's tolerances and quadrature orders are the defaults of the functions that use them, and `solver.solve` takes `tol` and derives the rest as `load_inputs.m` does |
+| `src_utils/src_loaders/load_inputs.m` | `inputs.read_case` for the simulation file; MARIE's tolerances and quadrature orders are the defaults of the functions that use them, and `solver.solve` takes `tol` and derives the rest as `load_inputs.m` does |
+| `src_geometry/geo_assembly.m` (file paths) | `inputs.read_case`: bodies under `bodies/`, surface coils under `coils/coil_files/`, lumped elements beside the mesh |
 | `src_physics/em_constants.m` | `constants.NUCLEI` table and `constants.Medium(b0, nucleus)` |
 | `src_utils/src_loaders/parse_inputs.m` | not ported: milestone 1 builds one path, so the dispatch has no branches to make. The branch it selects — coil present, no wire, no shield, `pFFT_flag` set — is the whole of `solver.solve` |
 | `src_geometry/geo_assembly.m` | `solver.build_geometry` |
-| `src_geometry/body_geometry/geo_body_domain.m`, `grid3d.m` | `body.VoxelBody`: grid coordinates, mask, voxel index and degree-of-freedom map |
+| `src_geometry/body_geometry/geo_body_domain.m`, `grid3d.m` | `body.VoxelBody`: grid coordinates, mask, voxel index and degree-of-freedom map; `VoxelBody.read_marie` reads the `RHBM` file |
+| `src_utils/src_loaders/update_RHBM.m` | the tissue rule `VoxelBody.read_marie` applies to a file without `idxS` |
 | `src_physics/src_electromagnetism/em_assembly.m` | `body.contrast`, returning `Mr`, `Mc`, `Mcr` and the inverses |
 | `src_geometry/scoil_geometry/mesh_geo/Mesh_Parse.m` | `mesh.SurfaceMesh.read_gmsh22` |
 | `Mesh_Permute.m` | `mesh.SurfaceMesh.align_to_lines` |
 | `Mesh_CLP.m`, `rwg_geo/Triangle_area.m` | `mesh.SurfaceMesh.centroids`, `edge_vectors`, `edge_lengths`, `rho`, `areas` |
-| `Mesh_PreProc.m`, `ProcessLoops.m` | `coil.SurfaceCoil.build`: edges, signs, the dof numbering and the adjacency classes |
+| `Mesh_PreProc.m`, `ProcessLoops.m` | `coil.SurfaceCoil.build`: edges, signs, the dof numbering and the adjacency classes; `coil.pair_tags` pairs elements with tags |
 | `rwg_geo/get_rwg_vertices.m` | `coil.SurfaceCoil.rwg_vertices`, shape `(n_rwg, 4, 3)` for `rp, rn, r2, r3` |
-| `ports_geo/geo_scoil_lumped_elements.m` | `coil.read_lumped_elements` |
+| `ports_geo/geo_scoil_lumped_elements.m` | `coil.read_lumped_elements`, with its `tmd` flag |
 | `scoil_geometry/geo_scoil.m` | `coil.SurfaceCoil.build(mesh.SurfaceMesh.read_gmsh22(...), coil.read_lumped_elements(...))` |
 | `src_integral_equations/src_vie/src_operators_vie/assembly_N.m` | `vie.kernel_n` |
 | `assembly_K.m` | `vie.kernel_k` |
@@ -414,12 +419,19 @@ that are design decisions; the rest are recorded here.
    value; the `slow` leg checks that the error falls with refinement.
    `PLAN.md`'s **Test layout** now says so.
 
-5. **A lumped element is matched to its mesh edges by its own number.**
-   `Mesh_PreProc.m` matches the *i*-th entry of the element file to the *i*-th
-   smallest physical line tag in the mesh, so an element file listed out of tag
-   order silently drives the wrong edges. `coil.SurfaceCoil.build` matches on
-   the element's `number`, which `geo_scoil_lumped_elements.m` already reads and
-   MARIE then ignores, and raises when a number names no interior edge.
+5. **A lumped element is paired with its tag by its number, and by file order
+   only when the number cannot mean anything else.**
+   `Mesh_PreProc.m` pairs the *i*-th entry of the element file with the *i*-th
+   smallest physical line tag and never reads the element's `number`, so an
+   element file listed out of tag order silently drives the wrong edges.
+   `coil.pair_tags` reads the number first: when every number is a tag, the
+   number is the tag. MARIE's own files do not all number their elements that
+   way — `SKYRA_Coil` tags its lines 1001 to 1064 and numbers its elements 1 to
+   64 — so when the numbers are not the tags, and the file lists one element per
+   tag in ascending number, file order and tag order agree and MARIE's rule is
+   the only reading. Anything else is ambiguous and raises, as does a number
+   whose tag names no interior edge. A mutual inductor's partner is renamed
+   through the same pairing.
 
 6. **Every edge shared by two triangles carries a basis function.**
    `Mesh_PreProc.m` reaches the same set through a boundary flag `kn` that is
@@ -494,6 +506,25 @@ that are design decisions; the rest are recorded here.
    that is exact — extinction equals absorption plus scattering, inside the
    body — together with the inequality at the port and a direct-integration
    check on the field itself.
+
+13. **A body file without `idxS` takes its tissue where it conducts.**
+   `geo_body_domain.m` reads the body's voxels from `RHBM.idxS` and computes no
+   fallback, so MARIE cannot load its own `Hugo_Head_3T.mat`, which carries
+   none. The one rule MARIE has for building `idxS` is `find(sigma_e > 0)` in
+   `update_RHBM.m`, and on `Multilayer_Sphere.mat`, which does carry `idxS`, it
+   reproduces every index. `VoxelBody.read_marie` reads `idxS` when the file
+   has it and applies that rule when it does not, so a lossless scatterer needs
+   `idxS` in its file. The struct's `rho` — `rhos` in some files — is proton
+   density and is not read.
+
+14. **A mutual inductor's partner is read in both forms MARIE writes.**
+   `geo_scoil_lumped_elements.m` keeps `cross_talk` as it finds it and reformats
+   only the object form, so both `{"coupled_port": n, "coupled_value": m}` and
+   `[n, m]` reach `geo_scoil.m` as `[n, m]`. `Stadium_Triangular` uses the
+   list. A mutual inductor with neither form raises, where MARIE would fail on
+   an index. With `tmd` set, every element whose `optim.boolean` is set becomes
+   a driven port, as MARIE's loader does, so its terminals appear in the port
+   matrices co-simulation tunes against; the tuning itself is milestone 3.
 
 A further decision sits in section 4.2 and in `PLAN.md`'s **Excluded** list rather
 than here: `gauss_1d.m` and `getLebedevSphere.m` ship without a licence, so

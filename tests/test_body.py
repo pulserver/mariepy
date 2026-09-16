@@ -2,12 +2,15 @@
 
 import math
 
+import numpy as np
 import pytest
 import torch
 
 from mariepy.body import VoxelBody
 from mariepy.constants import Medium
 from mariepy.preconditioner import body_diagonal
+
+from .marie_files import write_marie_body
 
 PERMITTIVITY = 52.0
 CONDUCTIVITY = 0.55
@@ -158,3 +161,88 @@ def test_the_body_preconditioner_repeats_across_the_three_components(device):
     one = diagonal[: body.n_voxels]
     assert torch.allclose(diagonal[body.n_voxels : 2 * body.n_voxels], one)
     assert torch.allclose(diagonal[2 * body.n_voxels :], one)
+
+
+def _layered(shape=(4, 3, 5)):
+    """A body whose values differ along every axis, so a transposed read shows."""
+    i, j, k = np.meshgrid(*(np.arange(n) for n in shape), indexing="ij")
+    permittivity = 1.0 + 10.0 * i + 3.0 * j + 0.5 * k
+    tissue = (i + 2 * j + 3 * k) % 3 != 0
+    conductivity = np.where(tissue, 0.1 + 0.01 * (i + j + k), 0.0)
+    permittivity = np.where(tissue, permittivity, 1.0)
+    return permittivity, conductivity, tissue
+
+
+def test_a_marie_body_file_gives_back_its_grid_values_and_tissue(tmp_path):
+    permittivity, conductivity, tissue = _layered()
+    # Tissue that does not conduct shows that idxS, not the conductivity, is read.
+    conductivity = np.where(
+        np.arange(tissue.size).reshape(tissue.shape) == 7, 0.0, conductivity
+    )
+    path = tmp_path / "body.mat"
+    write_marie_body(
+        path,
+        permittivity,
+        conductivity,
+        pitch=0.002,
+        origin=(-0.1, 0.02, 0.3),
+        tissue=tissue,
+    )
+    body = VoxelBody.read_marie(path)
+
+    assert body.shape == permittivity.shape
+    assert body.resolution == pytest.approx(0.002)
+    assert body.origin == pytest.approx((-0.1, 0.02, 0.3))
+    np.testing.assert_array_equal(body.permittivity.numpy(), permittivity)
+    np.testing.assert_array_equal(body.conductivity.numpy(), conductivity)
+    np.testing.assert_array_equal(body.mask.numpy(), tissue)
+
+
+def test_the_voxel_centres_of_a_marie_body_are_the_ones_its_file_lists(tmp_path):
+    from scipy.io import loadmat
+
+    permittivity, conductivity, tissue = _layered()
+    path = tmp_path / "body.mat"
+    write_marie_body(
+        path,
+        permittivity,
+        conductivity,
+        pitch=0.003,
+        origin=(0.01, -0.02, 0.05),
+        tissue=tissue,
+    )
+    listed = loadmat(path, squeeze_me=True, struct_as_record=False)["RHBM"].r
+    centres = VoxelBody.read_marie(path).coordinates().permute(1, 2, 3, 0)
+    np.testing.assert_allclose(centres.numpy(), listed, atol=1e-15)
+
+
+def test_a_marie_body_file_without_idxs_takes_the_tissue_where_it_conducts(tmp_path):
+    permittivity, conductivity, _ = _layered()
+    path = tmp_path / "body.mat"
+    write_marie_body(path, permittivity, conductivity, pitch=0.002, origin=(0, 0, 0))
+    body = VoxelBody.read_marie(path)
+    np.testing.assert_array_equal(body.mask.numpy(), conductivity > 0)
+
+
+def test_a_marie_body_file_on_a_non_uniform_grid_is_refused(tmp_path):
+    from scipy.io import loadmat, savemat
+
+    permittivity, conductivity, tissue = _layered()
+    path = tmp_path / "body.mat"
+    write_marie_body(
+        path, permittivity, conductivity, pitch=0.002, origin=(0, 0, 0), tissue=tissue
+    )
+    held = loadmat(path)
+    held["RHBM"]["r"][0, 0][..., 2, 2] += 0.0005
+    savemat(path, {"RHBM": held["RHBM"]})
+    with pytest.raises(ValueError, match="not a uniform grid"):
+        VoxelBody.read_marie(path)
+
+
+def test_a_file_that_holds_no_marie_body_is_refused(tmp_path):
+    from scipy.io import savemat
+
+    path = tmp_path / "other.mat"
+    savemat(path, {"something": np.zeros(3)})
+    with pytest.raises(ValueError, match="no RHBM"):
+        VoxelBody.read_marie(path)

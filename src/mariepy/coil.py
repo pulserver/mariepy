@@ -18,14 +18,14 @@ block.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
 
 from mariepy.mesh import _FIRST_NODE, _SECOND_NODE, SurfaceMesh
 
-__all__ = ["Adjacency", "Port", "SurfaceCoil", "read_lumped_elements"]
+__all__ = ["Adjacency", "Port", "SurfaceCoil", "pair_tags", "read_lumped_elements"]
 
 _PAIR_CHUNK = 256
 
@@ -54,7 +54,8 @@ class Port:
     Attributes
     ----------
     tag
-        Physical line tag in the mesh, which is the element's number.
+        The element's number as read; on a built coil, the physical line tag
+        it sits on.
     kind
         ``"port"`` for a driven port, ``"element"`` for a lumped load.
     load
@@ -68,7 +69,8 @@ class Port:
     voltage
         Delta-gap drive, 1 for a driven port and 0 otherwise.
     coupled_tag
-        Tag of the partner element of a mutual inductor, else None.
+        The partner of a mutual inductor, named as ``tag`` names this element,
+        else None.
     coupled_value
         Mutual inductance in henries, else None.
     dofs
@@ -244,7 +246,8 @@ class SurfaceCoil:
             function, so pass the mesh through ``align_to_lines`` first if the
             port polarity matters.
         elements
-            Port and lumped-element definitions, matched to the mesh by tag.
+            Port and lumped-element definitions, in file order. Each is paired
+            with a physical line tag by :func:`pair_tags`.
 
         Returns
         -------
@@ -254,9 +257,11 @@ class SurfaceCoil:
         Raises
         ------
         ValueError
-            If an edge is shared by more than two triangles, or an element's tag
-            names no interior edge of the mesh.
+            If an edge is shared by more than two triangles, the elements cannot
+            be paired with the mesh's tags, or an element's tag names no
+            interior edge of the mesh.
         """
+        elements = pair_tags(elements, mesh.line_tags)
         edges, edge_of_triangle, signs = _build_edges(mesh)
         n_edges = int(edges.shape[0])
         occurrences = torch.bincount(edge_of_triangle.reshape(-1), minlength=n_edges)
@@ -314,16 +319,95 @@ class SurfaceCoil:
         )
 
 
-def read_lumped_elements(path: str | Path) -> tuple[Port, ...]:
+def pair_tags(elements: tuple[Port, ...], line_tags: torch.Tensor) -> tuple[Port, ...]:
+    """Give each element the physical line tag it sits on.
+
+    MARIE's ``Mesh_PreProc.m`` pairs the element at file position ``i`` with
+    the ``i``-th smallest positive tag and never reads the element's number, so
+    a file listed out of tag order silently drives the wrong edges. The pairing
+    here reads the number first:
+
+    - when every number is a tag in the mesh, the number is the tag;
+    - otherwise, when there is one element per tag and the file lists them in
+      ascending number, the file order and the tag order agree, so MARIE's rule
+      is the only reading;
+    - otherwise the pairing is ambiguous, and it raises.
+
+    A mutual inductor's partner is renamed through the same pairing.
+
+    Parameters
+    ----------
+    elements
+        The elements, in file order, named by their numbers.
+    line_tags
+        The physical tag of every line in the mesh.
+
+    Returns
+    -------
+    tuple of Port
+        The elements, each named by its tag.
+
+    Raises
+    ------
+    ValueError
+        If neither reading applies, or a mutual inductor names a partner the
+        file does not define.
+    """
+    if not elements:
+        return elements
+    tags = sorted({int(tag) for tag in line_tags.tolist() if int(tag) > 0})
+    numbers = [port.tag for port in elements]
+    if set(numbers) <= set(tags):
+        tag_of = {number: number for number in numbers}
+    elif len(numbers) == len(tags) and numbers == sorted(set(numbers)):
+        tag_of = dict(zip(numbers, tags, strict=True))
+    else:
+        raise ValueError(
+            f"cannot pair {len(numbers)} elements numbered "
+            f"{min(numbers)}..{max(numbers)} with {len(tags)} line tags "
+            f"{tags[0] if tags else None}..{tags[-1] if tags else None}: the "
+            "numbers are not the tags, and the file does not list one element "
+            "per tag in ascending order"
+        )
+
+    paired = []
+    for port in elements:
+        partner = port.coupled_tag
+        if partner is not None and partner not in tag_of:
+            raise ValueError(
+                f"mutual inductor {port.tag} names partner {partner}, which the "
+                "file does not define"
+            )
+        paired.append(
+            replace(
+                port,
+                tag=tag_of[port.tag],
+                coupled_tag=None if partner is None else tag_of[partner],
+            )
+        )
+    return tuple(paired)
+
+
+def read_lumped_elements(path: str | Path, *, tmd: bool = False) -> tuple[Port, ...]:
     """Read MARIE's JSON lumped-element file.
 
-    Each element's ``number`` is the physical line tag it sits on. A driven port
-    takes a unit delta-gap drive; a lumped element takes none.
+    Ported from ``ports_geo/geo_scoil_lumped_elements.m``. Each element's
+    ``number`` names it; :meth:`SurfaceCoil.build` pairs it with a physical line
+    tag. A driven port takes a unit delta-gap drive; a lumped element takes
+    none.
+
+    A mutual inductor names its partner and the mutual inductance in
+    ``cross_talk``, which MARIE's files write either as
+    ``{"coupled_port": n, "coupled_value": m}`` or as ``[n, m]``.
 
     Parameters
     ----------
     path
         File to read.
+    tmd
+        MARIE's tuning, matching and decoupling flag. When set, every element
+        whose ``optim.boolean`` is set becomes a driven port, so that its
+        terminals appear in the port matrices co-simulation tunes against.
 
     Returns
     -------
@@ -333,7 +417,8 @@ def read_lumped_elements(path: str | Path) -> tuple[Port, ...]:
     Raises
     ------
     ValueError
-        If an element declares a type other than ``port`` or ``element``.
+        If an element declares a type other than ``port`` or ``element``, or
+        a mutual inductor's ``cross_talk`` has neither form.
     """
     data = json.loads(Path(path).read_text())
     elements = data["coil_configuration"]["elements"]
@@ -342,7 +427,10 @@ def read_lumped_elements(path: str | Path) -> tuple[Port, ...]:
         kind = element["type"]
         if kind not in ("port", "element"):
             raise ValueError(f"element {element['number']} has unknown type {kind!r}")
-        cross_talk = element.get("cross_talk") or {}
+        optim = element.get("optim") or {}
+        if tmd and kind == "element" and optim.get("boolean"):
+            kind = "port"
+        coupled_tag, coupled_value = _cross_talk(element)
         value = element["value"]
         quality = element["Q"]
         ports.append(
@@ -355,19 +443,26 @@ def read_lumped_elements(path: str | Path) -> tuple[Port, ...]:
                 if isinstance(quality, list)
                 else float(quality),
                 voltage=1.0 if kind == "port" else 0.0,
-                coupled_tag=(
-                    int(cross_talk["coupled_port"])
-                    if "coupled_port" in cross_talk
-                    else None
-                ),
-                coupled_value=(
-                    float(cross_talk["coupled_value"])
-                    if "coupled_value" in cross_talk
-                    else None
-                ),
+                coupled_tag=coupled_tag,
+                coupled_value=coupled_value,
             )
         )
     return tuple(ports)
+
+
+def _cross_talk(element: dict) -> tuple[int | None, float | None]:
+    """Return a mutual inductor's partner and mutual inductance, else two Nones."""
+    if element["load"] != "mutual_inductor":
+        return None, None
+    cross_talk = element.get("cross_talk")
+    if isinstance(cross_talk, dict) and "coupled_port" in cross_talk:
+        return int(cross_talk["coupled_port"]), float(cross_talk["coupled_value"])
+    if isinstance(cross_talk, list) and len(cross_talk) == 2:
+        return int(cross_talk[0]), float(cross_talk[1])
+    raise ValueError(
+        f"mutual inductor {element['number']} names no partner: "
+        f"cross_talk is {cross_talk!r}"
+    )
 
 
 def _build_edges(mesh: SurfaceMesh) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:

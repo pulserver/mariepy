@@ -6,7 +6,7 @@ import math
 import pytest
 import torch
 
-from mariepy.coil import Port, SurfaceCoil, read_lumped_elements
+from mariepy.coil import Port, SurfaceCoil, pair_tags, read_lumped_elements
 from mariepy.mesh import SurfaceMesh
 
 RADIUS = 0.05
@@ -30,8 +30,8 @@ ELEMENTS = {
             {
                 "number": 2,
                 "type": "element",
-                "load": "capacitor",
-                "value": 3.3e-12,
+                "load": "mutual_inductor",
+                "value": 3.3e-9,
                 "Q": 250.0,
                 "optim": {"boolean": 0},
                 "cross_talk": {"coupled_port": 1, "coupled_value": 5e-9},
@@ -186,9 +186,75 @@ def test_the_edge_of_a_degree_of_freedom_gives_back_its_own_length(device):
     )
 
 
-def test_building_a_coil_rejects_an_element_tag_the_mesh_does_not_carry(device):
+def _tags(*values):
+    return torch.tensor(values, dtype=torch.int64)
+
+
+def test_elements_numbered_as_the_tags_keep_their_own_tag_whatever_the_file_order():
+    paired = pair_tags((_port(tag=2), _port(tag=1)), _tags(1, 1, 2))
+    assert [port.tag for port in paired] == [2, 1]
+
+
+def test_elements_numbered_apart_from_the_tags_take_them_in_file_order():
+    elements = (
+        _port(tag=1),
+        Port(
+            tag=2,
+            kind="element",
+            load="mutual_inductor",
+            value=1e-9,
+            quality=100.0,
+            voltage=0.0,
+            coupled_tag=1,
+            coupled_value=2e-10,
+        ),
+    )
+    first, second = pair_tags(elements, _tags(1002, 1001, 1002, 0))
+    assert (first.tag, second.tag) == (1001, 1002)
+    assert second.coupled_tag == 1001
+
+
+@pytest.mark.parametrize(
+    ("numbers", "tags"),
+    [((2, 1), (1001, 1002)), ((1, 2), (1001,)), ((1,), (1001, 1002))],
+    ids=["out of order", "more elements than tags", "fewer elements than tags"],
+)
+def test_elements_that_neither_are_the_tags_nor_list_one_per_tag_in_order_are_refused(
+    numbers, tags
+):
+    with pytest.raises(ValueError, match="cannot pair"):
+        pair_tags(tuple(_port(tag=number) for number in numbers), _tags(*tags))
+
+
+def test_a_mutual_inductor_whose_partner_the_file_does_not_define_is_refused():
+    lonely = Port(
+        tag=1,
+        kind="element",
+        load="mutual_inductor",
+        value=1e-9,
+        quality=100.0,
+        voltage=0.0,
+        coupled_tag=9,
+        coupled_value=2e-10,
+    )
+    with pytest.raises(ValueError, match="partner 9"):
+        pair_tags((lonely,), _tags(1))
+
+
+def test_building_a_coil_rejects_an_element_whose_tag_sits_on_the_rim(device):
+    mesh = _mesh(device)
+    rim = SurfaceCoil.build(mesh)
+    occurrences = torch.bincount(rim.edge_of_triangle.reshape(-1))
+    edge = rim.edges[int(torch.nonzero(occurrences == 1)[0])]
+    on_rim = SurfaceMesh(
+        nodes=mesh.nodes,
+        triangles=mesh.triangles,
+        triangle_tags=mesh.triangle_tags,
+        lines=edge[None],
+        line_tags=torch.tensor([1], dtype=torch.int64, device=mesh.device),
+    )
     with pytest.raises(ValueError, match="names no interior edge"):
-        SurfaceCoil.build(_mesh(device), (_port(tag=7),))
+        SurfaceCoil.build(on_rim, (_port(tag=1),))
 
 
 def test_building_a_coil_rejects_a_surface_with_a_non_manifold_edge(device):
@@ -212,6 +278,44 @@ def test_a_lumped_element_file_becomes_ports_carrying_its_tags_and_values(tmp_pa
     assert driven.value == pytest.approx(1e-12)
     assert (load.tag, load.kind, load.voltage) == (2, "element", 0.0)
     assert (load.coupled_tag, load.coupled_value) == (1, 5e-9)
+
+
+@pytest.mark.parametrize(
+    "cross_talk",
+    [{"coupled_port": 1, "coupled_value": 5e-9}, [1, 5e-9]],
+    ids=["object", "list"],
+)
+def test_a_mutual_inductor_names_its_partner_in_either_form_marie_writes(
+    tmp_path, cross_talk
+):
+    written = json.loads(json.dumps(ELEMENTS))
+    written["coil_configuration"]["elements"][1]["cross_talk"] = cross_talk
+    path = tmp_path / "elements.json"
+    path.write_text(json.dumps(written))
+    _, load = read_lumped_elements(path)
+    assert (load.coupled_tag, load.coupled_value) == (1, 5e-9)
+
+
+def test_a_mutual_inductor_that_names_no_partner_is_refused(tmp_path):
+    written = json.loads(json.dumps(ELEMENTS))
+    written["coil_configuration"]["elements"][1]["cross_talk"] = []
+    path = tmp_path / "elements.json"
+    path.write_text(json.dumps(written))
+    with pytest.raises(ValueError, match="names no partner"):
+        read_lumped_elements(path)
+
+
+def test_tuning_turns_every_tunable_element_into_a_driven_port(tmp_path):
+    written = json.loads(json.dumps(ELEMENTS))
+    written["coil_configuration"]["elements"][1]["optim"] = {"boolean": 1}
+    path = tmp_path / "elements.json"
+    path.write_text(json.dumps(written))
+    assert [port.kind for port in read_lumped_elements(path)] == ["port", "element"]
+    tuned = read_lumped_elements(path, tmd=True)
+    assert [(port.kind, port.voltage) for port in tuned] == [
+        ("port", 1.0),
+        ("port", 1.0),
+    ]
 
 
 def test_a_lumped_element_file_with_an_unknown_type_is_refused(tmp_path):

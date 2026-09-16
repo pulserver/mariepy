@@ -65,7 +65,7 @@ def test_gmres_reports_a_residual_history_that_does_not_rise(device):
     b = matrix @ exact
     solution = gmres(lambda v: matrix @ v, b, tol=1e-10, restart=40)
     history = solution.residuals
-    assert history[0] == pytest.approx(1.0)
+    assert float(history[0]) == pytest.approx(1.0)
     assert torch.all(history[1:] <= history[:-1] * (1.0 + 1e-9))
 
 
