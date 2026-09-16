@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import torch
 
+from mariepy import _accelerators
 from mariepy.constants import Medium
 from mariepy.quadrature import dunavant, gauss_legendre_1d
 from mariepy.vie import _DYADIC_INDEX, green_k, green_n
@@ -246,6 +247,49 @@ def _couple(
         offsets = cell_size / 2.0 * nodes
         factor = factors[basis_term]
 
+    cell_weights = cell_weights * factor
+
+    if device.type == "cpu":
+        return _compiled(
+            corners,
+            points,
+            medium,
+            triangle_weights,
+            barycentric,
+            cell_weights,
+            offsets,
+            kernel is _electric,
+        )
+    return _batched(
+        corners,
+        points,
+        medium,
+        triangle_weights,
+        barycentric,
+        cell_weights,
+        offsets,
+        kernel,
+    )
+
+
+def _batched(
+    corners,
+    points,
+    medium,
+    triangle_weights,
+    barycentric,
+    cell_weights,
+    offsets,
+    kernel,
+):
+    """Contract the kernel over every pair in torch, on whichever device holds them.
+
+    The compiled kernel in ``_ext`` is checked against this: it is written from
+    ``vie.green_n`` and ``vie.green_k``, which the Mie series already validated,
+    so agreement between the two is an independent formulation agreeing, not a
+    transcription agreeing with itself.
+    """
+    device = corners.device
     free = corners[:, :2]
     shared = corners[:, 2:]
     length = torch.linalg.vector_norm(shared[:, 1] - shared[:, 0], dim=-1)
@@ -257,9 +301,7 @@ def _couple(
         + barycentric[None, None, :, 2, None] * shared[:, None, None, 1, :]
     )
     rho = sign[None, :, None, None] * (source - free[:, :, None, :])
-    weight = ((cell_weights * factor)[:, None] * triangle_weights[None, :]).to(
-        torch.complex128
-    )
+    weight = (cell_weights[:, None] * triangle_weights[None, :]).to(torch.complex128)
 
     rows = int(corners.shape[0])
     budget = max(
@@ -280,3 +322,34 @@ def _couple(
         if pieces
         else torch.zeros((0, 3), dtype=torch.complex128, device=device)
     )
+
+
+def _compiled(
+    corners,
+    points,
+    medium,
+    triangle_weights,
+    barycentric,
+    cell_weights,
+    offsets,
+    electric,
+):
+    """Run the kernel in ``_ext`` over CPU buffers.
+
+    ``PLAN.md``'s **C++ kernels** constraint puts this work in the extension, on
+    CPU buffers. :func:`_batched` runs it on CUDA, and is the independent
+    formulation this is checked against.
+    """
+    couple = _accelerators.require("couple")
+    values = couple(
+        corners.detach().numpy(),
+        points.detach().numpy(),
+        triangle_weights.detach().numpy(),
+        barycentric.detach().numpy(),
+        cell_weights.detach().numpy(),
+        offsets.detach().numpy(),
+        medium.wavenumber,
+        medium.electric_scaling,
+        electric,
+    )
+    return torch.from_numpy(values)

@@ -13,6 +13,7 @@ find_package(Threads REQUIRED)
 # explicitly: a glob makes a new file compile without anyone deciding it should.
 pybind11_add_module(_ext
     ${CMAKE_SOURCE_DIR}/src/cpp/module.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/coupling.cpp
 )
 
 target_include_directories(_ext PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)
