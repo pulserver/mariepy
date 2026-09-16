@@ -131,10 +131,15 @@ precorrected FFT rather than tensor trains.
 matrix with the closed forms for a segment against itself, its lumped loads,
 its port drive and its coupling kernels. The precorrected FFT takes a wire coil
 as it takes a surface one, since the two differ only in where a basis function
-sits, how wide it is and which kernel gives its field. The port reads closed
-loops only: MARIE's open-wire branch of `ProcessLoops.m` assigns rows of
-mismatched size and cannot run. It departs from MARIE in two places:
+sits, how wide it is and which kernel gives its field. It departs from MARIE
+in three places:
 
+- MARIE's open-wire branch of `ProcessLoops.m` assigns rows of mismatched
+  size and cannot run. An open wire here carries a basis function at every
+  interior node and none at its two ends, where the current vanishes; a port
+  on an end segment is refused. A centre-fed half-wave dipole converges, in
+  the segment count, to an input impedance above the infinitely thin dipole's
+  73 + j42 ohms, as a wire of finite radius has.
 - MARIE's wire coupling sources sample the falling half of each basis function
   with the rising ramp, so the current they couple to the body is not the one
   the wire's own matrix solves for. The torch kernel gives the falling half its

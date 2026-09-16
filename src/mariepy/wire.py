@@ -1,4 +1,4 @@
-"""Wire coils: closed loops of thin wire with a triangle basis.
+"""Wire coils: thin wires, closed or open, with a triangle basis.
 
 Ported from MARIE 3.0's wire path: ``src_geometry/scoil_geometry/geo_wcoil.m``,
 ``mesh_geo/Mesh_Wire.m`` and ``triangle_geo/ProcessLoops.m`` for the geometry;
@@ -14,8 +14,9 @@ a lumped element sits on the segment that leaves a node, and MARIE splits its
 voltage or impedance evenly between the two basis functions that segment
 carries.
 
-Only closed loops are read: MARIE's open-wire branch of ``ProcessLoops.m``
-assigns rows of mismatched size and cannot run.
+MARIE's open-wire branch of ``ProcessLoops.m`` assigns rows of mismatched
+size and cannot run. An open wire here carries a basis function at every
+interior node, and none at its two ends, where the current vanishes.
 """
 
 from __future__ import annotations
@@ -54,7 +55,7 @@ _GMSH_LINE = 1
 
 @dataclass(frozen=True)
 class WireCoil:
-    """Closed wire loops with their triangle basis, ports and loads.
+    """Wires, closed or open, with their triangle basis, ports and loads.
 
     Attributes
     ----------
@@ -62,12 +63,16 @@ class WireCoil:
         Each basis function's three nodes, MARIE's ``F_point``, ``S_point``
         and ``T_point``, shape ``(n_dof, 3)``.
     loops
-        Each loop's basis functions, as ``(start, stop)`` ranges.
+        Each wire's basis functions, as ``(start, stop)`` ranges.
     ports
-        Ports and lumped elements in file order, each spanning the two basis
+        Ports and lumped elements in file order, each spanning the basis
         functions of the segment it sits on.
     radius
         Wire radius in metres.
+    closed
+        Whether each wire closes on itself; all of them by default.
+    ends
+        The end nodes of the open wires, which carry no basis function.
     """
 
     first: torch.Tensor
@@ -76,6 +81,8 @@ class WireCoil:
     loops: tuple[tuple[int, int], ...]
     ports: tuple[Port, ...] = ()
     radius: float = WIRE_RADIUS
+    closed: tuple[bool, ...] | None = None
+    ends: torch.Tensor | None = None
 
     @property
     def n_dof(self) -> int:
@@ -93,8 +100,10 @@ class WireCoil:
         return self.centre.device
 
     def points(self) -> torch.Tensor:
-        """Every node the wire passes through, shape ``(n_dof, 3)``."""
-        return self.centre
+        """Return every node the wire passes through, shape ``(n_nodes, 3)``."""
+        if self.ends is None or not self.ends.numel():
+            return self.centre
+        return torch.cat([self.centre, self.ends])
 
     def left_lengths(self) -> torch.Tensor:
         """Length of each basis function's rising segment, MARIE's ``Dl``."""
@@ -104,12 +113,15 @@ class WireCoil:
         """Length of each basis function's falling segment, MARIE's ``Dr``."""
         return torch.linalg.vector_norm(self.last - self.centre, dim=-1)
 
-    def following(self, dof: int) -> int:
-        """Return the basis function after ``dof`` along its own loop."""
-        for start, stop in self.loops:
+    def following(self, dof: int) -> int | None:
+        """Return the basis function after ``dof`` along its wire, or None past an open end."""
+        closed = self.closed or (True,) * len(self.loops)
+        for (start, stop), shut in zip(self.loops, closed, strict=True):
             if start <= dof < stop:
-                return start + (dof - start + 1) % (stop - start)
-        raise IndexError(f"basis function {dof} is on no loop")
+                if shut:
+                    return start + (dof - start + 1) % (stop - start)
+                return dof + 1 if dof + 1 < stop else None
+        raise IndexError(f"basis function {dof} is on no wire")
 
     @classmethod
     def build(
@@ -121,17 +133,23 @@ class WireCoil:
         *,
         radius: float = WIRE_RADIUS,
     ) -> WireCoil:
-        """Build the basis of closed loops and place the ports on it.
+        """Build the basis of the wires and place the ports on it.
+
+        A wire is a run of consecutive segments, each starting where the one
+        before ended. A wire whose last segment ends where its first begins is
+        closed and carries a basis function at every node, as
+        ``ProcessLoops.m`` gives it; any other is open and carries one at
+        every node but its two ends, the current vanishing there.
 
         Parameters
         ----------
         nodes
             Node coordinates, shape ``(n_nodes, 3)``.
         segments
-            Node pairs in file order; each loop is a run of consecutive
-            segments whose last ends where its first begins.
+            Node pairs in file order.
         port_nodes
-            The node each port or element sits at, in file order.
+            The node each port or element sits at, in file order. It sits on
+            the segment that leaves that node.
         elements
             The ports and lumped elements, in file order, as
             :func:`mariepy.coil.read_lumped_elements` reads them. The ``n``-th
@@ -142,68 +160,81 @@ class WireCoil:
         Returns
         -------
         WireCoil
-            The loops and their ports.
+            The wires and their ports.
 
         Raises
         ------
-        NotImplementedError
-            If a run of segments does not close.
         ValueError
-            If there are fewer port nodes than elements, or a port node is on
-            no loop.
+            If there are fewer port nodes than elements, a port node leaves no
+            segment, or a port sits on an open wire's end segment, where the
+            basis cannot carry a gap.
         """
-        loops = []
+        runs = []
         start = 0
-        for k, (head, _) in enumerate(segments):
-            if k > start and head != segments[k - 1][1]:
-                raise NotImplementedError(
-                    f"segments {start}..{k - 1} leave node {segments[start][0]} "
-                    "without returning: open wires are not supported"
-                )
-            if segments[k][1] == segments[start][0]:
-                loops.append((start, k + 1))
-                start = k + 1
-        if start != len(segments):
-            raise NotImplementedError(
-                f"segments from {start} on do not close: open wires are not supported"
-            )
+        for k in range(1, len(segments) + 1):
+            broken = k == len(segments) or segments[k][0] != segments[k - 1][1]
+            closes = segments[k - 1][1] == segments[start][0]
+            if broken or closes:
+                runs.append((start, k))
+                start = k
 
-        previous = []
-        for begin, end in loops:
-            previous += [
-                begin + (k - begin - 1) % (end - begin) for k in range(begin, end)
-            ]
-        heads = torch.tensor([s[0] for s in segments], device=nodes.device)
-        tails = torch.tensor([s[1] for s in segments], device=nodes.device)
-        first = nodes[heads[torch.tensor(previous, device=nodes.device)]]
-        centre = nodes[heads]
-        last = nodes[tails]
+        first, centre, last, ranges, closed = [], [], [], [], []
+        ends = []
+        count = 0
+        for begin, end in runs:
+            heads = [segments[k][0] for k in range(begin, end)]
+            tails = [segments[k][1] for k in range(begin, end)]
+            shut = tails[-1] == heads[0]
+            if shut:
+                previous = heads[-1:] + heads[:-1]
+                own, after = heads, tails
+            else:
+                previous, own, after = heads[:-1], heads[1:], tails[1:]
+                ends += [heads[0], tails[-1]]
+            first += previous
+            centre += own
+            last += after
+            ranges.append((count, count + len(own)))
+            closed.append(shut)
+            count += len(own)
+        dof_of_node = {}
+        for index, node in enumerate(centre):
+            dof_of_node.setdefault(int(node), index)
+
+        device = nodes.device
+
+        def take(index):
+            return nodes[torch.tensor(index, dtype=torch.long, device=device)]
+
+        coil = cls(
+            first=take(first),
+            centre=take(centre),
+            last=take(last),
+            loops=tuple(ranges),
+            radius=radius,
+            closed=tuple(closed),
+            ends=take(ends) if ends else nodes.new_zeros((0, 3)),
+        )
 
         if len(port_nodes) < len(elements):
             raise ValueError(
                 f"{len(elements)} elements but only {len(port_nodes)} port nodes"
             )
-        dof_of_node = {int(node): k for k, node in enumerate(heads.tolist())}
-        coil = cls(
-            first=first,
-            centre=centre,
-            last=last,
-            loops=tuple(loops),
-            radius=radius,
-        )
+        leaving = {int(s[0]): int(s[1]) for s in segments}
         placed = []
         for element, node in zip(elements, port_nodes, strict=False):
-            if node not in dof_of_node:
-                raise ValueError(f"port node {node} is on no loop")
-            dof = dof_of_node[node]
+            node = int(node)
+            if node not in leaving:
+                raise ValueError(f"port node {node} leaves no segment")
+            here, there = dof_of_node.get(node), dof_of_node.get(leaving[node])
+            if here is None or there is None:
+                raise ValueError(
+                    f"element {element.tag} sits on an open wire's end segment"
+                )
             placed.append(
                 replace(
                     element,
-                    dofs=torch.tensor(
-                        [dof, coil.following(dof)],
-                        dtype=torch.long,
-                        device=nodes.device,
-                    ),
+                    dofs=torch.tensor([here, there], dtype=torch.long, device=device),
                 )
             )
         return replace(coil, ports=tuple(placed))
@@ -236,7 +267,7 @@ class WireCoil:
         Returns
         -------
         WireCoil
-            The loops and their ports.
+            The wires and their ports.
 
         Raises
         ------
@@ -566,7 +597,7 @@ def lumped_loads(
 def port_excitation(coil: WireCoil) -> torch.Tensor:
     """Drive each port with half its voltage on each of its two basis functions.
 
-    Ported from ``excitation_wire.m``, for closed loops.
+    Ported from ``excitation_wire.m``.
 
     Parameters
     ----------
