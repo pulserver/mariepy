@@ -335,9 +335,9 @@ against the inductance the loop's own geometry implies.
 field jumps across a dielectric boundary by the contrast ratio, and this basis
 puts that jump on a staircase. The error is therefore concentrated in the
 boundary voxels, falls about as fast as the voxel size, and grows with contrast:
-a sphere at brain-like permittivity needs far more than ten voxels across its
-radius before its interior field is worth quoting, while at a permittivity of 2
-ten voxels already suffice. MARIE's own example runs the piecewise-linear basis
+for a 5 cm sphere at brain-like permittivity the interior field's error falls
+from 31% to 16% to 7.5% as the voxel halves from 10 mm to 2.5 mm, while at a
+permittivity of 2 ten voxels across the radius already suffice. MARIE's own example runs the piecewise-linear basis
 at 2 mm for this reason. The Mie criterion is therefore measured over the
 interior rather than over every voxel, and the refinement legs carry the grids
 they were measured on.
