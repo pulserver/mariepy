@@ -1,10 +1,14 @@
 """MARIE's own coupling sources, compiled and called without MATLAB.
 
-The 24 sources under ``src_integral_equations/src_svie/Cpp_Assembly/src/`` are
-the reference `PLAN.md` sets for the coupling kernels. They are not vendored
-here: the checkout is named by the ``MARIEPY_MARIE_TOOLS`` environment
-variable, and the checks that use them skip when it is unset or no C++ compiler
-is on the path.
+The 24 sources in ``tests/marie/`` are the reference `PLAN.md` sets for the
+coupling kernels. They are MARIE 3.0's own files, kept here so that the
+comparison runs wherever a C++ compiler does, and skipped only when none is on
+the path. `THIRD_PARTY.md` records them and their licence.
+
+They answer the transcription question -- did we copy MARIE faithfully -- and
+not the physics question, which the Mie series, reciprocity and the power
+balance answer. A port that reproduces MARIE reproduces its errors with it, so
+both layers are kept.
 
 Two things stand between the sources and a compiler. They include ``mex.h``,
 which is absent, for the one type ``mxComplexDouble``; a four-line header
@@ -16,7 +20,6 @@ each copy is what makes one library out of twenty-four translation units.
 import ctypes
 import functools
 import itertools
-import os
 import shutil
 import subprocess
 import tempfile
@@ -24,8 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
-ENVIRONMENT = "MARIEPY_MARIE_TOOLS"
-SOURCES = "src/src_integral_equations/src_svie/Cpp_Assembly/src"
+SOURCES = Path(__file__).parent / "marie"
 
 MEX_SHIM = """#ifndef MEX_H
 #define MEX_H
@@ -59,11 +61,6 @@ def _name(operator, component, term):
 
 def reason():
     """Say why the MARIE comparison cannot run, or None if it can."""
-    checkout = os.environ.get(ENVIRONMENT)
-    if not checkout:
-        return f"{ENVIRONMENT} does not name a marie-tools checkout"
-    if not (Path(checkout) / SOURCES).is_dir():
-        return f"{checkout} has no {SOURCES}"
     if shutil.which("g++") is None:
         return "no C++ compiler on the path"
     return None
@@ -83,12 +80,11 @@ def build():
         matrix, with ``index`` the position in :func:`variants`.
     """
     work = Path(tempfile.mkdtemp(prefix="mariepy-parity-"))
-    checkout = Path(os.environ[ENVIRONMENT]) / SOURCES
     (work / "mex.h").write_text(MEX_SHIM)
 
     names = [_name(*variant) for variant in variants()]
     for name in names:
-        text = (checkout / f"{name}.cpp").read_text()
+        text = (SOURCES / f"{name}.cpp").read_text()
         for external, internal in HELPERS:
             text = text.replace(external, internal)
         (work / f"{name}.cpp").write_text(text)

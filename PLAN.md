@@ -170,7 +170,7 @@ it was measured on.
 | Body solver | Analytic Mie series for a homogeneous sphere, then a layered sphere, in a plane-wave incident field | Relative L2 error of E inside the sphere falls monotonically over three voxel sizes, and on the coarsest stays at or below its recorded value. Measured over the interior, for the reason below |
 | Linear solve | – | Final GMRES relative residual at or below `tol` for every port |
 | Compressed body operator | The uncompressed kernel on a small grid | Operator applied to random currents agrees within `tol_HOSVD` |
-| Coupling kernels | MARIE's original C++ coupling sources, compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the three helper functions each source repeats are given internal linkage so all 24 variants link into one library | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
+| Coupling kernels | MARIE's original C++ coupling sources, kept in `tests/marie/` and compiled without MATLAB: a header defining `mxComplexDouble` replaces `mex.h`, and the three helper functions each source repeats are given internal linkage so all 24 variants link into one library | For every component and basis term, the new N and K kernels reproduce the corresponding original to floating-point precision on random geometry |
 | Coil matrix | Analytic Mie series for a perfectly conducting sphere in a plane-wave incident field | Each interaction block equals the independently computed transposed pair within `tol`, before `Z + Zᵀ` is formed; the scattering cross section falls monotonically towards the series over three mesh refinements and on the coarsest stays at or below its recorded value |
 | Coupled system | – | The port matrix is reciprocal within `tol` before `(Ip + Ipᵀ)/2` is formed; the field in the body agrees with a direct integration of the coupling kernel and the body operator, taken without the projection; the power the body takes out of the coil's field equals the ohmic loss integrated from E plus the power the body's own current puts back, within `tol` |
 
@@ -271,6 +271,12 @@ What this leaves uncovered is recorded rather than implied away:
 - **Permissive code** (MIT, BSD, Apache-2.0) may be ported with its copyright
   notice kept, and each ported source is listed in `THIRD_PARTY.md`. This covers
   MARIE 3.0 itself and TT-Toolbox's `dmrg_cross`.
+- **MARIE files kept verbatim as a test oracle** are listed the same way. MARIE
+  3.0 is MIT, so a source a check compares against is kept rather than described:
+  a comparison a developer must set up is a comparison that does not run. Such
+  files live under `tests/`, never under `src/`, so nothing in them reaches the
+  wheel or links into `_ext`. The 24 coupling sources in `tests/marie/` are the
+  first of them.
 - **MARIE's LGPL files** stay outside the MIT code:
   - the DIRECTFN singular integrals, built as a separate extension module with
     their notice;

@@ -212,7 +212,6 @@ def test_the_collocation_matrix_carries_one_column_block_for_each_cell_basis_ter
         )
 
 
-@pytest.mark.slow
 @pytest.mark.skipif(parity.reason() is not None, reason=parity.reason() or "")
 @pytest.mark.parametrize(
     ("index", "variant"),

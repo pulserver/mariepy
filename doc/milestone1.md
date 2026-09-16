@@ -319,9 +319,14 @@ time:
 The test builds a random RWG geometry and a random set of cells and asserts
 that `coupling.coupling_n(..., basis_term=b)[:, c]` reproduces
 `Assemble_rwg_coupling_matrix_N_{x,y,z}{,1,2,3}` for every `(c, b)` pair, and
-likewise for K. It carries the `slow` marker, runs on CPU, and skips when
-`MARIEPY_MARIE_TOOLS` does not name a checkout or no C++ compiler is on the
-path — the sources are not vendored into this repository.
+likewise for K. It runs on CPU and skips only when no C++ compiler is on the
+path.
+
+The sources are kept in `tests/marie/`. MARIE 3.0 is MIT, so unlike the
+DIRECTFN family there is no licence reason to hold them at arm's length, and a
+comparison that needs no setup is a comparison every pull request runs. They are
+test-only: nothing under `tests/` reaches the wheel, and `_ext` never links
+them.
 
 ## 5. The coupling kernels
 
