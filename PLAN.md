@@ -261,6 +261,10 @@ package's single `_ext` module, following the package template and pypulseqpp.
 
 **MATLAB-side code.**
 
+- **Data licences.** The same terms as code: no MathWorks, GPL, AGPL or
+  unlicensed data, and no non-commercial clause. The IT'IS tissue database is
+  CC BY-NC and therefore excluded; tissue properties come from Gabriel et al.
+  1996, as the SAR milestone records.
 - **Numerical building blocks.** Arrays, FFTs, sparse projection matrices and
   dense factorisations use torch (`torch.fft`, sparse CSR tensors,
   `torch.linalg`), so one code path runs on CPU or CUDA.
@@ -536,6 +540,18 @@ section says. It is described here so the solver's interfaces serve it.
   44 table. Tissues NIST does not list take a recorded substitute: soft tissue
   for skin, dura and mucosa, water for CSF and vitreous humour, cortical bone for
   cancellous bone.
+- **Where the numbers live.** `tissue.py` carries the four-Cole-Cole model and
+  reads the parameters from a table beside the label volume, rather than
+  bundling them. A measured parameter the package cannot check against its
+  source would be a silent error in every SAR number that follows, and the
+  pipeline writes the table it names its own labels against anyway.
+  `tissue.read_table` states the columns and the paper's units.
+- **Which measurements.** Gabriel et al. 1996, and not the IT'IS database, whose
+  licence is CC BY-NC and so outside this package's terms. The two differ: at
+  127.74 MHz MARIE's own head model, which carries IT'IS values, has grey matter
+  at 65.4 and 0.518 S/m where Gabriel's fit gives 73.6 and 0.587. Muscle, white
+  matter and cortical bone agree between them to the three figures MARIE stores,
+  so those are a check on the model rather than on the table.
 - **Open check.** Whether IXI volumes keep the face is unverified, so it is
   checked before the pipeline relies on it.
 
