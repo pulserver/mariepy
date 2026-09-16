@@ -99,12 +99,9 @@ milestones, each building on the previous one:
 Milestone 1 ends with each port's body currents, fields and network parameters.
 From milestone 3 onward, co-simulation forms the channel drive inside mariepy.
 
-**Order.** Milestone 2 comes first, then the stages under **Later stages** — Q
-matrices, averaging, compression and head models — and then milestones 3 and 4.
-A coil defined by fixed current patterns takes its channel drive from the port
-matrix milestone 1 already returns, so the VOP file for such a coil needs no
-co-simulation; every VOP file depends on how much the body basis moves peak 10 g
-SAR at tissue boundaries, which milestone 2 measures.
+**Order.** The four milestones run in order, and the SAR milestone follows them:
+Q matrices, averaging, compression and head models, described under **SAR
+milestone** below.
 
 **Co-simulation source.** MARIE ships its co-simulation twice:
 `src_physics/src_electronics/co_simulation/` and a copy under
@@ -365,11 +362,10 @@ What this leaves uncovered is recorded rather than implied away:
 - Build, lint and test commands are those in `AGENTS.md`, and a change is
   reported complete only with their output.
 
-## Later stages
+## SAR milestone
 
-These stages follow milestone 2 and come before milestones 3 and 4, as the
-**Order** paragraph of the MARIE port section says. They are here so the solver's interfaces
-serve them.
+This milestone follows milestone 4, as the **Order** paragraph of the MARIE port
+section says. It is described here so the solver's interfaces serve it.
 
 **Head models.**
 
