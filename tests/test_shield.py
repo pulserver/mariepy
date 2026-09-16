@@ -158,7 +158,7 @@ def test_the_preconditioner_inverts_the_shield_and_coil_block_exactly(device):
     torch.testing.assert_close(applied[:surfaces], head)
 
 
-def test_the_shield_takes_no_drive_of_its_own(device):
+def test_a_shield_without_ports_takes_no_drive(device):
     operator, _, _ = _operator(device)
     drive = operator.right_hand_side()
     assert drive.shape == (2, operator.n_shield + operator.n_coil + operator.n_body)
@@ -202,4 +202,65 @@ def test_a_shielded_linear_body_is_reciprocal_and_balanced():
         admittance.abs().max()
     )
     taken, absorbed, scattered = fields.power_balance(operator, computed, solution.body)
+    torch.testing.assert_close(taken, absorbed + scattered)
+
+
+# -- a shield with a port of its own -------------------------------------------------
+
+
+def _loop_mesh(radius, n_around, ports, first_tag):
+    mesh = SurfaceMesh.loop(
+        radius=radius, width=0.01, n_around=n_around, n_across=1, ports=ports
+    )
+    return mesh, mesh.line_tags + (first_tag - 1) * (mesh.line_tags > 0)
+
+
+def _driven_pair():
+    """An outer loop with one port as the shield, an inner two-port loop as the coil."""
+    outer, outer_tags = _loop_mesh(0.07, 24, 1, 1)
+    inner, inner_tags = _loop_mesh(0.03, 12, 2, 2)
+    port = [
+        Port(tag=t, kind="port", load="none", value=0.0, quality=1.0, voltage=1.0)
+        for t in (1, 2, 3)
+    ]
+    from dataclasses import replace
+
+    shield = SurfaceCoil.build(outer, (port[0],))
+    coil = SurfaceCoil.build(
+        replace(inner, line_tags=inner_tags - 1),
+        (replace(port[1], tag=1), replace(port[2], tag=2)),
+    )
+    merged = SurfaceMesh(
+        nodes=torch.cat([outer.nodes, inner.nodes]),
+        triangles=torch.cat([outer.triangles, inner.triangles + outer.n_nodes]),
+        triangle_tags=torch.cat([outer.triangle_tags, inner.triangle_tags]),
+        lines=torch.cat([outer.lines, inner.lines + outer.n_nodes]),
+        line_tags=torch.cat([outer_tags, inner_tags]),
+    )
+    both = SurfaceCoil.build(merged, tuple(port))
+    return shield, coil, both
+
+
+def test_a_driven_shield_s_port_comes_first_and_the_ports_are_reciprocal():
+    from mariepy.solver import solve
+
+    medium, body = _medium(), _body()
+    shield, coil, both = _driven_pair()
+    shielded = solve(body, coil, medium, tol=TOLERANCE, shield=shield, **ORDERS)
+    admittance = network.port_admittance(
+        shielded.operator.excitation,
+        shielded.operator.conductors(shielded.ports.coil, shielded.ports.shield),
+    )
+    assert admittance.shape == (3, 3)
+    asymmetry = (admittance - admittance.T).abs().max()
+    assert float(asymmetry) <= 1e-4 * float(admittance.abs().max())
+
+    # The same two loops as one coil, coupled through the precorrected FFT.
+    whole = solve(body, both, medium, tol=TOLERANCE, **ORDERS)
+    error = (shielded.admittance - whole.admittance).abs().max()
+    assert float(error / whole.admittance.abs().max()) <= 1e-2
+
+    taken, absorbed, scattered = fields.power_balance(
+        shielded.operator, shielded.fields, shielded.ports.body
+    )
     torch.testing.assert_close(taken, absorbed + scattered)

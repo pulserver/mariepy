@@ -112,7 +112,7 @@ matching stage only to the ports whose network carries it, where the top-level
 copy adds it to every port. The two agree when every port has the same matching
 topology. Milestone 3 ports the nested copy alone.
 
-**Shields.** A shield is a surface with no port of its own. Its own matrix is
+**Shields.** A shield is a surface around the coil and the body. Its own matrix is
 the coil's, `sie.assemble`; its coupling to the coil is assembled whole, where
 MARIE compresses it by adaptive cross approximation, since a coil and its shield
 together carry few enough unknowns for the dense block; its coupling to the body
@@ -121,7 +121,11 @@ is a tensor train per body unknown, built by the DMRG cross method ported into
 `maxvol2.m` never advances its iteration count, so its loop can run without
 end, and here it is bounded; `reort.m` compares squared entries without
 conjugating, which on complex data compares real parts, and here it compares
-squared moduli. A shield with driven ports is not supported.
+squared moduli. A shield may carry lumped elements and driven ports of its
+own; its ports come first, as in MARIE's `rhs_assembly.m`, and its element
+file is merged first for co-simulation. A simulation file that names a
+shield and no coil is solved with the shield as the coil, through the
+precorrected FFT rather than tensor trains.
 
 **Wire coils.** `wire.py` ports MARIE's wire coil: its geometry, its own
 matrix with the closed forms for a segment against itself, its lumped loads,

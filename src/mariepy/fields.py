@@ -160,7 +160,8 @@ def delivered_power(operator: CoupledOperator, coil: torch.Tensor) -> torch.Tens
     operator
         Supplies the port drive.
     coil
-        Coil currents, shape ``(n_ports, n_dof)``.
+        The conductors' currents, shape ``(n_ports, n_dof)``: the coil's, or
+        with a shield ``operator.conductors(coil, shield)``.
 
     Returns
     -------
@@ -170,7 +171,7 @@ def delivered_power(operator: CoupledOperator, coil: torch.Tensor) -> torch.Tens
         port alone: the coil's field and the body's interfere, so what the
         pair radiates is not what the coil would radiate by itself.
     """
-    drive = operator.system.excitation
+    drive = operator.excitation
     return -0.5 * torch.real((drive.conj() * coil).sum(dim=-1))
 
 

@@ -131,6 +131,16 @@ class CoupledOperator:
         """
         return vector[..., : self.n_coil], vector[..., self.n_coil :], None
 
+    @property
+    def excitation(self) -> torch.Tensor:
+        """The port drive over the conductors' unknowns, the coil's."""
+        return self.system.excitation
+
+    def conductors(self, coil: torch.Tensor, shield: torch.Tensor | None):
+        """Join the conductors' currents in :attr:`excitation`'s order."""
+        del shield
+        return coil
+
     def right_hand_side(self) -> torch.Tensor:
         """Give the drive of each port over the whole unknown vector.
 
@@ -300,20 +310,45 @@ class ShieldedOperator:
         )
         return torch.cat([shield_out, coil_out, body_out])
 
+    @property
+    def excitation(self) -> torch.Tensor:
+        """The port drive over the shield's unknowns and then the coil's.
+
+        The shield's ports come first, as MARIE's ``rhs_assembly.m`` orders
+        them, and each drives only its own conductor's rows.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_shield_ports + n_coil_ports, n_shield + n_coil)``.
+        """
+        own = self.shield.system.excitation
+        coil = self.system.excitation
+        return torch.cat(
+            [
+                torch.nn.functional.pad(own, (0, self.n_coil)),
+                torch.nn.functional.pad(coil, (self.n_shield, 0)),
+            ]
+        )
+
+    def conductors(self, coil: torch.Tensor, shield: torch.Tensor | None):
+        """Join the conductors' currents in :attr:`excitation`'s order."""
+        return torch.cat([shield, coil], dim=-1)
+
     def right_hand_side(self) -> torch.Tensor:
         """Give the drive of each port over the whole unknown vector.
 
         Returns
         -------
         torch.Tensor
-            Shape ``(n_driven, n_shield + n_coil + n_body)``: the shield takes
-            no drive of its own.
+            Shape ``(n_shield_ports + n_coil_ports, n_shield + n_coil +
+            n_body)``: the shield's ports first.
         """
-        inner = self.coupled.right_hand_side()
-        none = torch.zeros(
-            (inner.shape[0], self.n_shield), dtype=inner.dtype, device=inner.device
+        drive = self.excitation
+        rest = torch.zeros(
+            (drive.shape[0], self.n_body), dtype=drive.dtype, device=drive.device
         )
-        return torch.cat([none, inner], dim=1)
+        return torch.cat([drive, rest], dim=1)
 
     def preconditioner(self) -> Callable[[torch.Tensor], torch.Tensor]:
         """Build the split left preconditioner.

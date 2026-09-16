@@ -446,7 +446,9 @@ def solve(
         )
     ports = solve_ports(operator, tol=tol)
     admittance = network.symmetrise(
-        network.port_admittance(system.excitation, ports.coil)
+        network.port_admittance(
+            operator.excitation, operator.conductors(ports.coil, ports.shield)
+        )
     )
     impedance = network.y_to_z(admittance)
     return Result(

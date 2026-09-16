@@ -52,10 +52,12 @@ class Case:
         :func:`~mariepy.solver.solve`.
     shield
         The RF shield the file names, or None; pass it to
-        :func:`~mariepy.solver.solve`.
+        :func:`~mariepy.solver.solve`. A shield named without a coil is the
+        case's coil instead.
     network
         The coil's ports and lumped values as co-simulation reads them, with
-        the file's ``TMD`` flag, the wire's first; pass it to
+        the file's ``TMD`` flag, the shield's rows first, then the wire's; pass
+        it to
         :func:`~mariepy.cosim.co_simulate`.
     basis_support
         The surface the file names to build a field basis on, MARIE's
@@ -118,11 +120,20 @@ def read_case(
             "does not read; build the basis with mariepy.basis.surface_basis from "
             "the case's basis_support"
         )
-    if not (coil_name or wire_name):
+    if not (coil_name or wire_name or settings.get("ShieldFile")):
         raise ValueError(f"{path.name} names no coil")
 
     tmd = bool(settings.get("TMD", 0))
     element_files = []
+    shield = None
+    if settings.get("ShieldFile"):
+        shield_file = data / "coils" / "shield_files" / settings["ShieldFile"]
+        shield_mesh = SurfaceMesh.read_gmsh22(shield_file, device=device or "cpu")
+        shield_elements = ()
+        if shield_file.with_suffix(".json").is_file():
+            element_files.append(shield_file.with_suffix(".json"))
+            shield_elements = read_lumped_elements(element_files[-1], tmd=tmd)
+        shield = SurfaceCoil.build(shield_mesh, shield_elements)
     wire = surface = None
     if wire_name:
         wire_file = data / "coils" / "wire_files" / wire_name
@@ -152,17 +163,10 @@ def read_case(
         coil = CombinedCoil(wire=wire, surface=surface)
     else:
         coil = wire if wire is not None else surface
-
-    shield = None
-    if settings.get("ShieldFile"):
-        shield_file = data / "coils" / "shield_files" / settings["ShieldFile"]
-        shield_mesh = SurfaceMesh.read_gmsh22(shield_file, device=device or "cpu")
-        shield_elements = ()
-        if shield_file.with_suffix(".json").is_file():
-            shield_elements = read_lumped_elements(
-                shield_file.with_suffix(".json"), tmd=tmd
-            )
-        shield = SurfaceCoil.build(shield_mesh, shield_elements)
+    if coil is None:
+        # A shield alone is a surface conductor like any coil; it is solved as
+        # one, through the precorrected FFT rather than tensor trains.
+        coil, shield = shield, None
 
     return Case(
         medium=Medium(float(settings["B0"]), settings.get("Nucleus", "1H")),

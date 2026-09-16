@@ -775,7 +775,7 @@ def solve_coil(
 
     A shield joins as MARIE joins it there: its unknowns come first, with its
     own matrix, its interaction with the coil, and its coupling to the body
-    at the samples, and it takes no drive.
+    at the samples, and its driven ports, if any, come first among the ports.
 
     Parameters
     ----------
@@ -791,7 +791,7 @@ def solve_coil(
     medium
         The same frequency.
     shield
-        An RF shield around the coil and the body, with no driven port.
+        An RF shield around the coil and the body.
     triangle_order, cell_order
         Quadrature orders of the coupling at the samples.
 
@@ -818,12 +818,20 @@ def solve_coil(
         from mariepy import shield as shield_module
         from mariepy.sie import assemble as assemble_surface
 
-        own = assemble_surface(shield, medium).impedance
+        own = assemble_surface(shield, medium)
         cross = shield_module._coil_coupling(shield, coil, medium, 4)
         matrix = torch.cat(
-            [torch.cat([own, cross], dim=1), torch.cat([cross.T, matrix], dim=1)]
+            [
+                torch.cat([own.impedance, cross], dim=1),
+                torch.cat([cross.T, matrix], dim=1),
+            ]
         )
-        excitation = torch.nn.functional.pad(excitation, (shield.n_dof, 0))
+        excitation = torch.cat(
+            [
+                torch.nn.functional.pad(own.excitation, (0, coil.n_dof)),
+                torch.nn.functional.pad(excitation, (shield.n_dof, 0)),
+            ]
+        )
         tested = torch.cat(
             [
                 coupling_at(
@@ -846,13 +854,13 @@ def solve_coil(
     impedance = matrix + field.T @ basis.response @ field
     current = torch.linalg.solve(impedance, excitation.T).T
     coefficients = (basis.interpolation @ (field @ current.T)).T
+    admittance = network.symmetrise(network.port_admittance(excitation, current))
     shield_current = None
     if shield is not None:
         shield_current = current[:, : shield.n_dof]
         current = current[:, shield.n_dof :]
     electric = coefficients @ basis.electric
     magnetic = coefficients @ basis.magnetic
-    admittance = network.symmetrise(network.port_admittance(system.excitation, current))
     return MrgfSolution(
         impedance=impedance,
         coil=current,

@@ -160,6 +160,60 @@ def test_a_shielded_coil_through_the_basis_is_the_shielded_coil_coupled_whole():
     assert reduced.shield.shape == (2, shield.n_dof)
 
 
+def test_a_driven_shield_s_port_leads_the_reduced_ports():
+    """A shield with a port: its drive is its own, and its port comes first."""
+    from tests.test_shield import _driven_pair
+
+    medium, body, _ = _case()
+    shield, coil, _ = _driven_pair()
+    support = SurfaceCoil.build(
+        SurfaceMesh(
+            nodes=torch.cat([shield.mesh.nodes, coil.mesh.nodes]),
+            triangles=torch.cat(
+                [shield.mesh.triangles, coil.mesh.triangles + shield.mesh.n_nodes]
+            ),
+            triangle_tags=torch.cat(
+                [shield.mesh.triangle_tags, coil.mesh.triangle_tags]
+            ),
+            lines=torch.zeros((0, 2), dtype=torch.long),
+            line_tags=torch.zeros(0, dtype=torch.long),
+        )
+    )
+    incident = basis_module.surface_basis(
+        body, support, medium, tol=1e-12, interpolation_tol=1e-12
+    )
+    joint = basis_module.solve(incident, body, medium, tol=TOLERANCE, **ORDERS)
+    system = sie.assemble(coil, medium)
+    reduced = basis_module.solve_coil(coil, system, joint, body, medium, shield=shield)
+
+    own = sie.assemble(shield, medium)
+    cross = shield_module._coil_coupling(shield, coil, medium, 4)
+    whole = torch.cat(
+        [
+            torch.cat([own.impedance, cross], dim=1),
+            torch.cat([cross.T, system.impedance], dim=1),
+        ]
+    )
+    drive = torch.cat(
+        [
+            torch.nn.functional.pad(own.excitation, (0, coil.n_dof)),
+            torch.nn.functional.pad(system.excitation, (shield.n_dof, 0)),
+        ]
+    )
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    tested = torch.cat(
+        [
+            basis_module.coupling_at(part, centres, medium, body.resolution)
+            for part in (shield, coil)
+        ],
+        dim=1,
+    )
+    dense = _dense_from(tested, whole, drive, body, medium, False)
+    assert reduced.admittance.shape == (3, 3)
+    error = (reduced.admittance - dense).abs().max()
+    assert float(error / dense.abs().max()) <= 1e-7
+
+
 def test_the_basis_fields_are_the_body_s_own_total_fields(solved):
     """Each basis field against the body solved directly for its incident field."""
     medium, body, _, field_basis, linear = solved

@@ -183,5 +183,31 @@ def test_a_shield_the_simulation_file_names_is_read_with_its_basis(tmp_path):
     assert case.shield.n_driven == 0
 
 
+def test_a_shield_named_alone_is_the_coil_and_its_ports_lead_the_network(tmp_path):
+    path = _data(tmp_path, CoilFile="", ShieldFile="Loop/shield.msh")
+    folder = tmp_path / "data" / "coils" / "shield_files" / "Loop"
+    folder.mkdir(parents=True)
+    mesh = SurfaceMesh.loop(radius=0.08, width=0.01, n_around=8, n_across=1)
+    write_gmsh22(folder / "shield.msh", mesh)
+    (folder / "shield.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert case.shield is None
+    assert case.coil.n_driven == 1
+    assert [t.number for t in case.network.terminals] == [1]
+
+
+def test_a_shield_s_elements_come_before_the_coil_s(tmp_path):
+    path = _data(tmp_path, ShieldFile="Loop/shield.msh")
+    folder = tmp_path / "data" / "coils" / "shield_files" / "Loop"
+    folder.mkdir(parents=True)
+    mesh = SurfaceMesh.loop(radius=0.08, width=0.01, n_around=8, n_across=1)
+    write_gmsh22(folder / "shield.msh", mesh)
+    (folder / "shield.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert case.shield.n_driven == 1
+    assert [t.number for t in case.network.terminals] == [1, 2]
+    assert case.network.terminals[1].entities == (2,)
+
+
 def test_a_simulation_file_without_a_shield_reads_none(tmp_path):
     assert read_case(_data(tmp_path)).shield is None
