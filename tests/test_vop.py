@@ -198,3 +198,41 @@ def test_metadata_the_contract_requires_is_checked_on_reading(tmp_path):
     )
     with pytest.raises(ValueError, match="frequency_hz"):
         vop.read(path)
+
+
+def test_a_body_carries_from_its_fields_to_a_file_that_still_bounds_it(tmp_path):
+    """The whole chain: fields, matrices, averaging cubes, points, file."""
+    from mariepy import averaging
+
+    generator = torch.Generator().manual_seed(12)
+    size = 13
+    axis = torch.arange(size, dtype=torch.float64) - (size - 1) / 2
+    x, y, z = torch.meshgrid(axis, axis, axis, indexing="ij")
+    tissue = torch.sqrt(x**2 + y**2 + z**2) <= size / 2 - 1.0
+    resolution = 0.002
+    density = torch.full(tissue.shape, 1000.0, dtype=torch.float64)
+    mass = torch.where(tissue, density * resolution**3, 0.0)
+    electric = torch.randn(
+        CHANNELS, 3, size, size, size, dtype=torch.complex128, generator=generator
+    )
+    conductivity = 0.5 * tissue.to(torch.float64)
+
+    local = sar.local_matrices(electric, conductivity, density, tissue)
+    cubes = averaging.centred_cubes(mass, tissue, 1e-3)
+    over_cubes = averaging.averaged_matrices(cubes, local, mass, tissue)
+    points, _ = vop.compress(over_cubes, MARGIN)
+    whole = sar.average(local, sar.voxel_mass(density, resolution, tissue))
+
+    path = tmp_path / "chain.npz"
+    vop.write(
+        path,
+        points,
+        whole[None],
+        **(_file_arguments() | {"bodies": ["ball"], "averaging": "1 g, step 1"}),
+    )
+    back = vop.read(path)
+    drives = _drives(8, 13)
+    assert bool((sar.peak(back.vops, drives) >= sar.peak(over_cubes, drives)).all())
+    assert bool(
+        (sar.peak(over_cubes, drives) >= sar.sar(whole[None], drives)[:, 0]).all()
+    )

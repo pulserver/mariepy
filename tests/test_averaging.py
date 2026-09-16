@@ -216,3 +216,34 @@ def test_a_body_with_no_tissue_is_refused(device):
     grid = torch.zeros((5, 5, 5), dtype=torch.float64, device=device)
     with pytest.raises(ValueError, match="no tissue"):
         averaging.centred_cubes(grid, grid.to(torch.bool), TARGET)
+
+
+def test_a_cube_s_matrix_is_the_sar_of_every_drive_averaged_over_it(device):
+    """Averaging the matrices and averaging the SAR are the same operation."""
+    from mariepy import sar
+
+    mass, tissue, _ = _body(device=device)
+    generator = torch.Generator().manual_seed(3)
+    channels = 3
+    electric = torch.randn(
+        channels, 3, *mass.shape, dtype=torch.complex128, generator=generator
+    ).to(device)
+    conductivity = (0.5 * tissue).to(torch.float64)
+    density = mass / RESOLUTION**3
+    matrices = sar.local_matrices(
+        electric, conductivity, density.clamp(min=1.0), tissue
+    )
+
+    cubes = averaging.centred_cubes(mass, tissue, TARGET)
+    over_cubes = averaging.averaged_matrices(cubes, matrices, mass, tissue)
+    assert over_cubes.shape == (len(cubes), channels, channels)
+    torch.testing.assert_close(over_cubes, over_cubes.conj().transpose(-2, -1))
+
+    drive = torch.randn(channels, dtype=torch.complex128, generator=generator).to(
+        device
+    )
+    local = torch.zeros(mass.shape, dtype=torch.float64, device=device)
+    local[tissue] = sar.sar(matrices, drive)
+    torch.testing.assert_close(
+        sar.sar(over_cubes, drive), averaging.averaged(cubes, local, mass)
+    )

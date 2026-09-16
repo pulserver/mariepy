@@ -27,7 +27,7 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["Cubes", "averaged", "centred_cubes"]
+__all__ = ["Cubes", "averaged", "averaged_matrices", "centred_cubes"]
 
 MASS_TOLERANCE = 1e-6
 """How far a cube's mass may sit from the target before its shell is cut back."""
@@ -73,8 +73,8 @@ def _prefix(grid: torch.Tensor) -> torch.Tensor:
     return padded.cumsum(0).cumsum(1).cumsum(2)
 
 
-def _windowed(prefix: torch.Tensor, low, high, margin: int) -> torch.Tensor:
-    """Sum a grid over one box about every centre that is clear of the edge.
+def _windowed(prefix: torch.Tensor, low, high, window) -> torch.Tensor:
+    """Sum a grid over one box about every centre in a window.
 
     Parameters
     ----------
@@ -83,29 +83,30 @@ def _windowed(prefix: torch.Tensor, low, high, margin: int) -> torch.Tensor:
     low, high
         The box, as offsets from the centre: it spans ``centre + low`` up to but
         not including ``centre + high``, per axis.
-    margin
-        Centres nearer than this to an edge are left out; every offset must lie
-        within it.
+    window
+        Per axis, the first and last-plus-one centre to read. Every offset must
+        keep the box inside the grid over that range.
 
     Returns
     -------
     torch.Tensor
-        Shape ``(n1 - 2m, n2 - 2m, n3 - 2m)``.
+        One value per centre in the window.
     """
-    shape = [size - 1 for size in prefix.shape]
-    total = torch.zeros(
-        [size - 2 * margin for size in shape],
-        dtype=prefix.dtype,
-        device=prefix.device,
-    )
+    total = None
     for corner in itertools.product((0, 1), repeat=3):
         offsets = [high[axis] if corner[axis] else low[axis] for axis in range(3)]
         cut = tuple(
-            slice(margin + offsets[axis], shape[axis] - margin + offsets[axis])
+            slice(window[axis][0] + offsets[axis], window[axis][1] + offsets[axis])
             for axis in range(3)
         )
-        total = total + (-1.0) ** (3 - sum(corner)) * prefix[cut]
+        term = (-1.0) ** (3 - sum(corner)) * prefix[cut]
+        total = term if total is None else total + term
     return total
+
+
+def _centred(half: int, shape):
+    """Give the window of centres a cube of this half-width fits about."""
+    return [(half, size - half) for size in shape]
 
 
 def _shell_sums(prefix: torch.Tensor, half: int) -> tuple[torch.Tensor, ...]:
@@ -117,13 +118,14 @@ def _shell_sums(prefix: torch.Tensor, half: int) -> tuple[torch.Tensor, ...]:
         The whole cube, the cube one shell smaller, and the shell's corner, edge
         and face parts, each about every centre clear of ``half``.
     """
-    whole = _windowed(prefix, (-half,) * 3, (half + 1,) * 3, half)
-    inner = _windowed(prefix, (-half + 1,) * 3, (half,) * 3, half)
+    window = _centred(half, [size - 1 for size in prefix.shape])
+    whole = _windowed(prefix, (-half,) * 3, (half + 1,) * 3, window)
+    inner = _windowed(prefix, (-half + 1,) * 3, (half,) * 3, window)
 
     corners = torch.zeros_like(whole)
     for signs in itertools.product((-1, 1), repeat=3):
         low = [sign * half for sign in signs]
-        corners = corners + _windowed(prefix, low, [value + 1 for value in low], half)
+        corners = corners + _windowed(prefix, low, [value + 1 for value in low], window)
 
     faces = torch.zeros_like(whole)
     for axis, sign in itertools.product(range(3), (-1, 1)):
@@ -131,20 +133,21 @@ def _shell_sums(prefix: torch.Tensor, half: int) -> tuple[torch.Tensor, ...]:
         high = [half] * 3
         low[axis] = sign * half
         high[axis] = sign * half + 1
-        faces = faces + _windowed(prefix, low, high, half)
+        faces = faces + _windowed(prefix, low, high, window)
 
     return whole, inner, corners, whole - inner - corners - faces, faces
 
 
 def _cube_faces_hold_tissue(prefix: torch.Tensor, half: int) -> torch.Tensor:
     """Say whether every face of the cube touches or cuts tissue."""
+    shape = [size - 1 for size in prefix.shape]
     holds = None
     for axis, sign in itertools.product(range(3), (-1, 1)):
         low = [-half] * 3
         high = [half + 1] * 3
         low[axis] = sign * half
         high[axis] = sign * half + 1
-        face = _windowed(prefix, low, high, half) > 0.5
+        face = _windowed(prefix, low, high, _centred(half, shape)) > 0.5
         holds = face if holds is None else (holds & face)
     return holds
 
@@ -232,7 +235,9 @@ def centred_cubes(
             settled |= ~faces  # a face that sees only background ends the growth
 
         whole = torch.zeros(shape, dtype=torch.float64, device=device)
-        whole[inner] = _windowed(mass_prefix, (-half,) * 3, (half + 1,) * 3, half)
+        whole[inner] = _windowed(
+            mass_prefix, (-half,) * 3, (half + 1,) * 3, _centred(half, shape)
+        )
         reached = (whole - target_mass) / target_mass >= -MASS_TOLERANCE
         found = reached & ~settled
         if bool(found.any()):
@@ -270,7 +275,7 @@ def _partial_fill(mass_prefix, half, target_mass, shape, where):
     if half == 0:
         # A single voxel already heavier than the target is used in proportion.
         centre = torch.zeros(shape, dtype=torch.float64, device=device)
-        centre[inner] = _windowed(mass_prefix, (0,) * 3, (1,) * 3, 0)
+        centre[inner] = _windowed(mass_prefix, (0,) * 3, (1,) * 3, _centred(0, shape))
         return (target_mass / centre)[where]
     whole, smaller, corner, edge, face = _shell_sums(mass_prefix, half)
     del whole
@@ -344,8 +349,58 @@ def _cube_parts(plane: torch.Tensor, half: int):
         else _prefix(plane)
     )
     if half == 0:
-        whole = _windowed(prefix, (0,) * 3, (1,) * 3, 0)
+        whole = _windowed(
+            prefix, (0,) * 3, (1,) * 3, _centred(0, [n - 1 for n in prefix.shape])
+        )
         zero = torch.zeros_like(whole)
         return zero, zero, zero, whole
     _, interior, corner, edge, face = _shell_sums(prefix, half)
     return corner, edge, face, interior
+
+
+def averaged_matrices(
+    cubes: Cubes,
+    matrices: torch.Tensor,
+    mass: torch.Tensor,
+    mask: torch.Tensor,
+) -> torch.Tensor:
+    """Average a body's SAR matrices over every cube.
+
+    Each cube holds the target mass, so its matrix is the spatial-average SAR
+    matrix of that volume: ``v^H Q v`` is what the standard averages for a
+    drive, and the largest over the cubes is its peak.
+
+    Parameters
+    ----------
+    cubes
+        From :func:`centred_cubes`.
+    matrices
+        Shape ``(n_voxels, n_channels, n_channels)``, as
+        :func:`mariepy.sar.local_matrices` gives them, over the voxels ``mask``
+        selects.
+    mass
+        Each voxel's mass in kilograms, shape ``(n1, n2, n3)``.
+    mask
+        Which voxels the matrices cover, the same shape.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(n_cubes, n_channels, n_channels)``, complex, Hermitian.
+    """
+    channels = matrices.shape[-1]
+    flat = mask.reshape(-1)
+    out = torch.empty(
+        (len(cubes), channels, channels),
+        dtype=matrices.dtype,
+        device=matrices.device,
+    )
+    for row in range(channels):
+        grid = torch.zeros(
+            (channels, mass.numel()), dtype=matrices.dtype, device=matrices.device
+        )
+        grid[:, flat] = matrices[:, row, :].transpose(0, 1)
+        out[:, row, :] = averaged(
+            cubes, grid.reshape(channels, *mass.shape), mass
+        ).transpose(0, 1)
+    return 0.5 * (out + out.conj().transpose(-2, -1))
