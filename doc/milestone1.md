@@ -62,7 +62,7 @@ src/mariepy/
     sie.py                  coil EFIE matrix, lumped loads, port excitation
     pfft.py                 extended grid, projection, precorrection
     system.py               the coupled operator
-    preconditioner.py       coil LU block, body diagonal block
+    preconditioner.py       the coupled system's body block
     gmres.py                restarted GMRES with a split preconditioner
     network.py              Y, Z and S at the ports
     fields.py               E and H on the body grid
@@ -146,9 +146,9 @@ quietly turned later.
 These kernels divide by the wavenumber, which therefore may not be zero.
 
 **Stage 2 — body solver and the Mie test.**
-`body.py`, `vie.py`, `gmres.py`, `preconditioner.py`, and the incident-field and
-body-only solve paths. A homogeneous dielectric sphere and then a two-layer
-sphere are built in code, illuminated by a plane wave, and solved. The relative
+`body.py`, `vie.py`, `gmres.py`, and the incident-field and body-only solve
+paths. A homogeneous dielectric sphere and then a two-layer sphere are built in
+code, illuminated by a plane wave, and solved. The relative
 L2 error of E inside the sphere against the analytic Mie series must fall
 monotonically over three voxel sizes and, on the coarsest, stay at or below the
 value that first converged run records as a test constant with its grid. The
@@ -157,9 +157,12 @@ compressed body operator is checked against the uncompressed kernel on a small
 grid, applied to random currents, within `tol_HOSVD`.
 
 This stage carries the whole numerical core: the N and K kernels, the Tucker
-compression, the FFT product, the diagonal body preconditioner and GMRES. The
-Mie comparison is the only place in milestone 1 where an absolute answer is
-known, so nothing downstream is trusted until it passes.
+compression, the FFT product and GMRES. The body operator is scaled by its own
+Galerkin mass term, which leaves the identity plus a compact term, so GMRES runs
+on it unpreconditioned; `preconditioner.py` conditions the coupled system, where
+that mass term stands in the matrix. The Mie comparison is the only place in
+milestone 1 where an absolute answer is known, so nothing downstream is trusted
+until it passes.
 
 **Stage 3 — coil matrix.**
 `mesh.py`, `coil.py`, `sie.py`, `network.py`. The GMSH reader and the RWG

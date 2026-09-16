@@ -22,7 +22,6 @@ from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
 from mariepy.fields import Fields
 from mariepy.gmres import Solution, gmres
-from mariepy.preconditioner import body_diagonal
 from mariepy.system import CoupledOperator, ShieldedOperator
 from mariepy.tucker import circulant_tucker
 from mariepy.wire import CombinedCoil, WireCoil
@@ -206,7 +205,7 @@ def solve_body(
     incident
         The incident electric field in the operator's basis.
     tol
-        Target for the preconditioned relative residual.
+        Target for the relative residual.
     restart, maxit
         Passed to :func:`mariepy.gmres.gmres`.
 
@@ -215,11 +214,9 @@ def solve_body(
     mariepy.gmres.Solution
         The solved current and the residual history.
     """
-    diagonal = body_diagonal(operator.body, operator.medium, linear=operator.linear)
     return gmres(
         operator,
         operator.right_hand_side(incident),
-        preconditioner=lambda vector: diagonal * vector,
         tol=tol,
         restart=restart,
         maxit=maxit,
