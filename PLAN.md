@@ -99,6 +99,19 @@ milestones, each building on the previous one:
 Milestone 1 ends with each port's body currents, fields and network parameters.
 From milestone 3 onward, co-simulation forms the channel drive inside mariepy.
 
+**Order.** The four milestones run in order, and the SAR milestone follows them:
+Q matrices, averaging, compression and head models, described under **SAR
+milestone** below.
+
+**Co-simulation source.** MARIE ships its co-simulation twice:
+`src_physics/src_electronics/co_simulation/` and a copy under
+`src_physics/src_electronics/src_electronics/`. The two share every function
+name; the nested copy moves the cost functions onto two shared helpers,
+`match_optim.m` and `preamplifier_match_optim.m`, and in `match.m` adds each
+matching stage only to the ports whose network carries it, where the top-level
+copy adds it to every port. The two agree when every port has the same matching
+topology. Milestone 3 ports the nested copy alone.
+
 **Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
 package's single `_ext` module, following the package template and pypulseqpp.
 
@@ -223,6 +236,10 @@ they were measured on.
 
 - Co-simulation reproduces closed-form results for simple lumped networks: a
   series RLC, and an L-section matching a known load.
+- The loaded port matrix and the fields at the matching network's input agree
+  with CoSimPy's `RF_Coil` connections for the same element values. CoSimPy
+  evaluates a given circuit in S-parameters and cannot tune one, so it checks
+  the ported circuit algebra rather than replacing it.
 - On a coil, the tuned and matched reflection at the Larmor frequency meets the
   target set in the coil's element file.
 
@@ -239,6 +256,8 @@ they were measured on.
   random drives.
 - For random drives, the largest VOP SAR is at least the largest averaged voxel
   SAR and at most that plus the compression margin.
+- On fields of rank three or less, the compression reproduces CoSimPy's
+  `compVOP` output, conjugated.
 - Each body's global matrix reproduces the head-average SAR integrated directly
   from the fields.
 
@@ -280,6 +299,9 @@ What this leaves uncovered is recorded rather than implied away:
   files live under `tests/`, never under `src/`, so nothing in them reaches the
   wheel or links into `_ext`. The 24 coupling sources in `tests/marie/` are the
   first of them.
+- **CoSimPy** (MIT, <https://github.com/umbertozanovello/CoSimPy>) enters with
+  the VOP compression stage, as the source of the compression core and as a
+  test dependency, and is listed in `THIRD_PARTY.md` then.
 - **MARIE's LGPL files** stay outside the MIT code:
   - the DIRECTFN singular integrals, built as a separate extension module with
     their notice;
@@ -316,7 +338,8 @@ What this leaves uncovered is recorded rather than implied away:
 - **Other dependencies.** numpy is used for file input and output only, where VOP
   files are `.npz`. scipy is a test and optional dependency: special functions
   for the Mie reference, reading MARIE's MATLAB body files, and the global
-  optimiser for co-simulation from milestone 3. No numba, no CuPy.
+  optimiser for co-simulation from milestone 3. cosimpy is a test dependency
+  from the VOP compression stage. No numba, no CuPy.
 - **C++ kernels.** Work over voxels, mesh elements or quadrature points that
   torch cannot batch runs in C++ in the pybind11 extension, on CPU buffers, and
   its result moves to the caller's device. Work that torch can batch stays in
@@ -339,10 +362,10 @@ What this leaves uncovered is recorded rather than implied away:
 - Build, lint and test commands are those in `AGENTS.md`, and a change is
   reported complete only with their output.
 
-## Later stages
+## SAR milestone
 
-These stages follow the solver. They are here so the solver's interfaces serve
-them; the first task is milestone 1.
+This milestone follows milestone 4, as the **Order** paragraph of the MARIE port
+section says. It is described here so the solver's interfaces serve it.
 
 **Head models.**
 
@@ -383,8 +406,16 @@ them; the first task is milestone 1.
 - **Pool.** The averaged matrices of all body models, compressed together, so the
   VOPs bound local SAR across the population.
 - **Algorithm.** Eichfelder and Gebhardt (MRM 2011, doi 10.1002/mrm.22927),
-  written from the paper. The open implementations found are copyleft or
-  unlicensed, so none is used.
+  ported from CoSimPy's `EM_Field.compVOP` (MIT). `compVOP` builds each point's
+  matrix from one field, so it holds rank three at most and cannot take the
+  pooled averaged matrices, and its compression steps are nested inside it. The
+  port is a function of a stack of Hermitian matrices.
+- **Convention.** `compVOP` returns the complex conjugates of the matrices that
+  bound `vᴴQv` in the convention of the output contract, which CoSimPy's own
+  `compQMatrix` follows. The port writes that convention, and the check against
+  `compVOP` conjugates its output; conjugating the output and conjugating the
+  input field give the same matrices, since the algorithm uses only eigenvalues
+  and their order.
 - **Margin.** The compression margin is a parameter recorded in the VOP file.
 
 **Head-average matrices.** One per body model, integrated over that model's head
