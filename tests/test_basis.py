@@ -16,6 +16,20 @@ from mariepy.solver import BodyOperator, solve_body
 ORDERS = {"far_order": 2, "medium_order": 2, "near_order": 4}
 TOLERANCE = 1e-9
 
+# A driven shield's own port is the one configuration here whose reduced model
+# does not reach the solver tolerance. The other two reduced-against-dense
+# checks agree to 4e-12; this one agrees to between 2e-9 and 2e-7, and which end
+# of that it lands on is decided by the interpolation points DEIM picks. Those
+# come from singular vectors that a near-degenerate spectrum leaves free to
+# rotate, so a different BLAS picks differently: perturbing the coupling by
+# 1e-14, which is nothing physical, moves the picked count between 30 and 33 and
+# the agreement over two orders of magnitude, with 8 of 24 draws above 1e-7.
+# The basis is rank-saturated -- tightening its tolerance from 1e-12 to 1e-14
+# keeps no further vectors -- so this is the accuracy the rank allows, not a
+# tolerance that can be tightened. The bound is on the spread, not on one draw
+# of it.
+DRIVEN_SHIELD_AGREEMENT = 1e-6
+
 
 def _case():
     medium = Medium(3.0)
@@ -212,7 +226,7 @@ def test_a_driven_shield_s_port_leads_the_reduced_ports():
     dense = _dense_from(tested, whole, drive, body, medium, False)
     assert reduced.admittance.shape == (3, 3)
     error = (reduced.admittance - dense).abs().max()
-    assert float(error / dense.abs().max()) <= 1e-7
+    assert float(error / dense.abs().max()) <= DRIVEN_SHIELD_AGREEMENT
 
 
 def test_the_basis_fields_are_the_body_s_own_total_fields(solved):
