@@ -25,6 +25,7 @@ __all__ = [
     "circulant_tucker",
     "hosvd",
     "mode_product",
+    "pair_parity",
     "to_full",
 ]
 
@@ -180,15 +181,41 @@ def _truncation_rank(singular_values: torch.Tensor, tol: float | None) -> int:
     return int(indices[0].item()) + 1
 
 
-def circulant_tucker(
-    kernel: torch.Tensor, tol: float | None = None
-) -> tuple[CirculantSymbol, ...]:
+def pair_parity(test: int, source: int) -> tuple[int, int, int]:
+    """Return the parity of a pair of linear basis functions under reflection.
+
+    Ported as a rule from the ``bt_n`` tables of MARIE's
+    ``assembly_fft_circ_tucker_pwl.m``: reflecting the offset along an axis
+    flips the sign of every basis function linear in that axis, so a pair
+    changes sign once for each of its two functions that is.
+
+    Parameters
+    ----------
+    test, source
+        Scalar basis functions: 0 for the constant, 1 to 3 for x, y, z.
+
+    Returns
+    -------
+    tuple of int
+        The sign along each of the three axes.
+    """
+    return tuple(
+        (-1) ** ((test == axis + 1) + (source == axis + 1)) for axis in range(3)
+    )
+
+
+def circulant_tucker(kernel: torch.Tensor, tol: float | None = None):
     """Embed each component of a Toeplitz kernel in a circulant and compress it.
+
+    Ported from MARIE's ``assembly_fft_circ_tucker_pwc.m`` and
+    ``assembly_fft_circ_tucker_pwl.m``.
 
     Parameters
     ----------
     kernel
-        Shape ``(n1, n2, n3, n_components)``, holding the kernel at
+        Shape ``(n1, n2, n3, n_components)`` for the constant basis, or
+        ``(n1, n2, n3, 10, n_components)`` for the linear basis with one entry
+        per pair of :data:`mariepy.vie.PAIRS`, holding the kernel at
         non-negative offsets. ``n_components`` is 6 for a symmetric dyadic
         operator, in the order xx, xy, xz, yy, yz, zz, or 3 for a vector
         operator, in the order x, y, z; the parity of each component under
@@ -198,18 +225,34 @@ def circulant_tucker(
 
     Returns
     -------
-    tuple of CirculantSymbol
-        One entry per component.
+    tuple
+        One :class:`CirculantSymbol` per component, or for the linear basis one
+        such tuple per pair.
 
     Raises
     ------
     ValueError
-        ``kernel`` is not fourth order, or carries a component count with no
-        parity assignment.
+        ``kernel`` has neither four nor five axes, or carries a component count
+        with no parity assignment.
     """
-    if kernel.ndim != 4:
-        raise ValueError(f"the kernel needs four axes, got {kernel.ndim}")
+    if kernel.ndim == 5:
+        from mariepy.vie import PAIRS
 
+        if kernel.shape[3] != len(PAIRS):
+            raise ValueError(
+                f"a linear kernel carries {len(PAIRS)} pairs, got {kernel.shape[3]}"
+            )
+        return tuple(
+            _circulant_tucker(kernel[..., index, :], tol, pair_parity(*pair))
+            for index, pair in enumerate(PAIRS)
+        )
+    if kernel.ndim != 4:
+        raise ValueError(f"the kernel needs four or five axes, got {kernel.ndim}")
+    return _circulant_tucker(kernel, tol, (1, 1, 1))
+
+
+def _circulant_tucker(kernel, tol, pair_sign):
+    """Compress every component of a four-axis kernel under one pair parity."""
     n_components = kernel.shape[3]
     if n_components == 6:
         parity = _PARITY_XX_TO_ZZ
@@ -225,7 +268,7 @@ def circulant_tucker(
     for component in range(n_components):
         core, *factors = hosvd(kernel[..., component], tol)
         transformed = tuple(
-            _circulant_extension(factor, parity[axis][component])
+            _circulant_extension(factor, parity[axis][component] * pair_sign[axis])
             for axis, factor in enumerate(factors)
         )
         symbols.append(CirculantSymbol(core=core, factors=transformed))

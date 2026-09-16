@@ -29,24 +29,41 @@ FIELD_STRENGTH = 3.0
 # refinement study records these; they are not guaranteed across releases.
 COARSEST_RESOLUTION = 0.02
 COARSEST_INTERIOR_ERROR = 0.025
+COARSEST_LINEAR_INTERIOR_ERROR = 0.022
 INTERIOR_FRACTION = 0.6
 
 
-def _solve(radius, resolution, permittivity, conductivity=0.0, device=None):
+def _solve(
+    radius, resolution, permittivity, conductivity=0.0, device=None, linear=False
+):
     medium = Medium(FIELD_STRENGTH)
     body = VoxelBody.sphere(
         radius, resolution, permittivity, conductivity, padding=0, device=device
     )
     operator = BodyOperator.build(
-        body, medium, tol=1e-10, far_order=4, medium_order=6, near_order=6
+        body,
+        medium,
+        tol=1e-10,
+        far_order=4,
+        medium_order=6,
+        near_order=6,
+        linear=linear,
     )
-    incident = plane_wave(body, medium)
-    solution = solve_body(operator, incident, tol=1e-10)
-    return body, medium, incident, solution, operator.total_field(solution.x, incident)
+    incident = plane_wave(body, medium, linear=linear)
+    solution = solve_body(operator, incident, tol=1e-10, maxit=400)
+    total = operator.total_field(solution.x, incident)
+    if linear:
+        # The linear functions vanish at the centre, so the constant term is
+        # the field there.
+        incident = incident.reshape(3, 4, *body.shape)[:, 0]
+        total = total.reshape(3, 4, *body.shape)[:, 0]
+    return body, medium, incident, solution, total
 
 
-def _interior_error(radius, resolution, permittivity, fraction=INTERIOR_FRACTION):
-    body, medium, _, _, total = _solve(radius, resolution, permittivity)
+def _interior_error(
+    radius, resolution, permittivity, fraction=INTERIOR_FRACTION, linear=False
+):
+    body, medium, _, _, total = _solve(radius, resolution, permittivity, linear=linear)
     coordinates = body.coordinates()
     points = torch.stack(
         [coordinates[axis][body.mask] for axis in range(3)], dim=1
@@ -152,9 +169,11 @@ def test_the_interior_field_converges_to_the_mie_series_as_the_grid_is_refined()
     )
 
 
-def _quasi_static_error(radius, resolution, permittivity):
+def _quasi_static_error(radius, resolution, permittivity, linear=False):
     """Return how far the internal field is from ``3 / (eps_r + 2)``."""
-    body, _, incident, _, total = _solve(radius, resolution, permittivity)
+    body, _, incident, _, total = _solve(
+        radius, resolution, permittivity, linear=linear
+    )
     deep = body.mask & (
         torch.linalg.vector_norm(body.coordinates(), dim=0) < 0.5 * radius
     )
@@ -178,3 +197,35 @@ def test_a_high_contrast_sphere_converges_only_as_its_staircase_is_resolved():
         f"the staircase error did not fall: {[f'{e:.4f}' for e in errors]}"
     )
     assert errors[-1] < 0.2
+
+
+def test_the_linear_basis_matches_the_mie_series_closer_than_the_constant_one():
+    """Measured on the grid named in this module, not guaranteed elsewhere."""
+    linear = _interior_error(RADIUS, COARSEST_RESOLUTION, 2.0, linear=True)
+    constant = _interior_error(RADIUS, COARSEST_RESOLUTION, 2.0)
+    assert linear <= COARSEST_LINEAR_INTERIOR_ERROR, (
+        f"linear interior error {linear:.4f} at resolution {COARSEST_RESOLUTION}"
+    )
+    assert linear < constant, f"linear {linear:.4f}, constant {constant:.4f}"
+
+
+@pytest.mark.slow
+def test_the_linear_basis_converges_to_the_mie_series_as_the_grid_is_refined():
+    errors = [
+        _interior_error(RADIUS, res, 2.0, linear=True) for res in (0.02, 0.0125, 0.01)
+    ]
+    assert all(later < earlier for earlier, later in itertools.pairwise(errors)), (
+        f"linear interior errors did not fall: {[f'{e:.4f}' for e in errors]}"
+    )
+
+
+@pytest.mark.slow
+def test_at_brain_like_contrast_the_linear_basis_cuts_the_staircase_error():
+    """The linear basis carries the jump across the boundary that the constant cannot.
+
+    On the grid named here its error is half the constant basis's; the bound
+    leaves room for the quasi-static reference's own error at this size.
+    """
+    linear = _quasi_static_error(0.02, 0.004, 52.0, linear=True)
+    constant = _quasi_static_error(0.02, 0.004, 52.0)
+    assert linear < 0.6 * constant, f"linear {linear:.4f}, constant {constant:.4f}"
