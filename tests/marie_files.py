@@ -51,3 +51,27 @@ def write_gmsh22(path, mesh):
     text += [f"{i + 1} {record}" for i, record in enumerate(records)]
     text += ["$EndElements", ""]
     path.write_text("\n".join(text))
+
+
+def write_wire_gmsh22(path, *, n_segments, port_nodes, radius=0.05):
+    """Write one closed circular wire loop as GMSH 2.2, as MARIE's wire files are laid out.
+
+    Point elements come first, one per port node, then the segments in order;
+    nodes are numbered from one along the loop and no element carries a tag.
+    """
+    angle = 2 * np.pi * np.arange(n_segments) / n_segments
+    records = ["$MeshFormat", "2.2 0 8", "$EndMeshFormat", "$Nodes", str(n_segments)]
+    records += [
+        f"{k + 1} {float(radius * np.cos(a))!r} {float(radius * np.sin(a))!r} 0.0"
+        for k, a in enumerate(angle)
+    ]
+    records += ["$EndNodes", "$Elements", str(len(port_nodes) + n_segments)]
+    number = 0
+    for node in port_nodes:
+        number += 1
+        records.append(f"{number} 15 0 {node + 1}")
+    for k in range(n_segments):
+        number += 1
+        records.append(f"{number} 1 0 {k + 1} {(k + 1) % n_segments + 1}")
+    records.append("$EndElements")
+    path.write_text("\n".join(records) + "\n")

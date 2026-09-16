@@ -5,12 +5,14 @@ import json
 import numpy as np
 import pytest
 
+from mariepy import cosim
 from mariepy.constants import Medium
 from mariepy.inputs import read_case
 from mariepy.mesh import SurfaceMesh
 from mariepy.solver import solve
+from mariepy.wire import CombinedCoil, WireCoil
 
-from .marie_files import write_gmsh22, write_marie_body
+from .marie_files import write_gmsh22, write_marie_body, write_wire_gmsh22
 
 ELEMENTS = {
     "coil_configuration": {
@@ -82,6 +84,9 @@ def test_a_marie_simulation_file_gives_the_body_the_coil_and_the_frequency_it_na
     assert case.body.resolution == pytest.approx(0.01)
     assert case.coil.n_driven == 1
     assert case.coil.ports[0].dofs.numel() > 0
+    assert [t.number for t in case.network.terminals] == [1]
+    assert case.network.roles == {"Tx"}
+    assert not case.network.tmd
 
 
 def test_a_case_read_from_marie_files_solves(tmp_path):
@@ -93,6 +98,15 @@ def test_a_case_read_from_marie_files_solves(tmp_path):
     assert all(residual <= 1e-5 for residual in result.ports.residual)
     assert float(result.impedance[0, 0].real) > 0.0
 
+    closed = cosim.co_simulate(
+        case.network, result.admittance, case.medium.angular_frequency
+    )
+    assert closed.values == ((1e-12,),)
+    voltage = closed.transmit[:, 0]
+    taken = 0.5 * float((voltage.conj() @ result.admittance.cpu() @ voltage).real)
+    accepted = 0.5 * (1 - abs(complex(closed.scattering[0, 0])) ** 2)
+    assert taken <= accepted * (1 + 1e-9)
+
 
 def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
     path = _data(tmp_path)
@@ -101,25 +115,51 @@ def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
     assert read_case(moved, data=tmp_path / "data").body.n_voxels == 1
 
 
-@pytest.mark.parametrize(
-    ("changes", "milestone"),
-    [
-        ({"ShieldFile": "shield.msh"}, "milestone 2"),
-        ({"WireFile": "wire.msh"}, "milestone 3"),
-        ({"CoilFile": "", "BasisFile": "basis.mat"}, "milestone 4"),
-    ],
-    ids=["shield", "wire coil", "field basis only"],
-)
-def test_a_simulation_file_milestone_1_does_not_cover_is_refused_by_name(
-    tmp_path, changes, milestone
-):
-    with pytest.raises(NotImplementedError, match=milestone):
-        read_case(_data(tmp_path, **changes))
+def test_a_simulation_file_asking_only_for_a_field_basis_is_refused(tmp_path):
+    with pytest.raises(NotImplementedError, match="basis file"):
+        read_case(_data(tmp_path, CoilFile="", BasisFile="basis.mat"))
+
+
+def test_a_basis_support_the_simulation_file_names_is_read(tmp_path):
+    path = _data(tmp_path, SurfaceBasisSupportFile="Loop/support.msh")
+    supports = path.parent.parent / "coils" / "basis_files" / "Loop"
+    supports.mkdir(parents=True)
+    mesh = SurfaceMesh.loop(radius=0.08, width=0.02, n_around=8, n_across=2)
+    write_gmsh22(supports / "support.msh", mesh)
+    case = read_case(path)
+    assert case.basis_support.n_dof > 0
+    assert case.basis_support.n_driven == 0
 
 
 def test_a_simulation_file_that_names_no_coil_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="names no surface coil"):
+    with pytest.raises(ValueError, match="names no coil"):
         read_case(_data(tmp_path, CoilFile=""))
+
+
+def test_a_wire_coil_the_simulation_file_names_is_read_with_its_ports(tmp_path):
+    path = _data(tmp_path, CoilFile="", WireFile="Loop/wire.msh")
+    wires = path.parent.parent / "coils" / "wire_files" / "Loop"
+    wires.mkdir(parents=True)
+    write_wire_gmsh22(wires / "wire.msh", n_segments=12, port_nodes=[0])
+    (wires / "wire.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert isinstance(case.coil, WireCoil)
+    assert case.coil.n_dof == 12
+    assert case.coil.ports[0].dofs.tolist() == [0, 1]
+    assert case.network.roles == {"Tx"}
+
+
+def test_a_wire_coil_and_a_surface_coil_are_read_together_wire_first(tmp_path):
+    path = _data(tmp_path, WireFile="Loop/wire.msh")
+    wires = path.parent.parent / "coils" / "wire_files" / "Loop"
+    wires.mkdir(parents=True)
+    write_wire_gmsh22(wires / "wire.msh", n_segments=12, port_nodes=[0])
+    (wires / "wire.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert isinstance(case.coil, CombinedCoil)
+    assert case.coil.n_driven == 2
+    assert [t.number for t in case.network.terminals] == [1, 2]
+    assert case.network.terminals[1].entities == (2,)
 
 
 @pytest.mark.parametrize(("basis", "linear"), [(0, False), (1, True)])
@@ -130,3 +170,18 @@ def test_the_simulation_file_names_the_body_basis(tmp_path, basis, linear):
 def test_a_body_basis_marie_does_not_know_is_refused(tmp_path):
     with pytest.raises(ValueError, match="body basis 2"):
         read_case(_data(tmp_path, Basis_Functions_VIE=2))
+
+
+def test_a_shield_the_simulation_file_names_is_read_with_its_basis(tmp_path):
+    path = _data(tmp_path, ShieldFile="Sphere/shield.msh")
+    folder = tmp_path / "data" / "coils" / "shield_files" / "Sphere"
+    folder.mkdir(parents=True)
+    write_gmsh22(folder / "shield.msh", SurfaceMesh.sphere(radius=0.08, subdivisions=1))
+    case = read_case(path)
+    assert case.shield is not None
+    assert case.shield.n_dof == 120
+    assert case.shield.n_driven == 0
+
+
+def test_a_simulation_file_without_a_shield_reads_none(tmp_path):
+    assert read_case(_data(tmp_path)).shield is None

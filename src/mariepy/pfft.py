@@ -1,11 +1,15 @@
-"""Precorrected FFT coupling between a surface coil and a voxel body.
+"""Precorrected FFT coupling between a coil and a voxel body.
 
 Ported from MARIE 3.0's ``src_integral_equations/src_wsvie/src_pfft``:
 ``src_svie_pfft/pfft_surface_domain.m``,
 ``pfft_proj_surface_create_near_lists.m``,
 ``pfft_projection_surface_assembly.m``, ``pfft_surface_assemble_direct_bc.m``,
 ``src_pfft_coil/pfft_assemble_voxel_bc.m``, ``pfft_assemble_voxel_cc.m`` and
-the supporting files under ``src_pfft_supporting``.
+the supporting files under ``src_pfft_supporting``; for a wire coil, from
+``src_wvie_pfft/pfft_wire_domain.m``, ``pfft_proj_wire_create_near_lists.m``,
+``pfft_projection_wire_assembly.m`` and ``pfft_wire_assemble_direct_bc.m``,
+which differ from the surface files only in where a basis function sits, how
+wide it is and which kernel gives its field.
 
 The coil and the body are never coupled by a dense matrix. Every coil basis
 function is replaced by cell currents on a three-by-three-by-three block of an
@@ -26,6 +30,7 @@ from dataclasses import dataclass
 import torch
 
 from mariepy import coupling, vie
+from mariepy import wire as wire_module
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
@@ -52,6 +57,96 @@ __all__ = [
 # ``pfft_surface_domain.m``; the code below carries it as a parameter but the
 # collocation sphere and the near distance are both sized from it.
 EXPANSION = 3
+
+Coil = SurfaceCoil | wire_module.WireCoil | wire_module.CombinedCoil
+
+
+def _nodes(coil: Coil) -> torch.Tensor:
+    """Every point the coil reaches."""
+    if isinstance(coil, wire_module.CombinedCoil):
+        return torch.cat([_nodes(coil.wire), _nodes(coil.surface)])
+    if isinstance(coil, wire_module.WireCoil):
+        return coil.points()
+    return coil.mesh.nodes
+
+
+def _anchors(coil: Coil) -> torch.Tensor:
+    """Where each basis function sits: its edge's midpoint, or its wire node."""
+    if isinstance(coil, wire_module.CombinedCoil):
+        return torch.cat([_anchors(coil.wire), _anchors(coil.surface)])
+    if isinstance(coil, wire_module.WireCoil):
+        return coil.centre
+    nodes = coil.mesh.nodes
+    edges = coil.edges[coil.edge_of_dof]
+    return 0.5 * (nodes[edges[:, 0]] + nodes[edges[:, 1]])
+
+
+def _width_in_cells(coil: Coil, resolution: float) -> int:
+    """Return the basis functions' mean width in cells, as MARIE sizes the near cube.
+
+    A surface basis function is as wide as its widest triangle edge
+    (``pfft_surface_domain.m``); a wire one as its rising segment, rounded up
+    before the mean (``pfft_wire_domain.m``); for both together, the wider of
+    the two (``pfft_wire_surface_domain.m``).
+    """
+    if isinstance(coil, wire_module.CombinedCoil):
+        return max(
+            _width_in_cells(coil.wire, resolution),
+            _width_in_cells(coil.surface, resolution),
+        )
+    if isinstance(coil, wire_module.WireCoil):
+        return math.ceil(float(torch.ceil(coil.left_lengths() / resolution).mean()))
+    lengths = coil.mesh.edge_lengths()
+    carried = coil.dof_of_triangle() >= 0
+    widest = torch.zeros(coil.n_dof, dtype=lengths.dtype, device=lengths.device)
+    triangle, local = torch.nonzero(carried, as_tuple=True)
+    widest.scatter_reduce_(
+        0,
+        coil.dof_of_triangle()[triangle, local],
+        lengths[triangle].max(dim=1).values,
+        reduce="amax",
+    )
+    return math.ceil(float((widest / resolution).mean()))
+
+
+def _field(
+    coil: Coil,
+    dofs: torch.Tensor,
+    points: torch.Tensor,
+    medium: Medium,
+    *,
+    magnetic: bool,
+    order: int,
+    **arguments,
+) -> torch.Tensor:
+    """Return the field each named basis function puts on its observer."""
+    if isinstance(coil, wire_module.CombinedCoil):
+        n_wire = coil.wire.n_dof
+        on_wire = dofs < n_wire
+        out = torch.zeros(
+            (dofs.numel(), 3), dtype=torch.complex128, device=points.device
+        )
+        for part, chosen, shift in (
+            (coil.wire, on_wire, 0),
+            (coil.surface, ~on_wire, n_wire),
+        ):
+            if bool(chosen.any()):
+                out[chosen] = _field(
+                    part,
+                    dofs[chosen] - shift,
+                    points[chosen],
+                    medium,
+                    magnetic=magnetic,
+                    order=order,
+                    **arguments,
+                )
+        return out
+    if isinstance(coil, wire_module.WireCoil):
+        kernel = wire_module.coupling_k if magnetic else wire_module.coupling_n
+        return kernel(coil, dofs, points, medium, order=order, **arguments)
+    kernel = coupling.coupling_k if magnetic else coupling.coupling_n
+    corners = coil.rwg_vertices()
+    return kernel(corners[dofs], points, medium, triangle_order=order, **arguments)
 
 
 @dataclass(frozen=True)
@@ -198,7 +293,7 @@ class Coupling:
 
 
 def extended_domain(
-    body: VoxelBody, coil: SurfaceCoil, *, expansion: int = EXPANSION
+    body: VoxelBody, coil: Coil, *, expansion: int = EXPANSION
 ) -> ExtendedGrid:
     """Grow the body grid until it holds every basis function's expansion block.
 
@@ -217,7 +312,7 @@ def extended_domain(
         The grown grid, with the body's mask placed inside it.
     """
     half = (expansion - 1) // 2
-    nodes = coil.mesh.nodes
+    nodes = _nodes(coil)
     origin = torch.tensor(body.origin, dtype=torch.float64, device=nodes.device)
     reach = (nodes - origin) / body.resolution
 
@@ -249,7 +344,7 @@ def extended_domain(
 
 def near_lists(
     grid: ExtendedGrid,
-    coil: SurfaceCoil,
+    coil: Coil,
     *,
     expansion: int = EXPANSION,
     distance: int | None = None,
@@ -279,9 +374,8 @@ def near_lists(
     ValueError
         If a basis function's expansion block would leave the grid.
     """
-    nodes = coil.mesh.nodes
-    edges = coil.edges[coil.edge_of_dof]
-    centre_point = 0.5 * (nodes[edges[:, 0]] + nodes[edges[:, 1]])
+    centre_point = _anchors(coil)
+    nodes = centre_point
     origin = torch.tensor(grid.origin, dtype=torch.float64, device=nodes.device)
     centre = torch.round((centre_point - origin) / grid.resolution).to(torch.int64)
 
@@ -294,20 +388,10 @@ def near_lists(
     if bool((expansion_index < 0).any()) or bool((expansion_index >= limits).any()):
         raise ValueError("a basis function's expansion block leaves the extended grid")
 
-    lengths = coil.mesh.edge_lengths()
-    carried = coil.dof_of_triangle() >= 0
-    widest = torch.zeros(coil.n_dof, dtype=lengths.dtype, device=nodes.device)
-    triangle, local = torch.nonzero(carried, as_tuple=True)
-    widest.scatter_reduce_(
-        0,
-        coil.dof_of_triangle()[triangle, local],
-        lengths[triangle].max(dim=1).values,
-        reduce="amax",
-    )
     if distance is None:
-        by_triangle = math.ceil(float((widest / grid.resolution).mean()))
+        by_basis = _width_in_cells(coil, grid.resolution)
         by_cell = expansion + expansion // 2
-        distance = math.ceil(1.6 * max(by_cell, by_triangle))
+        distance = math.ceil(1.6 * max(by_cell, by_basis))
     span = 2 * distance + 2 * (expansion // 2) + expansion % 2
     return NearLists(
         centre=centre, expansion=expansion_index, span=span, distance=distance
@@ -316,7 +400,7 @@ def near_lists(
 
 def projection(
     grid: ExtendedGrid,
-    coil: SurfaceCoil,
+    coil: Coil,
     medium: Medium,
     near: NearLists,
     *,
@@ -341,7 +425,8 @@ def projection(
     near
         Where each basis function sits.
     triangle_order
-        Degree of the Dunavant rule on each triangle.
+        Degree of the Dunavant rule on each triangle, or Gauss points per
+        segment of a wire.
     cell_order
         Points per axis of the Gauss rule over each cell.
     linear
@@ -369,15 +454,16 @@ def projection(
         n_basis=n_basis,
     )
 
-    corners = coil.rwg_vertices()
     centres = grid.centres(near.centre)
     points = centres[:, None, :] + collocation[None, :, :]
     n_dof, n_points = coil.n_dof, collocation.shape[0]
-    field = coupling.coupling_n(
-        corners.repeat_interleave(n_points, dim=0),
+    field = _field(
+        coil,
+        torch.arange(n_dof, device=device).repeat_interleave(n_points),
         points.reshape(-1, 3),
         medium,
-        triangle_order=triangle_order,
+        magnetic=False,
+        order=triangle_order,
     ).reshape(n_dof, n_points, 3)
 
     # The collocation sphere gives 78 equations for 81 cell currents, or 324
@@ -462,7 +548,7 @@ def scatter_matrix(grid: ExtendedGrid, n_components: int = 3) -> torch.Tensor:
 
 def direct_coupling(
     grid: ExtendedGrid,
-    coil: SurfaceCoil,
+    coil: Coil,
     medium: Medium,
     near: NearLists,
     *,
@@ -503,7 +589,6 @@ def direct_coupling(
     magnetic : torch.Tensor
         The same for the magnetic coupling.
     """
-    corners = coil.rwg_vertices()
     volume = grid.resolution**3
     body_dof = body_numbering(grid)
     n_voxels = int(grid.mask.sum())
@@ -511,21 +596,26 @@ def direct_coupling(
     n_components = 3 * len(terms)
     component = torch.arange(n_components, device=grid.device)
 
-    rows, columns, electric, magnetic = [], [], [], []
+    rows, columns, electric, magnetic_values = [], [], [], []
     for dof, cells in near_body_pairs(grid, near, chunk=chunk):
         points = grid.centres(unflatten(grid, cells))
         arguments = {
-            "triangle_order": triangle_order,
+            "order": triangle_order,
             "cell_size": grid.resolution,
             "cell_order": cell_order,
         }
-        for kernel, out in (
-            (coupling.coupling_n, electric),
-            (coupling.coupling_k, magnetic),
-        ):
+        for magnetic, out in ((False, electric), (True, magnetic_values)):
             stacked = torch.stack(
                 [
-                    kernel(corners[dof], points, medium, basis_term=term, **arguments)
+                    _field(
+                        coil,
+                        dof,
+                        points,
+                        medium,
+                        magnetic=magnetic,
+                        basis_term=term,
+                        **arguments,
+                    )
                     for term in terms
                 ],
                 dim=-1,
@@ -543,14 +633,14 @@ def direct_coupling(
             index, torch.cat(electric), shape, check_invariants=False
         ).coalesce(),
         torch.sparse_coo_tensor(
-            index, torch.cat(magnetic), shape, check_invariants=False
+            index, torch.cat(magnetic_values), shape, check_invariants=False
         ).coalesce(),
     )
 
 
 def projected_coupling(
     grid: ExtendedGrid,
-    coil: SurfaceCoil,
+    coil: Coil,
     medium: Medium,
     near: NearLists,
     weights: torch.Tensor,
@@ -620,7 +710,7 @@ def projected_coupling(
 
 
 def coil_precorrection(
-    coil: SurfaceCoil,
+    coil: Coil,
     impedance: torch.Tensor,
     near: NearLists,
     weights: torch.Tensor,
@@ -802,7 +892,7 @@ def expansion_response(
 
 def assemble(
     body: VoxelBody,
-    coil: SurfaceCoil,
+    coil: Coil,
     impedance: torch.Tensor,
     medium: Medium,
     *,

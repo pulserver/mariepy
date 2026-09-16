@@ -112,6 +112,115 @@ matching stage only to the ports whose network carries it, where the top-level
 copy adds it to every port. The two agree when every port has the same matching
 topology. Milestone 3 ports the nested copy alone.
 
+**Shields.** A shield is a surface with no port of its own. Its own matrix is
+the coil's, `sie.assemble`; its coupling to the coil is assembled whole, where
+MARIE compresses it by adaptive cross approximation, since a coil and its shield
+together carry few enough unknowns for the dense block; its coupling to the body
+is a tensor train per body unknown, built by the DMRG cross method ported into
+`tt.py`. The port makes two changes to TT-Toolbox as MARIE carries it:
+`maxvol2.m` never advances its iteration count, so its loop can run without
+end, and here it is bounded; `reort.m` compares squared entries without
+conjugating, which on complex data compares real parts, and here it compares
+squared moduli. A shield with driven ports is not supported.
+
+**Wire coils.** `wire.py` ports MARIE's wire coil: its geometry, its own
+matrix with the closed forms for a segment against itself, its lumped loads,
+its port drive and its coupling kernels. The precorrected FFT takes a wire coil
+as it takes a surface one, since the two differ only in where a basis function
+sits, how wide it is and which kernel gives its field. The port reads closed
+loops only: MARIE's open-wire branch of `ProcessLoops.m` assigns rows of
+mismatched size and cannot run. It departs from MARIE in two places:
+
+- MARIE's wire coupling sources sample the falling half of each basis function
+  with the rising ramp, so the current they couple to the body is not the one
+  the wire's own matrix solves for. The torch kernel gives the falling half its
+  falling ramp, and the oracle test compiles MARIE's sources with that one
+  change; a second test shows the sources as shipped differ.
+- A port or element on a loop's last segment spans that segment's two basis
+  functions, the last and the loop's first; MARIE takes the next basis
+  function by index, which there is the next loop's first.
+
+A wire coil goes with a surface coil or inside a shield through its
+interaction with a surface, assembled whole where MARIE compresses it by
+adaptive cross approximation. The port does not follow MARIE's row assembly
+(`assembly_wire_surf_ns_row.m`), which holds the triangle basis at one half on
+both segments and gives both segments' charge the same sign; it integrates the
+integrand both self-matrices share, with each basis as the self-matrices
+define it. A wire loop and a surface loop reproduce Neumann's mutual
+inductance.
+
+**Co-simulation.** `cosim.py` ports MARIE's tuning, matching, decoupling and
+preamplifier-decoupling searches and its calibrations, with the circuit
+numerics in `circuit.py`. MARIE's index masks become a table of rows read once
+from the element file. MARIE writes one master file per mix of port roles; the
+port writes the idea they share once. The transmit side is every port that
+transmits, with the receive-only ports detuned; the receive side is every port
+that receives, with the transmit-only ports detuned. With one role throughout
+nothing is detuned. The port departs from MARIE in these places:
+
+- `calibration_tune_match_decouple.m` uses `SPs` without defining it, and
+  MARIE's `Tx` search with optimisation stops there; the port defines it as
+  the preamplifier variant does, from the tuned admittance.
+- `toeplitz`, which the decoupling costs call, is not defined anywhere in
+  `marie-tools`; `circuit.toeplitz` builds the matrix it names.
+- `calibration_matching.m` rebuilds a lossless matching network from the
+  scattering parameters alone. Power conservation fixes that network only up
+  to a unitary, which on coupled ports can mix channels, and the map it gives
+  ends at the wave into the coil while the solver's currents are per volt. The
+  port computes the coil voltage per incident wave exactly, from each port's
+  chain of matching elements (`circuit.coil_voltage`). On one port the two
+  agree in magnitude.
+- The preamplifier terminations add `1/R` to every entry of the other ports'
+  admittance block, because MATLAB adds a scalar to a matrix entrywise; the
+  port adds it to the diagonal, one resistor per port.
+- `particleswarm` becomes scipy's differential evolution, with MARIE's swarm
+  size, iteration limit, restarts and bound narrowing. Each search's first
+  population holds the values the previous search handed it, so the joint
+  search cannot end worse than the per-entity ones.
+- Coupling-coefficient variables are numbered past every other variable,
+  where MARIE's numbering can collide with a symmetry-offset one.
+- Merging a wire coil's element file with a surface coil's, MARIE adds the
+  wire's element count to each mutual inductor's mutual inductance, where it
+  means the partner's number; the port moves the partner's number.
+- Where roles mix, MARIE's four cost and calibration copies differ in ways
+  the idea does not explain. The copy for all three roles detunes the
+  receive-only ports on its receive side, where it means the transmit-only
+  ones; the port detunes the other side's own ports throughout. The copy for
+  transmit-only with transmit-and-receive ports weighs no coupling, and the
+  port keeps that. MARIE adds a side's terms to the joint cost when that side's
+  own search found values; the port adds them when the side has ports.
+
+**Field bases and performance maps.** `basis.py` ports MARIE's basis and MRGF
+paths: the incident-field basis that a support surface, or a shell of voxel
+currents around the body, spans, its interpolation voxels, the body solved once per basis field, the ultimate intrinsic SNR and
+transmit efficiency, and a coil solved through the basis with its coupling
+integrated at the interpolation voxels only. `metrics.py` ports the SNR,
+transmit-efficiency and g-factor maps, and `plot.py` MARIE's figures, with
+matplotlib as an optional dependency. The port departs from MARIE in three
+places:
+
+- MARIE keeps the incident basis in tested form, the Gram matrix applied, and
+  solves the body with it as if it were a field. For the piecewise-constant
+  basis the Gram matrix is a scalar and the two agree; for the piecewise-linear
+  one the tested vectors do not span the fields a coil puts on the body. The
+  port keeps the basis in field coefficients and carries the Gram matrix where
+  the coupling needs it.
+- MARIE's noise covariance weighs the body by `integral sigma |E|^2`, twice the
+  power it dissipates, and the conductor and lumped elements by half that
+  scale and on the diagonal only. The port weighs all three alike, with their
+  channel-to-channel terms.
+- MARIE's randomised range finder (`rSVD_Q.m`) draws blocks until the
+  sample's spectrum drops below its tolerance, and on an operator whose
+  spectrum never does it never stops; the port stops once the sample has as
+  many columns as the operator has columns or rows.
+- MARIE's HDF5 basis files are not read; a basis is built here and saved with
+  `FieldBasis.save`.
+
+On a coarse body the ultimate SNR does not settle as basis fields are added:
+the discrete electric field under-resolves the high-order fields, which then
+look nearly noiseless. MARIE maps it over a logarithmic run of mode counts for
+that reason, and `ultimate_maps` takes the count.
+
 **Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
 package's single `_ext` module, following the package template and pypulseqpp.
 
@@ -124,8 +233,8 @@ package's single `_ext` module, following the package template and pypulseqpp.
   `tests/marie/`. The torch form is assembled from kernels the Mie series
   validated rather than transcribed, so the check between the two is a check
   between independent formulations.
-  The wire-coil sources are checked for the same structure when milestone 3
-  ports them.
+  The 24 wire-coil sources, kept in `tests/marie/wire/`, have the same
+  structure and are checked the same way against the torch wire kernel.
 - **Singular integrals.** The DIRECTFN sources (`direct_ws_*_rwg` for the coil,
   `solve_ea`, `solve_st`, `solve_va` and their headers for the body) carry an
   LGPL notice. They build as a separate extension module with that notice kept,
@@ -246,7 +355,10 @@ they were measured on.
 - The loaded port matrix and the fields at the matching network's input agree
   with CoSimPy's `RF_Coil` connections for the same element values. CoSimPy
   evaluates a given circuit in S-parameters and cannot tune one, so it checks
-  the ported circuit algebra rather than replacing it.
+  the ported circuit algebra rather than replacing it. The check runs when
+  CoSimPy enters, with the VOP compression stage; until then the circuit
+  algebra is checked by power conservation through lossless networks and by
+  the coil voltage against its closed form.
 - On a coil, the tuned and matched reflection at the Larmor frequency meets the
   target set in the coil's element file.
 
