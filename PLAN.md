@@ -355,7 +355,10 @@ they were measured on.
 - The loaded port matrix and the fields at the matching network's input agree
   with CoSimPy's `RF_Coil` connections for the same element values. CoSimPy
   evaluates a given circuit in S-parameters and cannot tune one, so it checks
-  the ported circuit algebra rather than replacing it.
+  the ported circuit algebra rather than replacing it. The check runs when
+  CoSimPy enters, with the VOP compression stage; until then the circuit
+  algebra is checked by power conservation through lossless networks and by
+  the coil voltage against its closed form.
 - On a coil, the tuned and matched reflection at the Larmor frequency meets the
   target set in the coil's element file.
 
