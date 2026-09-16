@@ -206,3 +206,86 @@ def test_one_call_drives_the_coil_against_the_body_and_returns_its_ports_and_fie
     torch.testing.assert_close(result.admittance, result.admittance.transpose(0, 1))
     assert bool((fields.absorbed_power(result.operator, result.fields) > 0).all())
     assert all(residual <= 1e-5 for residual in result.ports.residual)
+
+
+def _coefficients(device, shape=(2, 3, 4), seed=5):
+    """Random linear-basis coefficients, shape ``(12, n1, n2, n3)``."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+    real = torch.randn((12, *shape), generator=generator, dtype=torch.float64)
+    imaginary = torch.randn((12, *shape), generator=generator, dtype=torch.float64)
+    return torch.complex(real, imaginary).to(device)
+
+
+@pytest.mark.parametrize("step", [1, 2, 3])
+def test_refining_a_linear_field_agrees_with_marie_s_own_arithmetic(device, step):
+    """``interpolate_PWL.m``, written out index by index as the oracle."""
+    field = _coefficients(device)
+    got = fields.refine(field, step)
+
+    n1, n2, n3 = field.shape[-3:]
+    expected = torch.zeros(
+        (3, step * n1, step * n2, step * n3), dtype=field.dtype, device=field.device
+    )
+    for first in range(1, step + 1):
+        for second in range(1, step + 1):
+            for third in range(1, step + 1):
+                one = -(step - (2 * first - 1)) / (2 * step)
+                two = -(step - (2 * second - 1)) / (2 * step)
+                three = -(step - (2 * third - 1)) / (2 * step)
+                for component in range(3):
+                    expected[
+                        component,
+                        first - 1 :: step,
+                        second - 1 :: step,
+                        third - 1 :: step,
+                    ] = (
+                        field[4 * component]
+                        + one * field[4 * component + 1]
+                        + two * field[4 * component + 2]
+                        + three * field[4 * component + 3]
+                    )
+    torch.testing.assert_close(got, expected)
+
+
+def test_refining_by_one_is_the_field_at_the_cell_centres(device):
+    field = _coefficients(device)
+    torch.testing.assert_close(fields.refine(field, 1), fields.at_centres(field))
+
+
+def test_refining_reads_a_field_that_is_linear_across_the_grid_exactly(device):
+    """A field linear in space is spanned by the basis, so refining is exact."""
+    pitch, step = 0.01, 4
+    shape = (3, 4, 5)
+    axes = [pitch * torch.arange(n, dtype=torch.float64, device=device) for n in shape]
+    centres = torch.meshgrid(*axes, indexing="ij")
+    slope = (2.0, -3.0, 0.5)
+    field = torch.zeros((12, *shape), dtype=torch.complex128, device=device)
+    for component in range(3):
+        field[4 * component] = sum(s * c for s, c in zip(slope, centres, strict=True))
+        for axis in range(3):
+            field[4 * component + 1 + axis] = slope[axis] * pitch
+
+    got = fields.refine(field, step)
+    fine = [
+        pitch / step * torch.arange(step * n, dtype=torch.float64, device=device)
+        - pitch / 2
+        + pitch / (2 * step)
+        for n in shape
+    ]
+    grid = torch.meshgrid(*fine, indexing="ij")
+    want = sum(s * c for s, c in zip(slope, grid, strict=True)).to(torch.complex128)
+    for component in range(3):
+        torch.testing.assert_close(got[component], want)
+
+
+def test_refining_a_constant_field_repeats_each_cell(device):
+    field = _coefficients(device)[:3]
+    got = fields.refine(field, 2)
+    assert got.shape == (3, 4, 6, 8)
+    torch.testing.assert_close(got[:, 0::2, 0::2, 0::2], field)
+    torch.testing.assert_close(got[:, 1::2, 1::2, 1::2], field)
+
+
+def test_a_refinement_needs_at_least_one_sub_cell(device):
+    with pytest.raises(ValueError, match="at least one sub-cell"):
+        fields.refine(_coefficients(device), 0)

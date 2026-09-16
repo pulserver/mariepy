@@ -30,6 +30,8 @@ __all__ = [
     "circular_components",
     "compute",
     "delivered_power",
+    "power_balance",
+    "refine",
 ]
 
 
@@ -257,6 +259,71 @@ def at_centres(field: torch.Tensor) -> torch.Tensor:
     if field.shape[-4] == 3:
         return field
     return field[..., 0::4, :, :, :]
+
+
+def refine(field: torch.Tensor, step: int) -> torch.Tensor:
+    """Evaluate a linear-basis field on a grid ``step`` times finer.
+
+    Ported from MARIE 3.0's ``src_utils/src_loaders/interpolate_PWL.m``.
+
+    The linear basis carries, per cell and per component, a constant and three
+    functions linear in the cell's own coordinates over ``[-1/2, 1/2]``. Taking
+    only the constant, as :func:`at_centres` does, throws that detail away; this
+    reads the field at the centre of each of the ``step ** 3`` sub-cells
+    instead, which is where the linear basis earns its cost at a tissue
+    boundary.
+
+    Parameters
+    ----------
+    field
+        Shape ``(..., 12, n1, n2, n3)`` as linear-basis coefficients, or
+        ``(..., 3, n1, n2, n3)``, which is constant over each cell and so
+        repeats.
+    step
+        Sub-cells along each axis; 1 returns the field at the cell centres.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(..., 3, step * n1, step * n2, step * n3)``. The refined grid
+        has pitch ``resolution / step`` and its first centre sits at
+        ``origin - resolution / 2 + resolution / (2 * step)``.
+
+    Raises
+    ------
+    ValueError
+        If ``step`` is not positive, or the field is in neither basis.
+    """
+    if step < 1:
+        raise ValueError(f"a refinement takes at least one sub-cell, got {step}")
+    if field.shape[-4] not in (3, 12):
+        raise ValueError(
+            "a field must end in (3, n1, n2, n3) or (12, n1, n2, n3), got "
+            f"{tuple(field.shape)}"
+        )
+
+    leading = field.shape[:-4]
+    grid = field.shape[-3:]
+    constant = field[..., 0::4, :, :, :] if field.shape[-4] == 12 else field
+
+    def spread(component: torch.Tensor) -> torch.Tensor:
+        return component.unsqueeze(-1).unsqueeze(-3).unsqueeze(-5)
+
+    out = spread(constant).expand(
+        *leading, 3, grid[0], step, grid[1], step, grid[2], step
+    )
+    if field.shape[-4] == 12:
+        offsets = (
+            2 * torch.arange(step, device=field.device, dtype=torch.float64) + 1 - step
+        ) / (2 * step)
+        offsets = offsets.to(field.dtype)
+        out = (
+            spread(constant)
+            + spread(field[..., 1::4, :, :, :]) * offsets.reshape(-1, 1, 1, 1, 1)
+            + spread(field[..., 2::4, :, :, :]) * offsets.reshape(-1, 1, 1)
+            + spread(field[..., 3::4, :, :, :]) * offsets
+        )
+    return out.reshape(*leading, 3, grid[0] * step, grid[1] * step, grid[2] * step)
 
 
 def _spread(
