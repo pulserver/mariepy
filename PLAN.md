@@ -536,6 +536,17 @@ section says. It is described here so the solver's interfaces serve it.
   44 table. Tissues NIST does not list take a recorded substitute: soft tissue
   for skin, dura and mucosa, water for CSF and vitreous humour, cortical bone for
   cancellous bone.
+- **Where the numbers live.** `tissue.py` carries the four-Cole-Cole model and
+  reads the parameters from a table beside the label volume, rather than
+  bundling them. A measured parameter the package cannot check against its
+  source would be a silent error in every SAR number that follows, and the
+  pipeline writes the table it names its own labels against anyway.
+  `tissue.read_table` states the columns and the paper's units.
+- **Which measurements.** MARIE's own head model carries the IT'IS database's
+  values, not Gabriel's: at 127.74 MHz its grey matter is 65.4 and 0.518 S/m
+  where Gabriel's fit gives about 97 and 0.51. Muscle, fat and cortical bone
+  agree between the two. A model built here states in its table which set it
+  used.
 - **Open check.** Whether IXI volumes keep the face is unverified, so it is
   checked before the pipeline relies on it.
 
