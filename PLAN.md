@@ -200,12 +200,13 @@ nothing is detuned. The port departs from MARIE in these places:
   own search found values; the port adds them when the side has ports.
 
 **Field bases and performance maps.** `basis.py` ports MARIE's basis and MRGF
-paths: the incident-field basis that a support surface, or a shell of voxel
-currents around the body (hugging it or spherical), spans, its interpolation voxels, the body solved once per basis field, the ultimate intrinsic SNR and
-transmit efficiency, and a coil solved through the basis with its coupling
-integrated at the interpolation voxels only. `metrics.py` ports the SNR,
-transmit-efficiency and g-factor maps, and `plot.py` MARIE's figures, with
-matplotlib as an optional dependency. The port departs from MARIE in three
+paths. The incident-field basis is spanned by a support surface, or by a shell
+of voxel currents that hugs the body or is spherical; then come its
+interpolation voxels, the body solved once per basis field, the ultimate
+intrinsic SNR and transmit efficiency, and a coil solved through the basis with
+its coupling integrated at the interpolation voxels only. `metrics.py` ports
+the SNR, transmit-efficiency and g-factor maps, and `plot.py` MARIE's figures,
+with matplotlib as an optional dependency. The port departs from MARIE in five
 places:
 
 - MARIE keeps the incident basis in tested form, the Gram matrix applied, and
