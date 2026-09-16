@@ -6,9 +6,9 @@ object in ``<data>/inputs/``; it names a body under ``<data>/bodies/`` and a
 surface coil under ``<data>/coils/coil_files/``, whose lumped elements sit
 beside it with the same name and a ``.json`` suffix.
 
-Only the case :func:`mariepy.solver.solve` covers is read: a surface coil around
-a piecewise-constant body. A file that asks for anything else raises, naming the
-milestone that covers it, rather than being solved as something it is not.
+Only the cases :func:`mariepy.solver.solve` covers are read: a surface coil
+around a body in either basis. A file that asks for anything else raises, naming
+the milestone that covers it, rather than being solved as something it is not.
 """
 
 from __future__ import annotations
@@ -39,11 +39,15 @@ class Case:
         The body model.
     coil
         The surface coil, its ports and its lumped elements.
+    linear
+        Whether the file asks for the piecewise-linear body basis; pass it to
+        :func:`~mariepy.solver.solve`.
     """
 
     medium: Medium
     body: VoxelBody
     coil: SurfaceCoil
+    linear: bool = False
 
 
 def read_case(
@@ -73,20 +77,18 @@ def read_case(
     Raises
     ------
     NotImplementedError
-        If the file asks for the piecewise-linear basis, a wire coil, an RF
-        shield, or a precomputed field basis.
+        If the file asks for a wire coil, an RF shield, or a precomputed field
+        basis.
     ValueError
-        If the file names no surface coil.
+        If the file names no surface coil, or a body basis MARIE does not know.
     """
     path = Path(path)
     data = path.parent.parent if data is None else Path(data)
     settings = json.loads(path.read_text())
 
-    if int(settings.get("Basis_Functions_VIE", 0)) != 0:
-        raise NotImplementedError(
-            f"{path.name} asks for the piecewise-linear body basis, which is "
-            "milestone 2"
-        )
+    basis = int(settings.get("Basis_Functions_VIE", 0))
+    if basis not in (0, 1):
+        raise ValueError(f"{path.name} names body basis {basis}; MARIE knows 0 and 1")
     if settings.get("ShieldFile"):
         raise NotImplementedError(
             f"{path.name} names an RF shield, which is milestone 2"
@@ -115,4 +117,5 @@ def read_case(
             data / "bodies" / settings["BodyFile"], device=device
         ),
         coil=SurfaceCoil.build(mesh, elements),
+        linear=basis == 1,
     )

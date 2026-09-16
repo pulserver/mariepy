@@ -24,7 +24,7 @@ its coil in `data/coils/coil_files/` — is read whole:
 from mariepy.inputs import read_case
 
 case = read_case("data/inputs/my_case.json")
-result = solve(case.body, case.coil, case.medium)
+result = solve(case.body, case.coil, case.medium, linear=case.linear)
 ```
 
 `VoxelBody.read_marie`, `SurfaceMesh.read_gmsh22` and `read_lumped_elements`
@@ -57,6 +57,11 @@ from mariepy.fields import absorbed_power, circular_components
 watts = absorbed_power(result.operator, result.fields)
 b1_plus, b1_minus = circular_components(result.operator, result.fields)
 ```
+
+`linear=True` gives the body the piecewise-linear basis, twelve unknowns per
+voxel, which carries the field's variation inside each voxel; the fields then
+come back as those coefficients, and `fields.at_centres` gives their values at
+the voxel centres.
 
 The solve runs on either device: build the body and the coil with
 `device="cuda"` and everything downstream follows.

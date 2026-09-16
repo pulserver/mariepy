@@ -228,6 +228,13 @@ they were measured on.
 
 - The piecewise-linear basis meets the Mie criterion, and its error is reported
   against the piecewise-constant basis on the same grids.
+- The coupled solve in the piecewise-linear basis meets milestone 1's
+  reciprocity, power-balance and direct-integration criteria.
+- Each basis's absorbed power is measured against the Mie series for a lossy
+  sphere at brain-like permittivity, split between the interior and the shell
+  of boundary voxels, since the staircase error sits in that shell. Peak 10 g
+  SAR is compared in the same way once 10 g averaging exists, in the SAR
+  milestone.
 - Shielded coils meet the reciprocity and mesh-convergence criteria.
 - Tensor-train coupling agrees with the fully assembled coupling on a small
   case, within `tol_TT`.
