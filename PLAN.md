@@ -491,6 +491,16 @@ What this leaves uncovered is recorded rather than implied away:
   body kernel on a 60³ grid then assembles in about ten seconds for the
   piecewise-constant basis and half a minute for the piecewise-linear one,
   a cost set by the near offsets rather than by the grid.
+- **Circulant embedding.** A Toeplitz block of `n` offsets sits inside any
+  circulant of `2n - 1` rows or more, where MARIE always takes `2n`. The port
+  takes the shortest length with no prime factor above seven, since an FFT of a
+  length carrying a large prime factor costs several times the one it needs.
+  The symbol, not the caller, names the length, so the choice is local to
+  `tucker.transform_length`.
+- **Body solve.** The body operator is scaled by its own Galerkin mass term, so
+  what GMRES sees is the identity minus a compact term and no preconditioner is
+  applied. MARIE's `prec_vie.m` inverts that mass term, which is what the
+  coupled system still needs, since there the mass term stands in the matrix.
 - **Arrays and units.** Arrays are C-ordered with the batch dimension first:
   (ports, …) and (N, Nc, Nc). Units are SI, and frequencies are in Hz.
 - **Provenance.** Every ported function names its MARIE source file in its
