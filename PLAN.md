@@ -105,9 +105,12 @@ package's single `_ext` module, following the package template and pypulseqpp.
 - **Coupling kernels.** For a surface coil, MARIE ships 24 coupling sources that
   differ only in field component, piecewise-linear basis term and operator (N or
   K). They become one N kernel and one K kernel taking the component and basis
-  term as arguments. Both are batched quadratures over the same `N` and `K`
-  kernels the body operator already uses, so under **C++ kernels** below they
-  stay in torch; the 24 sources remain the reference they are checked against.
+  term as arguments, written twice: in C++ in `_ext`, which runs on CPU, and in
+  torch over the `N` and `K` kernels the body operator already uses, which runs
+  on CUDA. Each is checked against the other and against the 24 sources, kept in
+  `tests/marie/`. The torch form is assembled from kernels the Mie series
+  validated rather than transcribed, so the check between the two is a check
+  between independent formulations.
   The wire-coil sources are checked for the same structure when milestone 3
   ports them.
 - **Singular integrals.** The DIRECTFN sources (`direct_ws_*_rwg` for the coil,

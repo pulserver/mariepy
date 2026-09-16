@@ -251,3 +251,51 @@ def test_each_coupling_kernel_reproduces_marie_s_own_source(index, variant):
     )[:, component].reshape(corners.shape[0], points.shape[0])
     error = np.abs(got.numpy() - expected).max() / np.abs(expected).max()
     assert error <= 1e-12, error
+
+
+@pytest.mark.parametrize("electric", [True, False])
+@pytest.mark.parametrize("basis_term", [0, 1, 2, 3])
+def test_the_compiled_kernel_agrees_with_the_torch_contraction(electric, basis_term):
+    """The two formulations are independent, so agreement is evidence, not tautology.
+
+    ``_batched`` contracts ``vie.green_n`` and ``vie.green_k``, which the Mie
+    series validated; ``_ext.couple`` evaluates the same dyads in C++. A
+    transcription slip in either shows up here.
+    """
+    medium = _medium()
+    corners, points = _geometry("cpu")
+    flat_corners, flat_points = _pairs(corners, points)
+
+    triangle_weights, barycentric = dunavant(TRIANGLE_ORDER)
+    triangle_weights = 0.5 * triangle_weights
+    cell_weights, nodes, factors = coupling._cell_rule(
+        CELL_ORDER, flat_corners.device, flat_corners.dtype
+    )
+    offsets = RESOLUTION / 2.0 * nodes
+    kernel = coupling._electric if electric else coupling._magnetic
+
+    compiled = coupling._compiled(
+        flat_corners,
+        flat_points,
+        medium,
+        triangle_weights,
+        barycentric,
+        cell_weights * factors[basis_term],
+        offsets,
+        electric,
+    )
+    batched = coupling._batched(
+        flat_corners,
+        flat_points,
+        medium,
+        triangle_weights,
+        barycentric,
+        cell_weights * factors[basis_term],
+        offsets,
+        kernel,
+    )
+    # Relative to the size of the answer, as the MARIE comparison states it.
+    # Two summation orders over near-cancelling terms differ in the last bits,
+    # which is large relative to an element that is itself near zero.
+    error = (compiled - batched).abs().max() / batched.abs().max()
+    assert error <= 1e-12, error

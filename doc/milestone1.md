@@ -69,7 +69,8 @@ src/mariepy/
     solver.py               drives geometry, operators, solve, network, fields
 
 src/cpp/                    -> mariepy._ext, MIT
-    module.cpp              bindings; a kernel moves here when a profile asks
+    module.cpp              bindings
+    coupling.cpp            the N and K coupling kernels, over threads
 
 src/cpp_lgpl/               -> mariepy._directfn, LGPL, notices kept
     NOTICE.md               what is carried, and the two build changes
@@ -174,9 +175,9 @@ rather than at stage 5 because the port path needs an impedance to be checked
 against the loop's own inductance.
 
 **Stage 4 — coupling kernels.**
-`src/cpp/coupling.cpp`, `src/cpp/collocation.cpp`, bound into `_ext`. Checked
-against MARIE's own 24 sources, compiled without MATLAB, before any pFFT code
-uses them. Section 5 gives the signatures and section 4.3 the parity harness.
+`src/cpp/coupling.cpp`, bound into `_ext`, and its torch counterpart in
+`coupling.py`. Both are checked against MARIE's own 24 sources, compiled without
+MATLAB, and against each other, before any pFFT code uses them. Section 5 gives the signatures and section 4.3 the parity harness.
 
 **Stage 5 — pFFT coupling and the coupled solve.**
 `pfft.py`, `system.py`, `solver.py`. Checks: the projection
@@ -454,17 +455,24 @@ that are design decisions; the rest are recorded here.
    `PLAN.md`'s **Why the coil matrix is not checked at a port** paragraph and
    its milestone 1 table now carry the reason and the criterion.
 
-10. **The coupling kernels stayed in torch.**
-   `PLAN.md`'s **C++ kernels** constraint keeps in torch the work torch can
-   batch, and moves it to C++ when a profile shows it dominates. The 24 sources
-   are a quadrature over the same `N` and `K` kernels `vie.py` already carries:
-   the coupling of a basis function `f` to a point is
+10. **The coupling kernels have two implementations, and a check between them.**
+   The 24 sources are a quadrature over the same `N` and `K` kernels `vie.py`
+   already carries: the coupling of a basis function `f` to a point is
    `E = 1 / (j omega eps_0) * integral N(r - r') f(r') dS'` and
-   `H = integral K(r - r') x f(r') dS'`, which torch batches over pairs in one
-   contraction. `coupling.py` therefore reuses `vie.green_n` and `vie.green_k`,
-   which the Mie test already validated, and reproduces all 24 originals to
-   3e-14. `src/cpp/` keeps its bindings module for the first kernel a profile
-   sends there.
+   `H = integral K(r - r') x f(r') dS'`. `coupling._batched` writes that in
+   torch over `vie.green_n` and `vie.green_k`, which the Mie test validated, and
+   runs on whichever device holds the tensors. `src/cpp/coupling.cpp` evaluates
+   the same two dyads in C++ over threads, and `PLAN.md`'s **C++ kernels**
+   constraint puts it on CPU buffers, so `_couple` sends a CPU call there and a
+   CUDA call to torch.
+
+   Keeping both is what makes the checks worth anything. MARIE's sources answer
+   whether the transcription is faithful; they cannot answer whether the physics
+   is right, because a port that reproduces MARIE reproduces its errors with it.
+   The torch path is not a transcription — it is assembled from kernels the Mie
+   series pinned to an analytic answer — so C++ agreeing with torch *and* with
+   MARIE is three-way agreement between two independent formulations and one
+   reference. One implementation could not produce that.
 
 11. **MARIE halves Burkardt's Dunavant weights, and that is what carries the
    basis function's own factor.** `dunavant_rule.m` returns `0.5 * w`, so the
