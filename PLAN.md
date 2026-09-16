@@ -315,8 +315,8 @@ What this leaves uncovered is recorded rather than implied away:
   working precision.
 - **Other dependencies.** numpy is used for file input and output only, where VOP
   files are `.npz`. scipy is a test and optional dependency: special functions
-  for the Mie reference, and the global optimiser for co-simulation from
-  milestone 3. No numba, no CuPy.
+  for the Mie reference, reading MARIE's MATLAB body files, and the global
+  optimiser for co-simulation from milestone 3. No numba, no CuPy.
 - **C++ kernels.** Work over voxels, mesh elements or quadrature points that
   torch cannot batch runs in C++ in the pybind11 extension, on CPU buffers, and
   its result moves to the caller's device. Work that torch can batch stays in

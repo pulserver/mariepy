@@ -16,9 +16,19 @@ pip install mariepy
 ## Usage
 
 Build a coil and a body, and solve them together at the Larmor frequency of the
-field strength you name. Both are built in code here; a real coil comes from a
-GMSH file and a JSON list of its lumped elements, through
-`SurfaceMesh.read_gmsh22` and `read_lumped_elements`.
+field strength you name. Both are built in code here. A case laid out as MARIE
+lays it out — a simulation file in `data/inputs/`, its body in `data/bodies/`,
+its coil in `data/coils/coil_files/` — is read whole:
+
+```python
+from mariepy.inputs import read_case
+
+case = read_case("data/inputs/my_case.json")
+result = solve(case.body, case.coil, case.medium)
+```
+
+`VoxelBody.read_marie`, `SurfaceMesh.read_gmsh22` and `read_lumped_elements`
+read each file on its own.
 
 ```python
 from mariepy.body import VoxelBody

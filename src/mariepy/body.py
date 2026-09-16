@@ -1,7 +1,8 @@
 """A body model on a uniform Cartesian grid, and its dielectric contrast.
 
 Ported from MARIE 3.0's ``src_geometry/body_geometry/geo_body_domain.m``,
-``grid3d.m`` and ``src_physics/src_electromagnetism/em_assembly.m``.
+``grid3d.m``, ``src_physics/src_electromagnetism/em_assembly.m`` and
+``src_utils/src_loaders/update_RHBM.m``.
 
 The volume integral equation is solved for the polarisation current in the
 voxels the mask selects. A field over the grid has shape
@@ -13,7 +14,9 @@ restricted to the mask and flattened, of length ``3 * n_voxels``.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
+import numpy as np
 import torch
 
 from mariepy.constants import Medium
@@ -257,4 +260,91 @@ class VoxelBody:
             mask=inside,
             resolution=resolution,
             origin=(float(axis[0]), float(axis[0]), float(axis[0])),
+        )
+
+    @classmethod
+    def read_marie(
+        cls, path: str | Path, *, device: torch.device | str | None = None
+    ) -> VoxelBody:
+        """Read a body model saved as MARIE's ``RHBM`` structure.
+
+        Ported from ``geo_body_domain.m``. The file is a MATLAB v5 ``.mat``
+        holding a struct ``RHBM`` with the voxel centres ``r``, shape
+        ``(n1, n2, n3, 3)`` with x varying along the first axis, and the
+        per-voxel ``epsilon_r`` and ``sigma_e``. The grid pitch is the step
+        between the first two centres along x, as MARIE takes it.
+
+        The body is the set of voxels ``idxS`` lists, one-based and in MATLAB's
+        column-major order. Some of MARIE's own files carry no ``idxS``; for
+        those the body is every voxel with ``sigma_e > 0``, the rule
+        ``update_RHBM.m`` applies, which reproduces ``idxS`` exactly on the files
+        that do carry it. A lossless scatterer therefore needs ``idxS``.
+
+        The struct's density field, ``rho`` or ``rhos``, is proton density and is
+        not read.
+
+        Parameters
+        ----------
+        path
+            File to read.
+        device
+            Device the grids are built on.
+
+        Returns
+        -------
+        VoxelBody
+            The body the file describes.
+
+        Raises
+        ------
+        ImportError
+            If scipy, which reads the file, is not installed.
+        ValueError
+            If the file holds no ``RHBM``, or its grid is not uniform.
+        """
+        try:
+            from scipy.io import loadmat
+        except ImportError as error:  # pragma: no cover - scipy is a dev dependency
+            raise ImportError("reading a MARIE body model needs scipy") from error
+
+        held = loadmat(Path(path), squeeze_me=True, struct_as_record=False)
+        if "RHBM" not in held:
+            raise ValueError(f"{path} holds no RHBM structure")
+        rhbm = held["RHBM"]
+
+        centres = np.asarray(rhbm.r, dtype=np.float64)
+        permittivity = np.asarray(rhbm.epsilon_r, dtype=np.float64)
+        conductivity = np.asarray(rhbm.sigma_e, dtype=np.float64)
+        shape = permittivity.shape
+        if centres.shape != (*shape, 3):
+            raise ValueError(f"{path}: r is {centres.shape}, and epsilon_r is {shape}")
+
+        resolution = abs(float(centres[1, 0, 0, 0] - centres[0, 0, 0, 0]))
+        expected = centres[0, 0, 0] + resolution * np.stack(
+            np.meshgrid(*(np.arange(n) for n in shape), indexing="ij"), axis=-1
+        )
+        drift = float(np.abs(centres - expected).max())
+        if drift > 1e-9 * max(resolution, 1.0):
+            raise ValueError(
+                f"{path}: the voxel centres are not a uniform grid of pitch "
+                f"{resolution}; they depart from one by {drift:.3g} m"
+            )
+
+        if "idxS" in rhbm._fieldnames:
+            indices = np.asarray(rhbm.idxS, dtype=np.int64).ravel() - 1
+            mask = np.zeros(permittivity.size, dtype=bool)
+            mask[indices] = True
+            mask = mask.reshape(shape, order="F")
+        else:
+            mask = conductivity > 0
+
+        def grid(values: np.ndarray) -> torch.Tensor:
+            return torch.as_tensor(values, device=device)
+
+        return cls(
+            permittivity=grid(permittivity),
+            conductivity=grid(conductivity),
+            mask=grid(mask),
+            resolution=resolution,
+            origin=tuple(float(value) for value in centres[0, 0, 0]),
         )
