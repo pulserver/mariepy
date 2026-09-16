@@ -106,6 +106,64 @@ def test_a_distant_voxel_pair_integrates_to_the_kernel_times_the_volume(kernel, 
     assert torch.allclose(got, midpoint, rtol=2e-3)
 
 
+@pytest.mark.parametrize("kernel", ["n", "k"])
+@pytest.mark.parametrize("linear", [False, True])
+def test_the_reduced_rule_is_closer_to_the_converged_integral_than_marie_s(
+    kernel, linear
+):
+    """The overlap rule reaches the product rule's integral, with fewer points."""
+    green = vie.green_n if kernel == "n" else vie.green_k
+    n_components = 6 if kernel == "n" else 3
+    offsets = _offsets([[1.0, 1.0, 0.0], [2.0, 0.0, 0.0], [2.0, 1.0, 1.0]])
+    reference = vie._volume_volume_product(
+        offsets, RESOLUTION, WAVENUMBER, 9, green, n_components, linear
+    )
+    for order in (2, 4):
+        product = vie._volume_volume_product(
+            offsets, RESOLUTION, WAVENUMBER, order, green, n_components, linear
+        )
+        reduced = vie._volume_volume(
+            offsets, RESOLUTION, WAVENUMBER, order, green, n_components, linear
+        )
+        product_error = torch.linalg.vector_norm(product - reference)
+        assert torch.linalg.vector_norm(reduced - reference) <= product_error
+
+
+@pytest.mark.parametrize("kernel", ["n", "k"])
+def test_the_compiled_volume_rule_matches_the_torch_one(kernel):
+    green = vie.green_n if kernel == "n" else vie.green_k
+    n_components = 6 if kernel == "n" else 3
+    offsets = _offsets([[1.0, 1.0, 0.0], [2.0, -1.0, 3.0], [0.0, 0.0, 5.0]])
+    compiled = vie._volume_volume(
+        offsets, RESOLUTION, WAVENUMBER, 3, green, n_components, linear=True
+    )
+
+    nodes, weights = vie._overlap_rule(3, offsets.device, offsets.dtype)
+    grid = RESOLUTION * torch.cartesian_prod(nodes, nodes, nodes)
+    pair_weight = torch.stack(
+        [
+            (
+                weights[(test == 1) + 2 * (basis == 1)][:, None, None]
+                * weights[(test == 2) + 2 * (basis == 2)][None, :, None]
+                * weights[(test == 3) + 2 * (basis == 3)][None, None, :]
+            ).reshape(-1)
+            for test, basis in vie.PAIRS
+        ]
+    )
+    reference = vie._volume_volume_torch(
+        offsets,
+        grid,
+        pair_weight,
+        RESOLUTION**6,
+        WAVENUMBER,
+        green,
+        n_components,
+        True,
+    )
+    scale = reference.abs().max()
+    assert (compiled - reference).abs().max() <= 1e-12 * scale
+
+
 def test_the_volume_rule_refuses_an_offset_of_zero(device):
     with pytest.raises(ValueError, match="diverges at a zero offset"):
         vie.volume_volume_n(

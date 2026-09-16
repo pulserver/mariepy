@@ -115,9 +115,10 @@ def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
     assert read_case(moved, data=tmp_path / "data").body.n_voxels == 1
 
 
-def test_a_simulation_file_asking_only_for_a_field_basis_is_refused(tmp_path):
-    with pytest.raises(NotImplementedError, match="basis file"):
-        read_case(_data(tmp_path, CoilFile="", BasisFile="basis.mat"))
+def test_a_simulation_file_naming_only_a_basis_is_read_without_a_coil(tmp_path):
+    case = read_case(_data(tmp_path, CoilFile="", BasisFile="head.mat"))
+    assert case.coil is None
+    assert case.basis_file == tmp_path / "data" / "bases" / "head.mat"
 
 
 def test_a_basis_support_the_simulation_file_names_is_read(tmp_path):
@@ -132,7 +133,7 @@ def test_a_basis_support_the_simulation_file_names_is_read(tmp_path):
 
 
 def test_a_simulation_file_that_names_no_coil_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="names no coil"):
+    with pytest.raises(ValueError, match="names no coil and no basis"):
         read_case(_data(tmp_path, CoilFile=""))
 
 
@@ -181,6 +182,32 @@ def test_a_shield_the_simulation_file_names_is_read_with_its_basis(tmp_path):
     assert case.shield is not None
     assert case.shield.n_dof == 120
     assert case.shield.n_driven == 0
+
+
+def test_a_shield_named_alone_is_the_coil_and_its_ports_lead_the_network(tmp_path):
+    path = _data(tmp_path, CoilFile="", ShieldFile="Loop/shield.msh")
+    folder = tmp_path / "data" / "coils" / "shield_files" / "Loop"
+    folder.mkdir(parents=True)
+    mesh = SurfaceMesh.loop(radius=0.08, width=0.01, n_around=8, n_across=1)
+    write_gmsh22(folder / "shield.msh", mesh)
+    (folder / "shield.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert case.shield is None
+    assert case.coil.n_driven == 1
+    assert [t.number for t in case.network.terminals] == [1]
+
+
+def test_a_shield_s_elements_come_before_the_coil_s(tmp_path):
+    path = _data(tmp_path, ShieldFile="Loop/shield.msh")
+    folder = tmp_path / "data" / "coils" / "shield_files" / "Loop"
+    folder.mkdir(parents=True)
+    mesh = SurfaceMesh.loop(radius=0.08, width=0.01, n_around=8, n_across=1)
+    write_gmsh22(folder / "shield.msh", mesh)
+    (folder / "shield.json").write_text(json.dumps(ELEMENTS))
+    case = read_case(path)
+    assert case.shield.n_driven == 1
+    assert [t.number for t in case.network.terminals] == [1, 2]
+    assert case.network.terminals[1].entities == (2,)
 
 
 def test_a_simulation_file_without_a_shield_reads_none(tmp_path):

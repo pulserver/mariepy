@@ -8,9 +8,11 @@
 namespace py = pybind11;
 
 void bind_coupling(py::module_ &module);
+void bind_volume(py::module_ &module);
 
 PYBIND11_MODULE(_ext, module)
 {
     module.doc() = "Precompiled kernels for mariepy";
     bind_coupling(module);
+    bind_volume(module);
 }

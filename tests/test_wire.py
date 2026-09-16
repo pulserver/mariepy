@@ -20,6 +20,7 @@ from .marie_files import write_wire_gmsh22
 
 FIELD_STRENGTH = 3.0
 LOOP_RADIUS = 0.05
+WIRE_RADIUS_TEST = 0.0005
 
 
 def _port(tag, kind="port", load="none", value=0.0, **extra):
@@ -61,10 +62,58 @@ def test_two_loops_in_one_file_are_two_loops(tmp_path):
     assert coil.ports[0].dofs.tolist() == [11, 6]
 
 
-def test_an_open_wire_is_refused():
-    nodes = torch.rand(4, 3, dtype=torch.float64)
-    with pytest.raises(NotImplementedError, match="open wires"):
-        WireCoil.build(nodes, [(0, 1), (1, 2), (2, 3)], [])
+def test_an_open_wire_carries_a_basis_function_at_each_interior_node():
+    nodes = torch.rand(5, 3, dtype=torch.float64)
+    segments = [(0, 1), (1, 2), (2, 3), (3, 4)]
+    elements = (_port(1),)
+    coil = WireCoil.build(nodes, segments, [1], elements)
+    torch.testing.assert_close(coil.centre, nodes[1:4])
+    torch.testing.assert_close(coil.first, nodes[0:3])
+    torch.testing.assert_close(coil.last, nodes[2:5])
+    assert coil.closed == (False,)
+    assert coil.following(2) is None
+    assert coil.ports[0].dofs.tolist() == [0, 1]
+    assert coil.points().shape == (5, 3)
+
+
+def test_a_port_on_an_open_wire_s_end_segment_is_refused():
+    nodes = torch.rand(5, 3, dtype=torch.float64)
+    with pytest.raises(ValueError, match="end segment"):
+        WireCoil.build(nodes, [(0, 1), (1, 2), (2, 3), (3, 4)], [0], (_port(1),))
+
+
+def test_a_loop_and_an_open_wire_in_one_file_are_told_apart():
+    nodes = torch.rand(8, 3, dtype=torch.float64)
+    segments = [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 6), (6, 7)]
+    coil = WireCoil.build(nodes, segments, [])
+    assert coil.loops == ((0, 3), (3, 6))
+    assert coil.closed == (True, False)
+
+
+def _dipole(length, n_segments, medium_radius=WIRE_RADIUS_TEST):
+    z = torch.linspace(-length / 2, length / 2, n_segments + 1, dtype=torch.float64)
+    nodes = torch.stack([torch.zeros_like(z), torch.zeros_like(z), z], dim=1)
+    segments = [(k, k + 1) for k in range(n_segments)]
+    return WireCoil.build(
+        nodes, segments, [n_segments // 2], (_port(1),), radius=medium_radius
+    )
+
+
+def test_a_half_wave_dipole_has_its_textbook_input_impedance():
+    """A centre-fed half-wave dipole of finite radius.
+
+    The infinitely thin dipole's 73 + j42 ohms rises for a wire a few
+    ten-thousandths of a wavelength thick; this one gives about 82 + j46.
+    """
+    medium = Medium(3.0)
+    wavelength = 2 * math.pi / medium.wavenumber
+    coil = _dipole(wavelength / 2, 80)
+    system = wire.assemble(coil, medium)
+    current = torch.linalg.solve(system.impedance, system.excitation.T).T
+    admittance = network.port_admittance(system.excitation, current)
+    impedance = complex(1 / admittance[0, 0])
+    assert 75 < impedance.real < 90
+    assert 35 < impedance.imag < 55
 
 
 def test_a_wire_mesh_reads_back_the_loop_it_was_written_from(tmp_path):

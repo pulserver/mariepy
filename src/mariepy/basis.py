@@ -43,11 +43,14 @@ __all__ = [
     "MrgfSolution",
     "coupling_at",
     "dipole_basis",
+    "ideal_currents",
+    "read_marie",
     "shell",
     "solve",
     "solve_coil",
     "surface_basis",
     "ultimate_maps",
+    "ultimate_weights",
 ]
 
 
@@ -72,6 +75,10 @@ class FieldBasis:
         ``(r, c * n_samples)``.
     singular_values
         The kept singular values of the magnetic coupling, MARIE's ``SK``.
+    support_currents
+        The support-surface current that puts each basis field on the body,
+        MARIE's ``VK/SK``, shape ``(r, n_dof)``. Only a basis built from a
+        support surface carries one.
     linear
         Whether the body carries the piecewise-linear basis.
     electric, magnetic
@@ -86,24 +93,34 @@ class FieldBasis:
     covariance
         The basis fields' noise covariance, MARIE's ``BASIS.phi``, shape
         ``(r, r)``, or None.
+    tested
+        Whether the basis is in MARIE's own form, as :func:`read_marie`
+        reads it: fields and interpolation carry the Gram matrix, the
+        response is MARIE's ``Zbb_hat_inv``, and the incident fields and body
+        currents are not stored.
     """
 
-    incident_electric: torch.Tensor
-    incident_magnetic: torch.Tensor
+    incident_electric: torch.Tensor | None
+    incident_magnetic: torch.Tensor | None
     samples: torch.Tensor
     interpolation: torch.Tensor
-    singular_values: torch.Tensor
+    singular_values: torch.Tensor | None
+    support_currents: torch.Tensor | None = None
     linear: bool = False
     electric: torch.Tensor | None = None
     magnetic: torch.Tensor | None = None
     current: torch.Tensor | None = None
     response: torch.Tensor | None = None
     covariance: torch.Tensor | None = None
+    tested: bool = False
 
     @property
     def rank(self) -> int:
         """Number of basis fields."""
-        return int(self.incident_electric.shape[0])
+        fields = (
+            self.electric if self.incident_electric is None else self.incident_electric
+        )
+        return int(fields.shape[0])
 
     @property
     def n_components(self) -> int:
@@ -314,6 +331,7 @@ def surface_basis(
         samples=samples,
         interpolation=interpolation,
         singular_values=values[:kept],
+        support_currents=combine.transpose(0, 1).contiguous(),
         linear=linear,
     )
 
@@ -356,13 +374,29 @@ def _ball(radius: int):
 
 
 def shell(
-    mask: torch.Tensor, resolution: float, *, distance: float, thickness: int
+    mask: torch.Tensor,
+    resolution: float,
+    *,
+    distance: float,
+    thickness: int,
+    shape: str = "hull",
 ) -> tuple[torch.Tensor, int]:
-    """Place the dipole shell around a body, as ``geo_ultimate_basis.m``.
+    """Place the dipole shell around a body.
 
-    The body's slices along the last axis are filled to their convex hulls;
-    the shell is what dilating that by ``thickness`` voxels more than the
-    distance adds, the object itself left out.
+    With ``shape="hull"``, as ``geo_ultimate_basis.m``: the body's slices along
+    the last axis are filled to their convex hulls, and the shell is what
+    dilating that by ``thickness`` voxels more than the distance adds, the
+    object itself left out.
+
+    With ``shape="sphere"``, as ``geo_spherical_basis.m``: the cells between
+    two spheres about the grid's centre voxel, the inner one the distance
+    beyond the sphere through the grid's corners and the outer one
+    ``thickness`` voxels further. MARIE's file reads its inputs from a
+    variable it never defines, centres its padded grid at the shell's
+    thickness rather than at the body, and sizes the enclosing sphere from
+    the body's position; here the grid is padded about the body and the
+    enclosing sphere is the grid's half-diagonal, which is MARIE's value for a
+    body centred at the origin.
 
     Parameters
     ----------
@@ -375,6 +409,8 @@ def shell(
         ``Basis_distance``.
     thickness
         Shell thickness in voxels, MARIE's ``Basis_thickness``.
+    shape
+        ``"hull"`` or ``"sphere"``.
 
     Returns
     -------
@@ -385,6 +421,10 @@ def shell(
     """
     from scipy.ndimage import binary_dilation
 
+    if shape == "sphere":
+        return _spherical_shell(mask, resolution, distance, thickness)
+    if shape != "hull":
+        raise ValueError(f"unknown shell shape {shape!r}")
     gap = math.floor(distance / resolution)
     padding = gap + thickness
     padded = torch.nn.functional.pad(mask.to(torch.bool), (padding,) * 6, value=False)
@@ -393,6 +433,26 @@ def shell(
     outer = binary_dilation(hull, structure=_ball(gap + thickness))
     result = outer & ~inner & ~hull
     return torch.from_numpy(result).to(mask.device), padding
+
+
+def _spherical_shell(mask, resolution, distance, thickness):
+    """Place the spherical shell of :func:`shell`."""
+    shape = torch.tensor(mask.shape, dtype=torch.float64)
+    centre = torch.ceil(shape / 2) - 1  # MARIE's r(ceil(n/2)), zero-based
+    half_diagonal = float(torch.linalg.vector_norm((shape - 1) * resolution / 2))
+    inner_radius = half_diagonal + distance
+    outer_radius = inner_radius + thickness * resolution
+    room = torch.minimum(centre, shape - 1 - centre)
+    padding = max(math.ceil(float((outer_radius / resolution - room).max())) + 1, 0)
+    size = [int(n) + 2 * padding for n in mask.shape]
+    axes = [
+        (torch.arange(n, dtype=torch.float64) - padding - centre[axis]) * resolution
+        for axis, n in enumerate(size)
+    ]
+    grid = torch.meshgrid(*axes, indexing="ij")
+    radius = torch.sqrt(sum(g**2 for g in grid))
+    result = (radius >= inner_radius) & (radius <= outer_radius)
+    return result.to(mask.device), padding
 
 
 def _range(apply, n_columns, n_rows, tol, block, generator, device):
@@ -427,6 +487,7 @@ def dipole_basis(
     *,
     distance: float = 0.02,
     thickness: int = 3,
+    support: str = "hull",
     tol: float = 1e-3,
     interpolation_tol: float = 1e-4,
     block: int = 1000,
@@ -453,6 +514,9 @@ def dipole_basis(
         Free-space constants at the working frequency.
     distance, thickness
         Where the shell sits, as :func:`shell` takes them.
+    support
+        The shell's shape, ``"hull"`` (MARIE's ``geo_ultimate_basis.m``) or
+        ``"sphere"`` (``geo_spherical_basis.m``).
     tol
         Relative singular value below which fields are dropped, MARIE's
         ``tol_rSVD``.
@@ -475,7 +539,11 @@ def dipole_basis(
         The incident basis, not yet solved.
     """
     around, padding = shell(
-        body.mask, body.resolution, distance=distance, thickness=thickness
+        body.mask,
+        body.resolution,
+        distance=distance,
+        thickness=thickness,
+        shape=support,
     )
     shape = tuple(around.shape)
     inside = torch.nn.functional.pad(body.mask.to(torch.bool), (padding,) * 6)
@@ -724,6 +792,140 @@ def ultimate_maps(
     )
 
 
+def _receive_sensitivity(basis: FieldBasis, medium: Medium, count: int) -> torch.Tensor:
+    """Give each basis field's ``B1-`` at every voxel, shape ``(count, n_voxels)``."""
+    magnetic = basis.magnetic[:count]
+    components = magnetic.reshape(count, basis.n_components, -1)
+    centres = components[:, 0::4] if basis.linear else components
+    return medium.permeability * (centres[:, 0] - 1j * centres[:, 1])
+
+
+def ultimate_weights(
+    basis: FieldBasis, medium: Medium, *, modes: int | None = None
+) -> torch.Tensor:
+    """Give the channel weights that reach the ultimate SNR at every voxel.
+
+    MARIE's ``wUISNR`` in ``em_ehfield_vie.m``: the matched filter of the basis
+    fields' ``B1-`` against their noise covariance,
+    ``w = Psi^-T conj(S) / (S^H Psi^-1 S)``, normalised so that ``w^T S`` is one.
+
+    Parameters
+    ----------
+    basis
+        A solved basis, carrying its total fields and their covariance.
+    medium
+        The same frequency.
+    modes
+        Use the first this many basis fields; all by default.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(modes, n_voxels)``, complex, the voxels in the body's own
+        order.
+    """
+    count = basis.rank if modes is None else modes
+    sensitivity = _receive_sensitivity(basis, medium, count)
+    inverse = torch.linalg.inv(basis.covariance[:count, :count].to(sensitivity.dtype))
+    filtered = inverse @ sensitivity
+    gain = torch.einsum("pv,pv->v", sensitivity.conj(), filtered)
+    return (inverse.transpose(0, 1) @ sensitivity.conj()) / gain
+
+
+def _mode_ladder(rank: int, steps: int = 50) -> list[int]:
+    """MARIE's logarithmic run of mode counts, ``nmodes`` in ``em_ehfield_vie.m``."""
+    spaced = torch.logspace(0.0, math.log10(rank), steps, dtype=torch.float64)
+    return sorted({min(rank, max(1, int(value))) for value in spaced.floor()})
+
+
+def ideal_currents(
+    basis: FieldBasis,
+    body: VoxelBody,
+    medium: Medium,
+    target,
+    *,
+    modes: int | None = None,
+    fraction: float = 0.95,
+) -> torch.Tensor:
+    """Give the support current that reaches the ultimate SNR at a target point.
+
+    The pattern of ``visualize_ideal_current_patterns.m``: the receive weights
+    of the voxel nearest the target, carried back through the basis onto the
+    support surface's own RWG functions.
+
+    Truncating the basis matters, because the last modes buy a fraction of a
+    percent of SNR with currents that oscillate from triangle to triangle. With
+    ``modes`` unset, the fewest modes reaching ``fraction`` of the full-rank SNR
+    at that voxel are used, over the same logarithmic ladder MARIE maps its
+    convergence on.
+
+    Parameters
+    ----------
+    basis
+        A solved basis built by :func:`surface_basis`.
+    body
+        The body it was built for.
+    medium
+        The same frequency.
+    target
+        A point in metres, shape ``(3,)``, or several, shape ``(n, 3)``.
+    modes
+        Use exactly this many basis fields.
+    fraction
+        The share of the full-rank SNR the mode count must reach.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(n, n_dof)``, complex, the support's basis coefficients, one row
+        per target point. A single point still gives one row.
+
+    Raises
+    ------
+    ValueError
+        If the basis was not built from a support surface.
+    """
+    if basis.support_currents is None:
+        raise ValueError(
+            "the ideal pattern is a current on a support surface, and this basis "
+            "carries none; build it with surface_basis"
+        )
+    points = torch.as_tensor(target, dtype=torch.float64, device=body.device).reshape(
+        -1, 3
+    )
+    centres = body.coordinates().reshape(3, -1)[:, body.mask.reshape(-1)]
+    voxels = torch.cdist(points, centres.transpose(0, 1)).argmin(dim=1)
+
+    sensitivity = _receive_sensitivity(basis, medium, basis.rank)[:, voxels]
+    rows = []
+    for column, voxel in enumerate(voxels):
+        count = (
+            modes
+            if modes is not None
+            else _chosen_modes(basis, sensitivity[:, column], fraction)
+        )
+        weights = ultimate_weights(basis, medium, modes=count)[:, voxel]
+        rows.append(weights @ basis.support_currents[:count])
+    return torch.stack(rows)
+
+
+def _chosen_modes(basis: FieldBasis, sensitivity: torch.Tensor, fraction: float) -> int:
+    """Give the fewest modes on MARIE's ladder reaching ``fraction`` of the SNR."""
+    ladder = _mode_ladder(basis.rank)
+    gains = []
+    for count in ladder:
+        inverse = torch.linalg.inv(
+            basis.covariance[:count, :count].to(sensitivity.dtype)
+        )
+        head = sensitivity[:count]
+        gains.append(float((head.conj() @ (inverse @ head)).real.clamp(min=0)))
+    full = math.sqrt(gains[-1])
+    for count, gain in zip(ladder, gains, strict=True):
+        if full == 0.0 or math.sqrt(gain) >= fraction * full:
+            return count
+    return ladder[-1]
+
+
 @dataclass(frozen=True)
 class MrgfSolution:
     """A coil solved against a body through the body's field basis.
@@ -745,7 +947,8 @@ class MrgfSolution:
         Each port's total fields over the grid, shape
         ``(n_ports, c, n1, n2, n3)``.
     body
-        Each port's body current, shape ``(n_ports, c * n_voxels)``.
+        Each port's body current, shape ``(n_ports, c * n_voxels)``, or None
+        for a basis read from MARIE's file, which stores none.
     shield
         Each port's shield currents, or None without a shield.
     """
@@ -756,7 +959,7 @@ class MrgfSolution:
     admittance: torch.Tensor
     electric: torch.Tensor
     magnetic: torch.Tensor
-    body: torch.Tensor
+    body: torch.Tensor | None
     shield: torch.Tensor | None = None
 
 
@@ -775,7 +978,7 @@ def solve_coil(
 
     A shield joins as MARIE joins it there: its unknowns come first, with its
     own matrix, its interaction with the coil, and its coupling to the body
-    at the samples, and it takes no drive.
+    at the samples, and its driven ports, if any, come first among the ports.
 
     Parameters
     ----------
@@ -791,7 +994,7 @@ def solve_coil(
     medium
         The same frequency.
     shield
-        An RF shield around the coil and the body, with no driven port.
+        An RF shield around the coil and the body.
     triangle_order, cell_order
         Quadrature orders of the coupling at the samples.
 
@@ -818,12 +1021,20 @@ def solve_coil(
         from mariepy import shield as shield_module
         from mariepy.sie import assemble as assemble_surface
 
-        own = assemble_surface(shield, medium).impedance
+        own = assemble_surface(shield, medium)
         cross = shield_module._coil_coupling(shield, coil, medium, 4)
         matrix = torch.cat(
-            [torch.cat([own, cross], dim=1), torch.cat([cross.T, matrix], dim=1)]
+            [
+                torch.cat([own.impedance, cross], dim=1),
+                torch.cat([cross.T, matrix], dim=1),
+            ]
         )
-        excitation = torch.nn.functional.pad(excitation, (shield.n_dof, 0))
+        excitation = torch.cat(
+            [
+                torch.nn.functional.pad(own.excitation, (0, coil.n_dof)),
+                torch.nn.functional.pad(excitation, (shield.n_dof, 0)),
+            ]
+        )
         tested = torch.cat(
             [
                 coupling_at(
@@ -843,16 +1054,20 @@ def solve_coil(
         basis.n_components, points.shape[0], body.resolution, points.device
     )
     field = inverse[:, None] * tested  # the incident field at the samples
-    impedance = matrix + field.T @ basis.response @ field
+    if basis.tested:
+        # MARIE's ie_solver_svie_mrgf.m: ZbcN.' * iG * (U S V' * ZbcN).
+        impedance = matrix + tested.T @ (inverse[:, None] * (basis.response @ tested))
+    else:
+        impedance = matrix + field.T @ basis.response @ field
     current = torch.linalg.solve(impedance, excitation.T).T
     coefficients = (basis.interpolation @ (field @ current.T)).T
+    admittance = network.symmetrise(network.port_admittance(excitation, current))
     shield_current = None
     if shield is not None:
         shield_current = current[:, : shield.n_dof]
         current = current[:, shield.n_dof :]
     electric = coefficients @ basis.electric
     magnetic = coefficients @ basis.magnetic
-    admittance = network.symmetrise(network.port_admittance(system.excitation, current))
     return MrgfSolution(
         impedance=impedance,
         coil=current,
@@ -861,5 +1076,131 @@ def solve_coil(
         admittance=admittance,
         electric=torch.stack([body.from_dof(row) for row in electric]),
         magnetic=torch.stack([body.from_dof(row) for row in magnetic]),
-        body=coefficients @ basis.current,
+        body=None if basis.current is None else coefficients @ basis.current,
+    )
+
+
+def _read_matlab(group, name):
+    """Read one MATLAB v7.3 array: dimensions reversed, complex as a compound.
+
+    A MATLAB ``p``-by-``q`` matrix comes back as its transpose; a sparse one
+    is a group of ``data``, ``ir`` and ``jc``.
+    """
+    import numpy as np
+
+    item = group[name]
+    if hasattr(item, "keys"):
+        from scipy.sparse import csc_matrix
+
+        shape = (int(item.attrs["MATLAB_sparse"]), len(item["jc"]) - 1)
+        data = item["data"][()]
+        if data.dtype.names:
+            data = data["real"] + 1j * data["imag"]
+        matrix = csc_matrix((data, item["ir"][()], item["jc"][()]), shape=shape)
+        return torch.from_numpy(np.asarray(matrix.todense()))
+    data = item[()]
+    if data.dtype.names:
+        data = data["real"] + 1j * data["imag"]
+    return torch.from_numpy(np.ascontiguousarray(np.asarray(data).T))
+
+
+def read_marie(path, body: VoxelBody, *, device=None) -> FieldBasis:
+    """Read a basis MARIE's ``BASIS_runner.m`` saved, for the body it was built on.
+
+    Reads the datasets ``MRGF_runner.m`` reads from the MATLAB v7.3 file:
+    ``Ue`` and ``Ub``, the total fields; ``X``, the interpolation; the SVD of
+    the response, ``U_hat_inv``, ``S_hat_inv`` and ``V_hat_inv``; and the
+    sampled voxels' coordinates ``xds``, ``yds`` and ``zds``, with ``phi`` when
+    present. MARIE orders a body's unknowns component by component, voxels in
+    column-major order; they are reordered to the body's own. The basis stays
+    in MARIE's tested form and :func:`solve_coil` treats it as MARIE does.
+
+    Parameters
+    ----------
+    path
+        The ``.mat`` file.
+    body
+        The body the basis was built for.
+    device
+        Device to place the tensors on; the body's by default.
+
+    Returns
+    -------
+    FieldBasis
+        With :attr:`FieldBasis.tested` set.
+
+    Raises
+    ------
+    ImportError
+        Without h5py.
+    ValueError
+        If the file's fields do not fit the body, or a sampled voxel is not
+        one of its tissue voxels.
+    """
+    try:
+        import h5py
+    except ImportError as error:  # pragma: no cover - depends on the install
+        raise ImportError(
+            "reading MARIE's basis files needs h5py: pip install 'mariepy[marie]'"
+        ) from error
+    import numpy as np
+
+    device = body.device if device is None else device
+    with h5py.File(path, "r") as handle:
+        group = handle["BASIS"]
+        # MATLAB keeps each field as a column; here each is a row.
+        electric = _read_matlab(group, "Ue").T
+        magnetic = _read_matlab(group, "Ub").T
+        interpolation = _read_matlab(group, "X")
+        u = _read_matlab(group, "U_hat_inv")
+        s = _read_matlab(group, "S_hat_inv")
+        v = _read_matlab(group, "V_hat_inv")
+        coordinates = [
+            _read_matlab(group, name).reshape(-1).real for name in ("xds", "yds", "zds")
+        ]
+        covariance = _read_matlab(group, "phi") if "phi" in group else None
+
+    n_voxels = body.n_voxels
+    components, remainder = divmod(electric.shape[1], n_voxels)
+    if remainder or components not in (3, 12):
+        raise ValueError(
+            f"the basis has {electric.shape[1]} unknowns per field, not 3 or 12 "
+            f"for each of the body's {n_voxels} voxels"
+        )
+
+    # MARIE's voxel order is column-major over the grid.
+    index = body.mask.cpu().nonzero()
+    n1, n2, _ = body.shape
+    fortran = index[:, 0] + n1 * (index[:, 1] + n2 * index[:, 2])
+    marie_position = torch.empty(n_voxels, dtype=torch.long)
+    marie_position[torch.argsort(fortran)] = torch.arange(n_voxels)
+    order = (
+        torch.arange(components)[:, None] * n_voxels + marie_position[None, :]
+    ).reshape(-1)
+
+    origin = torch.tensor(body.origin, dtype=torch.float64)
+    points = torch.stack(coordinates, dim=1)
+    cells = torch.round((points - origin) / body.resolution).long()
+    numbering = torch.full((int(np.prod(body.shape)),), -1, dtype=torch.long)
+    numbering[body.mask.cpu().reshape(-1)] = torch.arange(n_voxels)
+    flat = (cells[:, 0] * n2 + cells[:, 1]) * body.shape[2] + cells[:, 2]
+    samples = numbering[flat]
+    if bool((samples < 0).any()):
+        raise ValueError(
+            "a sampled voxel of the basis is not a tissue voxel of the body"
+        )
+
+    response = u @ s.to(u.dtype) @ v.conj().T
+    return FieldBasis(
+        incident_electric=None,
+        incident_magnetic=None,
+        samples=samples.to(device),
+        interpolation=interpolation.to(torch.complex128).to(device),
+        singular_values=None,
+        linear=components == 12,
+        electric=electric[:, order].to(torch.complex128).to(device),
+        magnetic=magnetic[:, order].to(torch.complex128).to(device),
+        response=response.to(torch.complex128).to(device),
+        covariance=None if covariance is None else covariance.to(device),
+        tested=True,
     )

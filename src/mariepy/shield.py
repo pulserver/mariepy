@@ -81,8 +81,7 @@ def assemble(
     Parameters
     ----------
     surface
-        The shield's surface. It may carry lumped elements; it may not carry
-        driven ports.
+        The shield's surface, with its lumped elements and any driven ports.
     coil
         The coil it surrounds: a surface coil, a wire coil or both.
     body
@@ -102,14 +101,7 @@ def assemble(
     -------
     Shield
         Ready for :class:`mariepy.system.ShieldedOperator`.
-
-    Raises
-    ------
-    NotImplementedError
-        If the shield carries a driven port.
     """
-    if surface.n_driven:
-        raise NotImplementedError("a shield with driven ports is not supported")
     return Shield(
         surface=surface,
         system=assemble_system(surface, medium),

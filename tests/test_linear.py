@@ -11,6 +11,7 @@ from mariepy.constants import Medium
 from mariepy.incident import plane_wave
 from mariepy.preconditioner import body_diagonal
 from mariepy.quadrature import gauss_legendre_1d
+from mariepy.solver import BodyOperator, solve_body
 
 RESOLUTION = 0.01
 WAVENUMBER = 30.0
@@ -315,3 +316,24 @@ def test_a_projected_plane_wave_rebuilds_the_wave_inside_each_voxel():
             rtol=0.0,
             atol=1e-2 * abs(slope[axis]) * sampled.abs().max(),
         )
+
+
+def test_the_linear_basis_solves_in_the_steps_the_constant_basis_takes(device):
+    """Refining the current inside a voxel adds unknowns, not ill-conditioning.
+
+    In either basis the body equation is the identity minus a compact term, so
+    the same sphere at the same tolerance is reached in a comparable number of
+    GMRES steps. A left scaling that varies from one basis function to the next
+    breaks that, and shows up here as several times the steps.
+    """
+    body = VoxelBody.sphere(0.03, 0.006, 52.0, 0.55, padding=1, device=device)
+    medium = Medium(3.0)
+    orders = {"far_order": 4, "medium_order": 6, "near_order": 6}
+    steps = []
+    for linear in (False, True):
+        operator = BodyOperator.build(body, medium, linear=linear, **orders)
+        incident = plane_wave(body, medium, linear=linear)
+        solution = solve_body(operator, incident, tol=1e-6, maxit=400)
+        assert solution.converged
+        steps.append(len(solution.residuals) - 1)
+    assert steps[1] <= 2 * steps[0]

@@ -112,7 +112,7 @@ matching stage only to the ports whose network carries it, where the top-level
 copy adds it to every port. The two agree when every port has the same matching
 topology. Milestone 3 ports the nested copy alone.
 
-**Shields.** A shield is a surface with no port of its own. Its own matrix is
+**Shields.** A shield is a surface around the coil and the body. Its own matrix is
 the coil's, `sie.assemble`; its coupling to the coil is assembled whole, where
 MARIE compresses it by adaptive cross approximation, since a coil and its shield
 together carry few enough unknowns for the dense block; its coupling to the body
@@ -121,16 +121,25 @@ is a tensor train per body unknown, built by the DMRG cross method ported into
 `maxvol2.m` never advances its iteration count, so its loop can run without
 end, and here it is bounded; `reort.m` compares squared entries without
 conjugating, which on complex data compares real parts, and here it compares
-squared moduli. A shield with driven ports is not supported.
+squared moduli. A shield may carry lumped elements and driven ports of its
+own; its ports come first, as in MARIE's `rhs_assembly.m`, and its element
+file is merged first for co-simulation. A simulation file that names a
+shield and no coil is solved with the shield as the coil, through the
+precorrected FFT rather than tensor trains.
 
 **Wire coils.** `wire.py` ports MARIE's wire coil: its geometry, its own
 matrix with the closed forms for a segment against itself, its lumped loads,
 its port drive and its coupling kernels. The precorrected FFT takes a wire coil
 as it takes a surface one, since the two differ only in where a basis function
-sits, how wide it is and which kernel gives its field. The port reads closed
-loops only: MARIE's open-wire branch of `ProcessLoops.m` assigns rows of
-mismatched size and cannot run. It departs from MARIE in two places:
+sits, how wide it is and which kernel gives its field. It departs from MARIE
+in three places:
 
+- MARIE's open-wire branch of `ProcessLoops.m` assigns rows of mismatched
+  size and cannot run. An open wire here carries a basis function at every
+  interior node and none at its two ends, where the current vanishes; a port
+  on an end segment is refused. A centre-fed half-wave dipole converges, in
+  the segment count, to an input impedance above the infinitely thin dipole's
+  73 + j42 ohms, as a wire of finite radius has.
 - MARIE's wire coupling sources sample the falling half of each basis function
   with the rising ramp, so the current they couple to the body is not the one
   the wire's own matrix solves for. The torch kernel gives the falling half its
@@ -191,12 +200,13 @@ nothing is detuned. The port departs from MARIE in these places:
   own search found values; the port adds them when the side has ports.
 
 **Field bases and performance maps.** `basis.py` ports MARIE's basis and MRGF
-paths: the incident-field basis that a support surface, or a shell of voxel
-currents around the body, spans, its interpolation voxels, the body solved once per basis field, the ultimate intrinsic SNR and
-transmit efficiency, and a coil solved through the basis with its coupling
-integrated at the interpolation voxels only. `metrics.py` ports the SNR,
-transmit-efficiency and g-factor maps, and `plot.py` MARIE's figures, with
-matplotlib as an optional dependency. The port departs from MARIE in three
+paths. The incident-field basis is spanned by a support surface, or by a shell
+of voxel currents that hugs the body or is spherical; then come its
+interpolation voxels, the body solved once per basis field, the ultimate
+intrinsic SNR and transmit efficiency, and a coil solved through the basis with
+its coupling integrated at the interpolation voxels only. `metrics.py` ports
+the SNR, transmit-efficiency and g-factor maps, and `plot.py` MARIE's figures,
+with matplotlib as an optional dependency. The port departs from MARIE in five
 places:
 
 - MARIE keeps the incident basis in tested form, the Gram matrix applied, and
@@ -213,7 +223,14 @@ places:
   sample's spectrum drops below its tolerance, and on an operator whose
   spectrum never does it never stops; the port stops once the sample has as
   many columns as the operator has columns or rows.
-- MARIE's HDF5 basis files are not read; a basis is built here and saved with
+- MARIE's spherical shell (`geo_spherical_basis.m`) reads its inputs from a
+  variable it never defines, centres its padded grid at the shell's thickness
+  rather than at the body, and sizes the enclosing sphere from the body's
+  position. The port pads the grid about the body and takes the grid's
+  half-diagonal, MARIE's value for a body centred at the origin.
+- MARIE's saved basis files are read with h5py and kept in MARIE's tested
+  form, which the reduced coil solve then follows as MARIE does, piecewise-
+  linear inconsistency included; bases built here are saved with
   `FieldBasis.save`.
 
 On a coarse body the ultimate SNR does not settle as basis fields are added:
@@ -326,9 +343,9 @@ against the inductance the loop's own geometry implies.
 field jumps across a dielectric boundary by the contrast ratio, and this basis
 puts that jump on a staircase. The error is therefore concentrated in the
 boundary voxels, falls about as fast as the voxel size, and grows with contrast:
-a sphere at brain-like permittivity needs far more than ten voxels across its
-radius before its interior field is worth quoting, while at a permittivity of 2
-ten voxels already suffice. MARIE's own example runs the piecewise-linear basis
+for a 5 cm sphere at brain-like permittivity the interior field's error falls
+from 31% to 16% to 7.5% as the voxel halves from 10 mm to 2.5 mm, while at a
+permittivity of 2 ten voxels across the radius already suffice. MARIE's own example runs the piecewise-linear basis
 at 2 mm for this reason. The Mie criterion is therefore measured over the
 interior rather than over every voxel, and the refinement legs carry the grids
 they were measured on.
@@ -463,11 +480,27 @@ What this leaves uncovered is recorded rather than implied away:
   torch cannot batch runs in C++ in the pybind11 extension, on CPU buffers, and
   its result moves to the caller's device. Work that torch can batch stays in
   torch, where one code path runs on either device, and moves to C++ when a
-  profile shows it dominates, as **Loops** above says. Milestone 1's own profile names the
-  first candidate: assembling the body kernel takes tens of seconds, nearly all
-  of it the six-dimensional volume-volume rule at `Np_1D_medium_V`, whose cost
-  is set by that order and by the 512 offsets it covers rather than by the size
-  of the grid.
+  profile shows it dominates, as **Loops** above says. Milestone 1's profile
+  named the first: the six-dimensional volume-volume rule at `Np_1D_medium_V`.
+  The kernel sees only the separation of two points, so the port departs from
+  MARIE's `q⁶`-point product rule and integrates over the separation, weighted
+  by the two cells' overlap, with `(2q + 2)³` points; at every order tested
+  its error against a converged product rule is the smaller. It runs in C++
+  on CPU and in torch otherwise, each checked against the other. The DIRECTFN
+  face integrals of touching cells release the GIL and run on threads. A
+  body kernel on a 60³ grid then assembles in about ten seconds for the
+  piecewise-constant basis and half a minute for the piecewise-linear one,
+  a cost set by the near offsets rather than by the grid.
+- **Circulant embedding.** A Toeplitz block of `n` offsets sits inside any
+  circulant of `2n - 1` rows or more, where MARIE always takes `2n`. The port
+  takes the shortest length with no prime factor above seven, since an FFT of a
+  length carrying a large prime factor costs several times the one it needs.
+  The symbol, not the caller, names the length, so the choice is local to
+  `tucker.transform_length`.
+- **Body solve.** The body operator is scaled by its own Galerkin mass term, so
+  what GMRES sees is the identity minus a compact term and no preconditioner is
+  applied. MARIE's `prec_vie.m` inverts that mass term, which is what the
+  coupled system still needs, since there the mass term stands in the matrix.
 - **Arrays and units.** Arrays are C-ordered with the batch dimension first:
   (ports, …) and (N, Nc, Nc). Units are SI, and frequencies are in Hz.
 - **Provenance.** Every ported function names its MARIE source file in its

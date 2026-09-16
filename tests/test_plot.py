@@ -98,3 +98,18 @@ def test_the_sweep_figure_marks_the_working_frequency():
     ]
     assert any(np.allclose(x, 128.0) for x in vertical)
     assert len(figure.axes[0].get_legend().get_texts()) == 4
+
+
+def test_the_ideal_pattern_figure_draws_one_panel_per_phase():
+    body = VoxelBody.sphere(0.02, 0.01, 52.0, 0.55, padding=1)
+    coil = _surface()
+    generator = torch.Generator().manual_seed(1)
+    current = torch.randn(coil.n_dof, dtype=torch.complex128, generator=generator)
+    phases = (0.0, np.pi / 2, np.pi)
+    figure = plot.ideal_current_patterns(
+        coil, current, body, target=torch.zeros(3), phases=phases
+    )
+    assert len(figure.axes) == len(phases)
+    for ax, phase in zip(figure.axes, phases, strict=True):
+        assert f"{phase:.2f}" in ax.get_title()
+        assert ax.collections

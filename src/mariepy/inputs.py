@@ -10,10 +10,8 @@ with the same name and a ``.json`` suffix, optionally an RF shield under
 beside it in the same way, and optionally a basis support surface under
 ``<data>/coils/basis_files/``.
 
-A file that asks for what the port does not read raises, saying so, rather
-than being solved as something it is not: MARIE's HDF5 basis files are not
-read, and a basis is built with :mod:`mariepy.basis` from the support surface
-instead.
+A precomputed basis file is located under ``<data>/bases/`` and read on
+request with :func:`mariepy.basis.read_marie`.
 """
 
 from __future__ import annotations
@@ -46,30 +44,38 @@ class Case:
         The body model.
     coil
         The surface coil, the wire coil, or both together, with their ports
-        and lumped elements.
+        and lumped elements; None for a file that names only a basis.
     linear
         Whether the file asks for the piecewise-linear body basis; pass it to
         :func:`~mariepy.solver.solve`.
     shield
         The RF shield the file names, or None; pass it to
-        :func:`~mariepy.solver.solve`.
+        :func:`~mariepy.solver.solve`. A shield named without a coil is the
+        case's coil instead.
     network
         The coil's ports and lumped values as co-simulation reads them, with
-        the file's ``TMD`` flag, the wire's first; pass it to
+        the file's ``TMD`` flag, the shield's rows first, then the wire's; pass
+        it to
         :func:`~mariepy.cosim.co_simulate`.
     basis_support
         The surface the file names to build a field basis on, MARIE's
         ``SurfaceBasisSupportFile``, or None; pass it to
         :func:`~mariepy.basis.surface_basis`.
+    basis_file
+        Where MARIE's precomputed basis file would be, under
+        ``<data>/bases/``, or None; read it with
+        :func:`~mariepy.basis.read_marie`. MARIE's direct solver ignores it,
+        so it is not read here.
     """
 
     medium: Medium
     body: VoxelBody
-    coil: SurfaceCoil | WireCoil | CombinedCoil
+    coil: SurfaceCoil | WireCoil | CombinedCoil | None
     linear: bool = False
     shield: SurfaceCoil | None = None
     network: Network | None = None
     basis_support: SurfaceCoil | None = None
+    basis_file: Path | None = None
 
 
 def read_case(
@@ -98,10 +104,9 @@ def read_case(
 
     Raises
     ------
-    NotImplementedError
-        If the file asks for MARIE's precomputed basis file alone.
     ValueError
-        If the file names no coil, or a body basis MARIE does not know.
+        If the file names neither a coil nor a basis, or a body basis MARIE
+        does not know.
     """
     path = Path(path)
     data = path.parent.parent if data is None else Path(data)
@@ -112,17 +117,21 @@ def read_case(
         raise ValueError(f"{path.name} names body basis {basis}; MARIE knows 0 and 1")
     coil_name = settings.get("CoilFile")
     wire_name = settings.get("WireFile")
-    if settings.get("BasisFile") and not (coil_name or wire_name):
-        raise NotImplementedError(
-            f"{path.name} asks for MARIE's precomputed basis file, which this port "
-            "does not read; build the basis with mariepy.basis.surface_basis from "
-            "the case's basis_support"
-        )
-    if not (coil_name or wire_name):
-        raise ValueError(f"{path.name} names no coil")
+    basis_name = settings.get("BasisFile")
+    if not (coil_name or wire_name or settings.get("ShieldFile") or basis_name):
+        raise ValueError(f"{path.name} names no coil and no basis")
 
     tmd = bool(settings.get("TMD", 0))
     element_files = []
+    shield = None
+    if settings.get("ShieldFile"):
+        shield_file = data / "coils" / "shield_files" / settings["ShieldFile"]
+        shield_mesh = SurfaceMesh.read_gmsh22(shield_file, device=device or "cpu")
+        shield_elements = ()
+        if shield_file.with_suffix(".json").is_file():
+            element_files.append(shield_file.with_suffix(".json"))
+            shield_elements = read_lumped_elements(element_files[-1], tmd=tmd)
+        shield = SurfaceCoil.build(shield_mesh, shield_elements)
     wire = surface = None
     if wire_name:
         wire_file = data / "coils" / "wire_files" / wire_name
@@ -152,17 +161,10 @@ def read_case(
         coil = CombinedCoil(wire=wire, surface=surface)
     else:
         coil = wire if wire is not None else surface
-
-    shield = None
-    if settings.get("ShieldFile"):
-        shield_file = data / "coils" / "shield_files" / settings["ShieldFile"]
-        shield_mesh = SurfaceMesh.read_gmsh22(shield_file, device=device or "cpu")
-        shield_elements = ()
-        if shield_file.with_suffix(".json").is_file():
-            shield_elements = read_lumped_elements(
-                shield_file.with_suffix(".json"), tmd=tmd
-            )
-        shield = SurfaceCoil.build(shield_mesh, shield_elements)
+    if coil is None:
+        # A shield alone is a surface conductor like any coil; it is solved as
+        # one, through the precorrected FFT rather than tensor trains.
+        coil, shield = shield, None
 
     return Case(
         medium=Medium(float(settings["B0"]), settings.get("Nucleus", "1H")),
@@ -174,4 +176,5 @@ def read_case(
         shield=shield,
         network=read_network(*element_files, tmd=tmd),
         basis_support=support,
+        basis_file=data / "bases" / basis_name if basis_name else None,
     )

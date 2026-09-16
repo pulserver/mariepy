@@ -14,6 +14,7 @@ find_package(Threads REQUIRED)
 pybind11_add_module(_ext
     ${CMAKE_SOURCE_DIR}/src/cpp/module.cpp
     ${CMAKE_SOURCE_DIR}/src/cpp/coupling.cpp
+    ${CMAKE_SOURCE_DIR}/src/cpp/volume.cpp
 )
 
 target_include_directories(_ext PRIVATE ${CMAKE_SOURCE_DIR}/src/cpp)

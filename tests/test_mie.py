@@ -91,9 +91,9 @@ def test_the_mie_series_reproduces_the_quasi_static_internal_field():
     field = mie.internal_field(points, 1e-4, index, 1.0)
     expected = 3.0 / (index**2 + 2.0)
     assert np.allclose(field[:, 0], expected, atol=1e-4)
-    # The transverse components are the residual wave correction at a finite,
-    # if tiny, size parameter: five orders below the field they sit beside.
-    assert np.allclose(field[:, 1:], 0.0, atol=1e-5)
+    # The transverse components are the magnetic dipole's correction, of order
+    # m k r: here 1e-4 of the field they sit beside.
+    assert np.abs(field[:, 1:]).max() <= 2 * abs(index) * 1.0 * 1e-4
 
 
 def test_a_plane_wave_is_transverse(device):
@@ -229,3 +229,55 @@ def test_at_brain_like_contrast_the_linear_basis_cuts_the_staircase_error():
     linear = _quasi_static_error(0.02, 0.004, 52.0, linear=True)
     constant = _quasi_static_error(0.02, 0.004, 52.0)
     assert linear < 0.6 * constant, f"linear {linear:.4f}, constant {constant:.4f}"
+
+
+def _random_points(radius, count, seed):
+    generator = np.random.default_rng(seed)
+    points = generator.uniform(-1, 1, (4 * count, 3))
+    points = points[np.linalg.norm(points, axis=1) < 1][:count]
+    return points * radius
+
+
+def test_one_layer_is_the_homogeneous_sphere():
+    index = np.conj(np.sqrt(52 - 0.55j / (2 * np.pi * 128e6 * 8.854e-12)))
+    points = _random_points(0.1, 200, seed=1)
+    wavenumber = 2.68
+    homogeneous = mie.internal_field(points, 0.1, index, wavenumber)
+    for layers, indices in (([0.1], [index]), ([0.04, 0.1], [index, index])):
+        layered = mie.layered_internal_field(points, layers, indices, wavenumber)
+        np.testing.assert_allclose(layered, homogeneous, rtol=1e-8, atol=1e-12)
+
+
+def test_the_layered_field_meets_the_interface_conditions():
+    """Tangential E and normal D are continuous across each interface."""
+    radii = [0.04, 0.07, 0.1]
+    permittivities = np.array([60 - 8j, 40 - 5j, 20 - 3j])
+    indices = np.conj(np.sqrt(permittivities))
+    directions = _random_points(1.0, 50, seed=2)
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+    for layer, radius in enumerate(radii[:-1]):
+        inner = mie.layered_internal_field(
+            directions * radius * (1 - 1e-9), radii, indices, 2.68
+        )
+        outer = mie.layered_internal_field(
+            directions * radius * (1 + 1e-9), radii, indices, 2.68
+        )
+        normal_inner = np.sum(inner * directions, axis=1)
+        normal_outer = np.sum(outer * directions, axis=1)
+        tangential = (inner - normal_inner[:, None] * directions) - (
+            outer - normal_outer[:, None] * directions
+        )
+        assert np.abs(tangential).max() <= 1e-6 * np.abs(inner).max()
+        np.testing.assert_allclose(
+            permittivities[layer] * normal_inner,
+            permittivities[layer + 1] * normal_outer,
+            rtol=1e-6,
+        )
+
+
+@pytest.mark.slow
+def test_the_solver_converges_to_the_mie_series_at_brain_permittivity():
+    """Where the magnetic multipoles matter, the interior error halves with the voxel."""
+    errors = [_interior_error(RADIUS, res, 52.0) for res in (0.01, 0.005)]
+    assert errors[1] < 0.6 * errors[0]
+    assert errors[1] < 0.2

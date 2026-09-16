@@ -1,5 +1,6 @@
 """A body's field basis, and a coil solved through it against the direct solve."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -14,6 +15,20 @@ from mariepy.solver import BodyOperator, solve_body
 
 ORDERS = {"far_order": 2, "medium_order": 2, "near_order": 4}
 TOLERANCE = 1e-9
+
+# A driven shield's own port is the one configuration here whose reduced model
+# does not reach the solver tolerance. The other two reduced-against-dense
+# checks agree to 4e-12; this one agrees to between 2e-9 and 2e-7, and which end
+# of that it lands on is decided by the interpolation points DEIM picks. Those
+# come from singular vectors that a near-degenerate spectrum leaves free to
+# rotate, so a different BLAS picks differently: perturbing the coupling by
+# 1e-14, which is nothing physical, moves the picked count between 30 and 33 and
+# the agreement over two orders of magnitude, with 8 of 24 draws above 1e-7.
+# The basis is rank-saturated -- tightening its tolerance from 1e-12 to 1e-14
+# keeps no further vectors -- so this is the accuracy the rank allows, not a
+# tolerance that can be tightened. The bound is on the spread, not on one draw
+# of it.
+DRIVEN_SHIELD_AGREEMENT = 1e-6
 
 
 def _case():
@@ -158,6 +173,60 @@ def test_a_shielded_coil_through_the_basis_is_the_shielded_coil_coupled_whole():
     error = (reduced.admittance - dense).abs().max()
     assert float(error / dense.abs().max()) <= 1e-7
     assert reduced.shield.shape == (2, shield.n_dof)
+
+
+def test_a_driven_shield_s_port_leads_the_reduced_ports():
+    """A shield with a port: its drive is its own, and its port comes first."""
+    from tests.test_shield import _driven_pair
+
+    medium, body, _ = _case()
+    shield, coil, _ = _driven_pair()
+    support = SurfaceCoil.build(
+        SurfaceMesh(
+            nodes=torch.cat([shield.mesh.nodes, coil.mesh.nodes]),
+            triangles=torch.cat(
+                [shield.mesh.triangles, coil.mesh.triangles + shield.mesh.n_nodes]
+            ),
+            triangle_tags=torch.cat(
+                [shield.mesh.triangle_tags, coil.mesh.triangle_tags]
+            ),
+            lines=torch.zeros((0, 2), dtype=torch.long),
+            line_tags=torch.zeros(0, dtype=torch.long),
+        )
+    )
+    incident = basis_module.surface_basis(
+        body, support, medium, tol=1e-12, interpolation_tol=1e-12
+    )
+    joint = basis_module.solve(incident, body, medium, tol=TOLERANCE, **ORDERS)
+    system = sie.assemble(coil, medium)
+    reduced = basis_module.solve_coil(coil, system, joint, body, medium, shield=shield)
+
+    own = sie.assemble(shield, medium)
+    cross = shield_module._coil_coupling(shield, coil, medium, 4)
+    whole = torch.cat(
+        [
+            torch.cat([own.impedance, cross], dim=1),
+            torch.cat([cross.T, system.impedance], dim=1),
+        ]
+    )
+    drive = torch.cat(
+        [
+            torch.nn.functional.pad(own.excitation, (0, coil.n_dof)),
+            torch.nn.functional.pad(system.excitation, (shield.n_dof, 0)),
+        ]
+    )
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    tested = torch.cat(
+        [
+            basis_module.coupling_at(part, centres, medium, body.resolution)
+            for part in (shield, coil)
+        ],
+        dim=1,
+    )
+    dense = _dense_from(tested, whole, drive, body, medium, False)
+    assert reduced.admittance.shape == (3, 3)
+    error = (reduced.admittance - dense).abs().max()
+    assert float(error / dense.abs().max()) <= DRIVEN_SHIELD_AGREEMENT
 
 
 def test_the_basis_fields_are_the_body_s_own_total_fields(solved):
@@ -340,3 +409,247 @@ def _dense_fields(coil, body, medium):
     )
     magnetic = body.from_dof(coil_current @ (inverse[:, None] * tested_k).T) + scattered
     return electric, magnetic
+
+
+def test_a_basis_saved_as_marie_saves_it_solves_a_coil_as_ours_does(solved, tmp_path):
+    """MARIE's file layout, its voxel order and its tested form, read back."""
+    pytest.importorskip("h5py")
+    from tests.marie_files import write_marie_basis
+
+    medium, body, coil, field_basis, linear = solved
+    if linear:
+        pytest.skip("MARIE's tested form matches the field form for the constant basis")
+    gram = body.resolution**3
+    n = body.n_voxels
+    index = body.mask.nonzero()
+    n1, n2, _ = body.shape
+    fortran = index[:, 0] + n1 * (index[:, 1] + n2 * index[:, 2])
+    to_marie = torch.argsort(fortran)  # MARIE position -> our voxel
+    order = (torch.arange(3)[:, None] * n + to_marie[None, :]).reshape(-1)
+
+    left, values, right_h = torch.linalg.svd(field_basis.response / gram)
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    sampled = centres[field_basis.samples]
+    write_marie_basis(
+        tmp_path / "basis.mat",
+        {
+            "Ue": (gram * field_basis.electric[:, order]).T.numpy(),
+            "Ub": (gram * field_basis.magnetic[:, order]).T.numpy(),
+            "X": (field_basis.interpolation / gram).numpy(),
+            "U_hat_inv": left.numpy(),
+            "S_hat_inv": torch.diag(values).numpy(),
+            "V_hat_inv": right_h.conj().T.resolve_conj().numpy(),
+            "xds": sampled[:, 0:1].numpy(),
+            "yds": sampled[:, 1:2].numpy(),
+            "zds": sampled[:, 2:3].numpy(),
+        },
+    )
+    read = basis_module.read_marie(tmp_path / "basis.mat", body)
+    assert read.tested and read.rank == field_basis.rank
+    system = sie.assemble(coil, medium)
+    ours = basis_module.solve_coil(coil, system, field_basis, body, medium)
+    theirs = basis_module.solve_coil(coil, system, read, body, medium)
+    torch.testing.assert_close(theirs.admittance, ours.admittance, rtol=1e-9, atol=0)
+    torch.testing.assert_close(theirs.electric, ours.electric, rtol=1e-8, atol=1e-12)
+    assert theirs.body is None
+
+
+def test_a_basis_for_another_body_is_refused(solved, tmp_path):
+    pytest.importorskip("h5py")
+    from tests.marie_files import write_marie_basis
+
+    _, body, _, _, _ = solved
+    write_marie_basis(
+        tmp_path / "basis.mat",
+        {
+            "Ue": np.ones((7, 2), dtype=complex),
+            "Ub": np.ones((7, 2), dtype=complex),
+            "X": np.ones((2, 3), dtype=complex),
+            "U_hat_inv": np.eye(3, dtype=complex),
+            "S_hat_inv": np.eye(3),
+            "V_hat_inv": np.eye(3, dtype=complex),
+            "xds": np.zeros((1, 1)),
+            "yds": np.zeros((1, 1)),
+            "zds": np.zeros((1, 1)),
+        },
+    )
+    with pytest.raises(ValueError, match="3 or 12"):
+        basis_module.read_marie(tmp_path / "basis.mat", body)
+
+
+def test_the_spherical_shell_lies_between_its_two_spheres():
+    body = VoxelBody.sphere(0.02, 0.01, 52.0, 0.55, padding=1)
+    around, padding = basis_module.shell(
+        body.mask, body.resolution, distance=0.01, thickness=2, shape="sphere"
+    )
+    shape = torch.tensor(body.shape, dtype=torch.float64)
+    centre = torch.ceil(shape / 2) - 1 + padding
+    half = float(torch.linalg.vector_norm((shape - 1) * body.resolution / 2))
+    radius = (around.nonzero().to(torch.float64) - centre).norm(dim=1) * body.resolution
+    assert float(radius.min()) >= half + 0.01 - 1e-12
+    assert float(radius.max()) <= half + 0.01 + 2 * body.resolution + 1e-12
+    inside = torch.nn.functional.pad(body.mask, (padding,) * 6)
+    assert not bool((around & inside).any())
+    # Every direction out of the centre crosses it.
+    for axis in range(3):
+        line = around.movedim(axis, 0)[
+            :, int(centre[(axis + 1) % 3]), int(centre[(axis + 2) % 3])
+        ]
+        assert bool(line[: int(centre[axis])].any()) and bool(
+            line[int(centre[axis]) :].any()
+        )
+
+
+def test_an_unknown_shell_shape_is_refused():
+    with pytest.raises(ValueError, match="cube"):
+        basis_module.shell(
+            torch.ones(2, 2, 2, dtype=torch.bool),
+            0.01,
+            distance=0.01,
+            thickness=1,
+            shape="cube",
+        )
+
+
+def test_a_loop_outside_the_spherical_shell_does_not_beat_its_ultimate_snr():
+    medium = Medium(3.0)
+    body = VoxelBody.sphere(0.03, 0.01, 52.0, 0.55, padding=1)
+    incident = basis_module.dipole_basis(
+        body, medium, distance=0.005, thickness=1, support="sphere", block=400, **ORDERS
+    )
+    field_basis = basis_module.solve(incident, body, medium, tol=TOLERANCE, **ORDERS)
+    assert field_basis.rank < 3 * body.n_voxels
+    port = Port(tag=1, kind="port", load="none", value=0.0, quality=1.0, voltage=1.0)
+    coil = SurfaceCoil.build(
+        SurfaceMesh.loop(radius=0.09, width=0.01, n_around=16, n_across=1), (port,)
+    )
+    electric, magnetic = _dense_fields(coil, body, medium)
+    covariance = metrics.noise_covariance(
+        electric, body.conductivity, body.mask, body.resolution
+    )
+    centres = fields.at_centres(magnetic)
+    b1_minus = medium.permeability * (centres[:, 0] - 1j * centres[:, 1])
+    coil_snr = metrics.snr(b1_minus, covariance, medium, body.resolution, body.mask)
+    ultimate, _ = basis_module.ultimate_maps(field_basis, body, medium)
+    assert bool((coil_snr[body.mask] <= ultimate[body.mask] * 1.05).all())
+
+
+def test_each_basis_field_is_the_field_its_support_current_puts_on_the_body(solved):
+    medium, body, coil, field_basis, linear = solved
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    inverse = basis_module._inverse_mass(
+        field_basis.n_components, body.n_voxels, body.resolution, "cpu"
+    )
+    tested = basis_module.coupling_at(
+        coil, centres, medium, body.resolution, magnetic=True, linear=linear
+    )
+    driven = (inverse[:, None] * (tested @ field_basis.support_currents.T)).T
+    torch.testing.assert_close(driven, field_basis.incident_magnetic)
+
+
+def test_the_ultimate_weights_give_each_voxel_a_unit_sensitivity(solved):
+    """MARIE normalises the matched filter so the combined channel sees unit B1-."""
+    medium, _, _, field_basis, _ = solved
+    weights = basis_module.ultimate_weights(field_basis, medium)
+    sensitivity = basis_module._receive_sensitivity(
+        field_basis, medium, field_basis.rank
+    )
+    combined = torch.einsum("pv,pv->v", weights, sensitivity)
+    torch.testing.assert_close(combined, torch.ones_like(combined))
+
+
+def _channel_noise(weights, covariance):
+    """The noise the combined channel sees, ``w^T Psi conj(w)``."""
+    return float((weights @ covariance @ weights.conj()).real)
+
+
+def test_no_other_unit_sensitivity_leaves_less_noise_than_the_ultimate_weights(solved):
+    medium, body, _, field_basis, _ = solved
+    voxel = body.n_voxels // 2
+    weights = basis_module.ultimate_weights(field_basis, medium)[:, voxel]
+    sensitivity = basis_module._receive_sensitivity(
+        field_basis, medium, field_basis.rank
+    )[:, voxel]
+    least = _channel_noise(weights, field_basis.covariance)
+    generator = torch.Generator().manual_seed(4)
+    for _ in range(8):
+        step = torch.randn(
+            field_basis.rank, dtype=torch.complex128, generator=generator
+        )
+        step = weights.abs().max() * (step - (step @ sensitivity) * weights)
+        other = weights + step
+        torch.testing.assert_close(other @ sensitivity, torch.ones(()).to(other.dtype))
+        assert _channel_noise(other, field_basis.covariance) >= least
+
+
+def test_the_ultimate_snr_is_what_the_ultimate_weights_achieve(solved):
+    """The map and the weights are the same statement: one channel, matched."""
+    medium, body, _, field_basis, _ = solved
+    voxel = body.n_voxels // 2
+    weights = basis_module.ultimate_weights(field_basis, medium)[:, voxel]
+    noise = _channel_noise(weights, field_basis.covariance)
+    scale = (
+        body.resolution**3
+        * medium.angular_frequency
+        * metrics.equilibrium_magnetisation(medium)
+        / np.sqrt(4 * metrics.BOLTZMANN * metrics.BODY_TEMPERATURE)
+    )
+    ultimate, _ = basis_module.ultimate_maps(field_basis, body, medium)
+    here = body.mask.reshape(-1).nonzero()[voxel, 0]
+    assert float(ultimate.reshape(-1)[here]) == pytest.approx(
+        scale / np.sqrt(noise), rel=1e-9
+    )
+
+
+def test_the_ideal_pattern_is_its_weights_carried_onto_the_support(solved):
+    medium, body, coil, field_basis, _ = solved
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    voxel = body.n_voxels // 2
+    modes = field_basis.rank
+    pattern = basis_module.ideal_currents(
+        field_basis, body, medium, centres[voxel], modes=modes
+    )
+    weights = basis_module.ultimate_weights(field_basis, medium, modes=modes)[:, voxel]
+    assert pattern.shape == (1, coil.n_dof)
+    torch.testing.assert_close(pattern[0], weights @ field_basis.support_currents)
+
+
+def test_the_default_mode_count_keeps_the_share_of_the_snr_it_promises(solved):
+    """Truncation is what keeps the pattern smooth, so it has to be paid for."""
+    medium, body, _, field_basis, _ = solved
+    voxel = body.n_voxels // 2
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    sensitivity = basis_module._receive_sensitivity(
+        field_basis, medium, field_basis.rank
+    )[:, voxel]
+    count = basis_module._chosen_modes(field_basis, sensitivity, 0.95)
+    assert 1 <= count <= field_basis.rank
+
+    def gain(modes):
+        inverse = torch.linalg.inv(
+            field_basis.covariance[:modes, :modes].to(sensitivity.dtype)
+        )
+        head = sensitivity[:modes]
+        return float((head.conj() @ (inverse @ head)).real)
+
+    assert np.sqrt(gain(count)) >= 0.95 * np.sqrt(gain(field_basis.rank))
+    if count > 1:
+        earlier = basis_module._mode_ladder(field_basis.rank)
+        before = max(m for m in earlier if m < count)
+        assert np.sqrt(gain(before)) < 0.95 * np.sqrt(gain(field_basis.rank))
+    truncated = basis_module.ideal_currents(field_basis, body, medium, centres[voxel])
+    assert truncated.shape == (1, field_basis.support_currents.shape[1])
+
+
+def test_a_basis_without_a_support_surface_has_no_ideal_pattern():
+    body = VoxelBody.sphere(0.02, 0.01, 52.0, 0.55, padding=1)
+    basis = basis_module.FieldBasis(
+        incident_electric=None,
+        incident_magnetic=None,
+        samples=torch.zeros(1, dtype=torch.long),
+        interpolation=torch.zeros((1, 3), dtype=torch.complex128),
+        singular_values=None,
+        electric=torch.zeros((1, 3 * body.n_voxels), dtype=torch.complex128),
+    )
+    with pytest.raises(ValueError, match="support surface"):
+        basis_module.ideal_currents(basis, body, Medium(3.0), torch.zeros(3))

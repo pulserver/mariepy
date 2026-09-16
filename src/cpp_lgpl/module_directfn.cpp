@@ -157,6 +157,8 @@ dcomplex voxel_self(const Array &vertices, const Array &centre_source,
     std::vector<double> np_ = mutable_point(normal_observer, "normal_observer");
 
     dcomplex value = 0.0;
+    // DIRECTFN keeps no state, so calls may run on several threads at once.
+    py::gil_scoped_release release;
     create_ST(&r[0], &r[3], &r[6], &r[9], n_points, n_points, n_points, n_points,
               wavenumber, voxel_size, rq_c.data(), rp_c.data(), nq.data(),
               np_.data(), kernel_type, l, lp, &value);
@@ -176,6 +178,8 @@ dcomplex voxel_edge(const Array &vertices, const Array &centre_source,
     std::vector<double> np_ = mutable_point(normal_observer, "normal_observer");
 
     dcomplex value = 0.0;
+    // DIRECTFN keeps no state, so calls may run on several threads at once.
+    py::gil_scoped_release release;
     create_EA(&r[0], &r[3], &r[6], &r[9], &r[12], &r[15], n_points, n_points,
               n_points, n_points, wavenumber, voxel_size, rq_c.data(),
               rp_c.data(), nq.data(), np_.data(), kernel_type, l, lp, &value);
@@ -195,6 +199,8 @@ dcomplex voxel_vertex(const Array &vertices, const Array &centre_source,
     std::vector<double> np_ = mutable_point(normal_observer, "normal_observer");
 
     dcomplex value = 0.0;
+    // DIRECTFN keeps no state, so calls may run on several threads at once.
+    py::gil_scoped_release release;
     create_VA(&r[0], &r[3], &r[6], &r[9], &r[12], &r[15], &r[18], n_points,
               n_points, n_points, n_points, wavenumber, voxel_size, rq_c.data(),
               rp_c.data(), nq.data(), np_.data(), kernel_type, l, lp, &value);
