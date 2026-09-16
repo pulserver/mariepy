@@ -75,3 +75,52 @@ def write_wire_gmsh22(path, *, n_segments, port_nodes, radius=0.05):
         records.append(f"{number} 1 0 {k + 1} {(k + 1) % n_segments + 1}")
     records.append("$EndElements")
     path.write_text("\n".join(records) + "\n")
+
+
+def _matlab_dataset(group, name, array):
+    """Store an array as MATLAB v7.3 does: dimensions reversed, complex as a compound."""
+    array = np.asarray(array)
+    if np.iscomplexobj(array):
+        compound = np.dtype([("real", "<f8"), ("imag", "<f8")])
+        stored = np.empty(array.T.shape, dtype=compound)
+        stored["real"] = array.T.real
+        stored["imag"] = array.T.imag
+    else:
+        stored = array.T.astype(np.float64)
+    group.create_dataset(name, data=stored)
+    group[name].attrs["MATLAB_class"] = np.bytes_("double")
+
+
+def _matlab_sparse(group, name, array):
+    """Store a matrix as a MATLAB v7.3 sparse group of data, ir and jc."""
+    from scipy.sparse import csc_matrix
+
+    matrix = csc_matrix(np.asarray(array))
+    sub = group.create_group(name)
+    sub.attrs["MATLAB_class"] = np.bytes_("double")
+    sub.attrs["MATLAB_sparse"] = np.uint64(matrix.shape[0])
+    compound = np.dtype([("real", "<f8"), ("imag", "<f8")])
+    data = np.empty(matrix.data.shape, dtype=compound)
+    data["real"] = matrix.data.real
+    data["imag"] = matrix.data.imag
+    sub.create_dataset("data", data=data)
+    sub.create_dataset("ir", data=matrix.indices.astype(np.uint64))
+    sub.create_dataset("jc", data=matrix.indptr.astype(np.uint64))
+
+
+def write_marie_basis(path, fields):
+    """Write MARIE's BASIS struct as ``save(..., '-v7.3')`` lays it out.
+
+    ``fields`` maps each dataset name to a MATLAB-shaped array; ``X`` is
+    stored sparse, as MARIE's ``\\ speye`` can leave it.
+    """
+    import h5py
+
+    with h5py.File(path, "w") as handle:
+        group = handle.create_group("BASIS")
+        group.attrs["MATLAB_class"] = np.bytes_("struct")
+        for name, value in fields.items():
+            if name == "X":
+                _matlab_sparse(group, name, value)
+            else:
+                _matlab_dataset(group, name, value)

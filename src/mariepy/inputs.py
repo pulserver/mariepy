@@ -10,10 +10,8 @@ with the same name and a ``.json`` suffix, optionally an RF shield under
 beside it in the same way, and optionally a basis support surface under
 ``<data>/coils/basis_files/``.
 
-A file that asks for what the port does not read raises, saying so, rather
-than being solved as something it is not: MARIE's HDF5 basis files are not
-read, and a basis is built with :mod:`mariepy.basis` from the support surface
-instead.
+A precomputed basis file is located under ``<data>/bases/`` and read on
+request with :func:`mariepy.basis.read_marie`.
 """
 
 from __future__ import annotations
@@ -46,7 +44,7 @@ class Case:
         The body model.
     coil
         The surface coil, the wire coil, or both together, with their ports
-        and lumped elements.
+        and lumped elements; None for a file that names only a basis.
     linear
         Whether the file asks for the piecewise-linear body basis; pass it to
         :func:`~mariepy.solver.solve`.
@@ -63,15 +61,21 @@ class Case:
         The surface the file names to build a field basis on, MARIE's
         ``SurfaceBasisSupportFile``, or None; pass it to
         :func:`~mariepy.basis.surface_basis`.
+    basis_file
+        Where MARIE's precomputed basis file would be, under
+        ``<data>/bases/``, or None; read it with
+        :func:`~mariepy.basis.read_marie`. MARIE's direct solver ignores it,
+        so it is not read here.
     """
 
     medium: Medium
     body: VoxelBody
-    coil: SurfaceCoil | WireCoil | CombinedCoil
+    coil: SurfaceCoil | WireCoil | CombinedCoil | None
     linear: bool = False
     shield: SurfaceCoil | None = None
     network: Network | None = None
     basis_support: SurfaceCoil | None = None
+    basis_file: Path | None = None
 
 
 def read_case(
@@ -100,10 +104,9 @@ def read_case(
 
     Raises
     ------
-    NotImplementedError
-        If the file asks for MARIE's precomputed basis file alone.
     ValueError
-        If the file names no coil, or a body basis MARIE does not know.
+        If the file names neither a coil nor a basis, or a body basis MARIE
+        does not know.
     """
     path = Path(path)
     data = path.parent.parent if data is None else Path(data)
@@ -114,14 +117,9 @@ def read_case(
         raise ValueError(f"{path.name} names body basis {basis}; MARIE knows 0 and 1")
     coil_name = settings.get("CoilFile")
     wire_name = settings.get("WireFile")
-    if settings.get("BasisFile") and not (coil_name or wire_name):
-        raise NotImplementedError(
-            f"{path.name} asks for MARIE's precomputed basis file, which this port "
-            "does not read; build the basis with mariepy.basis.surface_basis from "
-            "the case's basis_support"
-        )
-    if not (coil_name or wire_name or settings.get("ShieldFile")):
-        raise ValueError(f"{path.name} names no coil")
+    basis_name = settings.get("BasisFile")
+    if not (coil_name or wire_name or settings.get("ShieldFile") or basis_name):
+        raise ValueError(f"{path.name} names no coil and no basis")
 
     tmd = bool(settings.get("TMD", 0))
     element_files = []
@@ -178,4 +176,5 @@ def read_case(
         shield=shield,
         network=read_network(*element_files, tmd=tmd),
         basis_support=support,
+        basis_file=data / "bases" / basis_name if basis_name else None,
     )

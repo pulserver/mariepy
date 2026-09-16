@@ -1,5 +1,6 @@
 """A body's field basis, and a coil solved through it against the direct solve."""
 
+import numpy as np
 import pytest
 import torch
 
@@ -394,3 +395,69 @@ def _dense_fields(coil, body, medium):
     )
     magnetic = body.from_dof(coil_current @ (inverse[:, None] * tested_k).T) + scattered
     return electric, magnetic
+
+
+def test_a_basis_saved_as_marie_saves_it_solves_a_coil_as_ours_does(solved, tmp_path):
+    """MARIE's file layout, its voxel order and its tested form, read back."""
+    pytest.importorskip("h5py")
+    from tests.marie_files import write_marie_basis
+
+    medium, body, coil, field_basis, linear = solved
+    if linear:
+        pytest.skip("MARIE's tested form matches the field form for the constant basis")
+    gram = body.resolution**3
+    n = body.n_voxels
+    index = body.mask.nonzero()
+    n1, n2, _ = body.shape
+    fortran = index[:, 0] + n1 * (index[:, 1] + n2 * index[:, 2])
+    to_marie = torch.argsort(fortran)  # MARIE position -> our voxel
+    order = (torch.arange(3)[:, None] * n + to_marie[None, :]).reshape(-1)
+
+    left, values, right_h = torch.linalg.svd(field_basis.response / gram)
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[body.mask.reshape(-1)]
+    sampled = centres[field_basis.samples]
+    write_marie_basis(
+        tmp_path / "basis.mat",
+        {
+            "Ue": (gram * field_basis.electric[:, order]).T.numpy(),
+            "Ub": (gram * field_basis.magnetic[:, order]).T.numpy(),
+            "X": (field_basis.interpolation / gram).numpy(),
+            "U_hat_inv": left.numpy(),
+            "S_hat_inv": torch.diag(values).numpy(),
+            "V_hat_inv": right_h.conj().T.resolve_conj().numpy(),
+            "xds": sampled[:, 0:1].numpy(),
+            "yds": sampled[:, 1:2].numpy(),
+            "zds": sampled[:, 2:3].numpy(),
+        },
+    )
+    read = basis_module.read_marie(tmp_path / "basis.mat", body)
+    assert read.tested and read.rank == field_basis.rank
+    system = sie.assemble(coil, medium)
+    ours = basis_module.solve_coil(coil, system, field_basis, body, medium)
+    theirs = basis_module.solve_coil(coil, system, read, body, medium)
+    torch.testing.assert_close(theirs.admittance, ours.admittance, rtol=1e-9, atol=0)
+    torch.testing.assert_close(theirs.electric, ours.electric, rtol=1e-8, atol=1e-12)
+    assert theirs.body is None
+
+
+def test_a_basis_for_another_body_is_refused(solved, tmp_path):
+    pytest.importorskip("h5py")
+    from tests.marie_files import write_marie_basis
+
+    _, body, _, _, _ = solved
+    write_marie_basis(
+        tmp_path / "basis.mat",
+        {
+            "Ue": np.ones((7, 2), dtype=complex),
+            "Ub": np.ones((7, 2), dtype=complex),
+            "X": np.ones((2, 3), dtype=complex),
+            "U_hat_inv": np.eye(3, dtype=complex),
+            "S_hat_inv": np.eye(3),
+            "V_hat_inv": np.eye(3, dtype=complex),
+            "xds": np.zeros((1, 1)),
+            "yds": np.zeros((1, 1)),
+            "zds": np.zeros((1, 1)),
+        },
+    )
+    with pytest.raises(ValueError, match="3 or 12"):
+        basis_module.read_marie(tmp_path / "basis.mat", body)

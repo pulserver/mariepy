@@ -43,6 +43,7 @@ __all__ = [
     "MrgfSolution",
     "coupling_at",
     "dipole_basis",
+    "read_marie",
     "shell",
     "solve",
     "solve_coil",
@@ -86,24 +87,33 @@ class FieldBasis:
     covariance
         The basis fields' noise covariance, MARIE's ``BASIS.phi``, shape
         ``(r, r)``, or None.
+    tested
+        Whether the basis is in MARIE's own form, as :func:`read_marie`
+        reads it: fields and interpolation carry the Gram matrix, the
+        response is MARIE's ``Zbb_hat_inv``, and the incident fields and body
+        currents are not stored.
     """
 
-    incident_electric: torch.Tensor
-    incident_magnetic: torch.Tensor
+    incident_electric: torch.Tensor | None
+    incident_magnetic: torch.Tensor | None
     samples: torch.Tensor
     interpolation: torch.Tensor
-    singular_values: torch.Tensor
+    singular_values: torch.Tensor | None
     linear: bool = False
     electric: torch.Tensor | None = None
     magnetic: torch.Tensor | None = None
     current: torch.Tensor | None = None
     response: torch.Tensor | None = None
     covariance: torch.Tensor | None = None
+    tested: bool = False
 
     @property
     def rank(self) -> int:
         """Number of basis fields."""
-        return int(self.incident_electric.shape[0])
+        fields = (
+            self.electric if self.incident_electric is None else self.incident_electric
+        )
+        return int(fields.shape[0])
 
     @property
     def n_components(self) -> int:
@@ -745,7 +755,8 @@ class MrgfSolution:
         Each port's total fields over the grid, shape
         ``(n_ports, c, n1, n2, n3)``.
     body
-        Each port's body current, shape ``(n_ports, c * n_voxels)``.
+        Each port's body current, shape ``(n_ports, c * n_voxels)``, or None
+        for a basis read from MARIE's file, which stores none.
     shield
         Each port's shield currents, or None without a shield.
     """
@@ -756,7 +767,7 @@ class MrgfSolution:
     admittance: torch.Tensor
     electric: torch.Tensor
     magnetic: torch.Tensor
-    body: torch.Tensor
+    body: torch.Tensor | None
     shield: torch.Tensor | None = None
 
 
@@ -851,7 +862,11 @@ def solve_coil(
         basis.n_components, points.shape[0], body.resolution, points.device
     )
     field = inverse[:, None] * tested  # the incident field at the samples
-    impedance = matrix + field.T @ basis.response @ field
+    if basis.tested:
+        # MARIE's ie_solver_svie_mrgf.m: ZbcN.' * iG * (U S V' * ZbcN).
+        impedance = matrix + tested.T @ (inverse[:, None] * (basis.response @ tested))
+    else:
+        impedance = matrix + field.T @ basis.response @ field
     current = torch.linalg.solve(impedance, excitation.T).T
     coefficients = (basis.interpolation @ (field @ current.T)).T
     admittance = network.symmetrise(network.port_admittance(excitation, current))
@@ -869,5 +884,131 @@ def solve_coil(
         admittance=admittance,
         electric=torch.stack([body.from_dof(row) for row in electric]),
         magnetic=torch.stack([body.from_dof(row) for row in magnetic]),
-        body=coefficients @ basis.current,
+        body=None if basis.current is None else coefficients @ basis.current,
+    )
+
+
+def _read_matlab(group, name):
+    """Read one MATLAB v7.3 array: dimensions reversed, complex as a compound.
+
+    A MATLAB ``p``-by-``q`` matrix comes back as its transpose; a sparse one
+    is a group of ``data``, ``ir`` and ``jc``.
+    """
+    import numpy as np
+
+    item = group[name]
+    if hasattr(item, "keys"):
+        from scipy.sparse import csc_matrix
+
+        shape = (int(item.attrs["MATLAB_sparse"]), len(item["jc"]) - 1)
+        data = item["data"][()]
+        if data.dtype.names:
+            data = data["real"] + 1j * data["imag"]
+        matrix = csc_matrix((data, item["ir"][()], item["jc"][()]), shape=shape)
+        return torch.from_numpy(np.asarray(matrix.todense()))
+    data = item[()]
+    if data.dtype.names:
+        data = data["real"] + 1j * data["imag"]
+    return torch.from_numpy(np.ascontiguousarray(np.asarray(data).T))
+
+
+def read_marie(path, body: VoxelBody, *, device=None) -> FieldBasis:
+    """Read a basis MARIE's ``BASIS_runner.m`` saved, for the body it was built on.
+
+    Reads the datasets ``MRGF_runner.m`` reads from the MATLAB v7.3 file:
+    ``Ue`` and ``Ub``, the total fields; ``X``, the interpolation; the SVD of
+    the response, ``U_hat_inv``, ``S_hat_inv`` and ``V_hat_inv``; and the
+    sampled voxels' coordinates ``xds``, ``yds`` and ``zds``, with ``phi`` when
+    present. MARIE orders a body's unknowns component by component, voxels in
+    column-major order; they are reordered to the body's own. The basis stays
+    in MARIE's tested form and :func:`solve_coil` treats it as MARIE does.
+
+    Parameters
+    ----------
+    path
+        The ``.mat`` file.
+    body
+        The body the basis was built for.
+    device
+        Device to place the tensors on; the body's by default.
+
+    Returns
+    -------
+    FieldBasis
+        With :attr:`FieldBasis.tested` set.
+
+    Raises
+    ------
+    ImportError
+        Without h5py.
+    ValueError
+        If the file's fields do not fit the body, or a sampled voxel is not
+        one of its tissue voxels.
+    """
+    try:
+        import h5py
+    except ImportError as error:  # pragma: no cover - depends on the install
+        raise ImportError(
+            "reading MARIE's basis files needs h5py: pip install 'mariepy[marie]'"
+        ) from error
+    import numpy as np
+
+    device = body.device if device is None else device
+    with h5py.File(path, "r") as handle:
+        group = handle["BASIS"]
+        # MATLAB keeps each field as a column; here each is a row.
+        electric = _read_matlab(group, "Ue").T
+        magnetic = _read_matlab(group, "Ub").T
+        interpolation = _read_matlab(group, "X")
+        u = _read_matlab(group, "U_hat_inv")
+        s = _read_matlab(group, "S_hat_inv")
+        v = _read_matlab(group, "V_hat_inv")
+        coordinates = [
+            _read_matlab(group, name).reshape(-1).real for name in ("xds", "yds", "zds")
+        ]
+        covariance = _read_matlab(group, "phi") if "phi" in group else None
+
+    n_voxels = body.n_voxels
+    components, remainder = divmod(electric.shape[1], n_voxels)
+    if remainder or components not in (3, 12):
+        raise ValueError(
+            f"the basis has {electric.shape[1]} unknowns per field, not 3 or 12 "
+            f"for each of the body's {n_voxels} voxels"
+        )
+
+    # MARIE's voxel order is column-major over the grid.
+    index = body.mask.cpu().nonzero()
+    n1, n2, _ = body.shape
+    fortran = index[:, 0] + n1 * (index[:, 1] + n2 * index[:, 2])
+    marie_position = torch.empty(n_voxels, dtype=torch.long)
+    marie_position[torch.argsort(fortran)] = torch.arange(n_voxels)
+    order = (
+        torch.arange(components)[:, None] * n_voxels + marie_position[None, :]
+    ).reshape(-1)
+
+    origin = torch.tensor(body.origin, dtype=torch.float64)
+    points = torch.stack(coordinates, dim=1)
+    cells = torch.round((points - origin) / body.resolution).long()
+    numbering = torch.full((int(np.prod(body.shape)),), -1, dtype=torch.long)
+    numbering[body.mask.cpu().reshape(-1)] = torch.arange(n_voxels)
+    flat = (cells[:, 0] * n2 + cells[:, 1]) * body.shape[2] + cells[:, 2]
+    samples = numbering[flat]
+    if bool((samples < 0).any()):
+        raise ValueError(
+            "a sampled voxel of the basis is not a tissue voxel of the body"
+        )
+
+    response = u @ s.to(u.dtype) @ v.conj().T
+    return FieldBasis(
+        incident_electric=None,
+        incident_magnetic=None,
+        samples=samples.to(device),
+        interpolation=interpolation.to(torch.complex128).to(device),
+        singular_values=None,
+        linear=components == 12,
+        electric=electric[:, order].to(torch.complex128).to(device),
+        magnetic=magnetic[:, order].to(torch.complex128).to(device),
+        response=response.to(torch.complex128).to(device),
+        covariance=None if covariance is None else covariance.to(device),
+        tested=True,
     )

@@ -115,9 +115,10 @@ def test_the_data_directory_can_be_named_apart_from_the_input_file(tmp_path):
     assert read_case(moved, data=tmp_path / "data").body.n_voxels == 1
 
 
-def test_a_simulation_file_asking_only_for_a_field_basis_is_refused(tmp_path):
-    with pytest.raises(NotImplementedError, match="basis file"):
-        read_case(_data(tmp_path, CoilFile="", BasisFile="basis.mat"))
+def test_a_simulation_file_naming_only_a_basis_is_read_without_a_coil(tmp_path):
+    case = read_case(_data(tmp_path, CoilFile="", BasisFile="head.mat"))
+    assert case.coil is None
+    assert case.basis_file == tmp_path / "data" / "bases" / "head.mat"
 
 
 def test_a_basis_support_the_simulation_file_names_is_read(tmp_path):
@@ -132,7 +133,7 @@ def test_a_basis_support_the_simulation_file_names_is_read(tmp_path):
 
 
 def test_a_simulation_file_that_names_no_coil_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="names no coil"):
+    with pytest.raises(ValueError, match="names no coil and no basis"):
         read_case(_data(tmp_path, CoilFile=""))
 
 
