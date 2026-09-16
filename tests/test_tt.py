@@ -86,21 +86,50 @@ def test_the_cross_approximation_reaches_its_tolerance(sizes):
     assert float(error) <= 1e-7
 
 
+def _smooth_at(sizes, subscripts):
+    """Entries of :func:`_smooth` at some subscripts, without the whole tensor."""
+    grid = torch.stack(
+        [
+            0.1 + 0.9 * subscripts[:, axis].to(torch.float64) / (n - 1)
+            for axis, n in enumerate(sizes)
+        ],
+        dim=-1,
+    )
+    return (
+        1.0 / (1.0 + grid.sum(-1)) * torch.exp(-3j * grid[..., 0] * grid[..., -1])
+    ).to(torch.complex128)
+
+
 def test_the_cross_approximation_samples_a_large_tensor_sparingly():
-    sizes = (30, 30, 30, 40)
-    full = _smooth(sizes)
+    """The sweeps cost what the ranks and sizes set, not what the tensor holds.
+
+    The tensor is large enough for that cost to be a small share of it, and
+    too large to hold whole, so the train is checked at random entries.
+    """
+    sizes = (60, 60, 60, 1000)
+    total = 60 * 60 * 60 * 1000
     sampled = []
 
     def entries(subscripts):
         sampled.append(subscripts.shape[0])
-        return full[
-            subscripts[:, 0], subscripts[:, 1], subscripts[:, 2], subscripts[:, 3]
-        ]
+        return _smooth_at(sizes, subscripts)
 
-    train = tt.cross(sizes, entries, 1e-6)
-    error = (train.full() - full).abs().max() / full.abs().max()
+    generator = torch.Generator().manual_seed(0)
+    train = tt.cross(sizes, entries, 1e-6, generator=generator)
+    assert sum(sampled) < 0.1 * total
+
+    probe = torch.stack(
+        [torch.randint(0, n, (20000,), generator=generator) for n in sizes], dim=1
+    )
+    cores = train.cores
+    vector = cores[0][0, probe[:, 0]]  # (probes, r1)
+    for axis in range(1, len(sizes)):
+        vector = torch.einsum("pa,apb->pb", vector, cores[axis][:, probe[:, axis]])
+    expected = _smooth_at(sizes, probe)
+    error = torch.linalg.vector_norm(
+        vector[:, 0] - expected
+    ) / torch.linalg.vector_norm(expected)
     assert float(error) <= 1e-5
-    assert sum(sampled) < 0.1 * full.numel()
 
 
 def test_applying_a_train_contracts_its_last_index():
