@@ -131,10 +131,10 @@ def gmres(
     )
 
 
-# Relative residual a single-precision inner solve is asked for. complex64
-# resolves about 1e-7 of a vector's norm, and the conditioning of these systems
-# costs one or two digits of that.
-INNER_TOLERANCE = 1e-5
+# Relative residual each single-precision inner solve is asked for. A single-
+# precision Krylov estimate drifts below the true residual well before 1e-6,
+# so asking for less per solve and refining more often costs fewer products.
+INNER_TOLERANCE = 1e-2
 
 
 def refine(

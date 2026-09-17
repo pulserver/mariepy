@@ -1,6 +1,7 @@
 """Run one MARIE example case end to end and report the physics checks.
 
 usage: run_case.py <input.json> --data <marie-tools>/data [--device cpu|cuda] [--quick]
+                   [--precision double|mixed]
 
 The data folder is that of https://github.com/cloudmrhub/marie-tools.
 """
@@ -19,6 +20,7 @@ parser.add_argument("input")
 parser.add_argument("--data", required=True, help="marie-tools data folder")
 parser.add_argument("--device", default="cpu")
 parser.add_argument("--quick", action="store_true", help="low quadrature orders")
+parser.add_argument("--precision", default="double", choices=("double", "mixed"))
 parser.add_argument("--out", default=None)
 args = parser.parse_args()
 
@@ -40,7 +42,10 @@ print(f"coil nodes inside tissue voxels: {int(hits)}", flush=True)
 
 orders = {"far_order": 2, "medium_order": 2, "near_order": 4} if args.quick else {}
 t1 = time.time()
-result = solve(case.body, coil, case.medium, linear=case.linear, shield=case.shield, **orders)
+result = solve(
+    case.body, coil, case.medium, linear=case.linear, shield=case.shield,
+    precision=args.precision, **orders,
+)
 t2 = time.time()
 op = result.operator
 raw = network.port_admittance(op.excitation, op.conductors(result.ports.coil, result.ports.shield))
