@@ -121,6 +121,88 @@ class CoupledOperator:
         )
         return torch.cat([coil_out, body_out])
 
+    def body_block(self, body_current: torch.Tensor) -> torch.Tensor:
+        """Apply the body's own block, ``Zbb``, to a body current.
+
+        Parameters
+        ----------
+        body_current
+            Shape ``(n_body,)``, complex128 or complex64.
+
+        Returns
+        -------
+        torch.Tensor
+            Same shape and precision: the body rows of the operator for this
+            current and no coil current.
+        """
+        products = self._products(body_current.dtype)
+        on_body = products.place(body_current)
+        field = on_body.reshape(self.coupling.n_components, *self.coupling.grid.shape)
+        resolution = self.coupling.grid.resolution
+        applied = vie.apply_n(self.coupling.symbols_n, field) - vie.apply_g(
+            field, resolution
+        )
+        induced = vie.apply_g(
+            self._contrast_inverse(body_current.dtype) * field, resolution
+        )
+        return (
+            products.take((induced - applied).reshape(-1))
+            / self.medium.electric_scaling
+        )
+
+    def couple(self, coil_current: torch.Tensor) -> torch.Tensor:
+        """Apply the coil-to-body coupling, ``Zbc``, to a coil current.
+
+        The body rows of the operator are ``Zbb Jb - Zbc Jc``.
+
+        Parameters
+        ----------
+        coil_current
+            Shape ``(n_coil,)``, complex128 or complex64.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_body,)``, the same precision.
+        """
+        products = self._products(coil_current.dtype)
+        field = _apply(products.project, coil_current).reshape(
+            self.coupling.n_components, *self.coupling.grid.shape
+        )
+        applied = vie.apply_n(self.coupling.symbols_n, field) - vie.apply_g(
+            field, self.coupling.grid.resolution
+        )
+        return products.take(
+            applied.reshape(-1) / self.medium.electric_scaling
+        ) + _apply(products.electric, coil_current)
+
+    def couple_transpose(self, body_current: torch.Tensor) -> torch.Tensor:
+        """Apply the transposed coupling, ``Zbc^T``, to a body current.
+
+        The coil rows of the operator are ``Acc Jc + Zbc^T Jb``.
+
+        Parameters
+        ----------
+        body_current
+            Shape ``(n_body,)``, complex128 or complex64.
+
+        Returns
+        -------
+        torch.Tensor
+            Shape ``(n_coil,)``, the same precision.
+        """
+        products = self._products(body_current.dtype)
+        field = products.place(body_current).reshape(
+            self.coupling.n_components, *self.coupling.grid.shape
+        )
+        applied = vie.apply_n(self.coupling.symbols_n, field) - vie.apply_g(
+            field, self.coupling.grid.resolution
+        )
+        return _apply(
+            products.project_transpose,
+            applied.reshape(-1) / self.medium.electric_scaling,
+        ) + _apply(products.electric_transpose, body_current)
+
     def split(self, vector: torch.Tensor):
         """Separate a solution vector into its coil, body and shield parts.
 

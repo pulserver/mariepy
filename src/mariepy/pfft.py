@@ -24,6 +24,7 @@ refers to.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -50,6 +51,7 @@ __all__ = [
     "projected_coupling",
     "projection",
     "projection_matrix",
+    "restrict",
     "scatter_matrix",
 ]
 
@@ -1017,6 +1019,83 @@ def assemble(
         symbols_n=symbols_n,
         symbols_k=symbols_k,
         linear=linear,
+    )
+
+
+def restrict(coupling: Coupling, mask: torch.Tensor) -> Coupling:
+    """Take a coupling assembled over a region down to a body inside it.
+
+    Every entry of the near corrections belongs to one basis function and one
+    cell, whatever else the grid holds, so a coupling assembled once with a
+    region of the body grid counted as body serves any body within that region:
+    its rows are selected and the scatter rebuilt.
+
+    Parameters
+    ----------
+    coupling
+        Assembled by :func:`assemble` for a body whose mask is the region.
+    mask
+        The body to keep, on the same body grid, shape ``(n1, n2, n3)``,
+        boolean, inside the region.
+
+    Returns
+    -------
+    Coupling
+        The coupling :func:`assemble` gives for a body with ``mask`` on the same
+        grid.
+
+    Raises
+    ------
+    ValueError
+        If ``mask`` is not the body grid's shape, or reaches outside the region.
+    """
+    grid = coupling.grid
+    start = grid.body_origin
+    window = (
+        slice(start[0], start[0] + mask.shape[0]),
+        slice(start[1], start[1] + mask.shape[1]),
+        slice(start[2], start[2] + mask.shape[2]),
+    )
+    region = grid.mask[window]
+    if tuple(region.shape) != tuple(mask.shape) or int(region.sum()) != int(
+        grid.mask.sum()
+    ):
+        raise ValueError(
+            f"the coupling's body grid is not of shape {tuple(mask.shape)}"
+        )
+    mask = mask.to(grid.mask.device)
+    if bool((mask & ~region).any()):
+        raise ValueError("the body reaches outside the region the coupling covers")
+    placed = torch.zeros_like(grid.mask)
+    placed[window] = mask
+    kept = dataclasses.replace(grid, mask=placed)
+
+    n_region = int(region.sum())
+    n_components = coupling.n_components
+    numbering = torch.full((n_region,), -1, dtype=torch.int64, device=grid.device)
+    inside = mask[region]
+    n_voxels = int(inside.sum())
+    numbering[inside] = torch.arange(n_voxels, device=grid.device)
+
+    def rows_of(matrix: torch.Tensor) -> torch.Tensor:
+        matrix = matrix.coalesce()
+        row, column = matrix.indices()
+        component, cell = row // n_region, row % n_region
+        new = numbering[cell]
+        keep = new >= 0
+        return torch.sparse_coo_tensor(
+            torch.stack([component[keep] * n_voxels + new[keep], column[keep]]),
+            matrix.values()[keep],
+            (n_components * n_voxels, matrix.shape[1]),
+            check_invariants=False,
+        ).coalesce()
+
+    return dataclasses.replace(
+        coupling,
+        grid=kept,
+        scatter=scatter_matrix(kept, n_components),
+        electric=rows_of(coupling.electric),
+        magnetic=rows_of(coupling.magnetic),
     )
 
 
