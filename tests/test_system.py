@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from mariepy import network, pfft, sie
+from mariepy import network, pfft, sie, vie
 from mariepy.body import VoxelBody
 from mariepy.coil import Port, SurfaceCoil
 from mariepy.constants import Medium
@@ -97,6 +97,50 @@ def test_the_coil_rows_of_the_coupled_operator_reproduce_the_coil_matrix(device)
     assert float((got - want).abs().max() / want.abs().max()) <= 1e-4
 
 
+def test_the_coupled_operator_is_the_block_matrix_its_coupling_assembles(device):
+    """The product equals the operator written out from the coupling's matrices."""
+    operator = _operator(device)
+    coupling = operator.coupling
+    n_components = coupling.n_components
+    grid = coupling.grid
+    vector = _random(operator.n_coil + operator.n_body, seed=2).to(device)
+    coil, body = vector[: operator.n_coil], vector[operator.n_coil :]
+
+    def field_of(on_grid):
+        field = on_grid.reshape(n_components, *grid.shape)
+        return (
+            vie.apply_n(coupling.symbols_n, field) - vie.apply_g(field, grid.resolution)
+        ).reshape(-1)
+
+    scaling = operator.medium.electric_scaling
+    on_body = coupling.scatter @ body
+    applied = field_of(coupling.project @ coil + on_body) / scaling
+    contrast = operator.body.contrast(operator.medium).scattering
+    inverse = torch.zeros(grid.shape, dtype=torch.complex128, device=device)
+    start = grid.body_origin
+    inverse[
+        start[0] : start[0] + operator.body.shape[0],
+        start[1] : start[1] + operator.body.shape[1],
+        start[2] : start[2] + operator.body.shape[2],
+    ] = torch.where(operator.body.mask, 1.0 / contrast, torch.zeros_like(contrast))
+    induced = (
+        vie.apply_g(
+            inverse * on_body.reshape(n_components, *grid.shape), grid.resolution
+        ).reshape(-1)
+        / scaling
+    )
+    scatter_t = coupling.scatter.transpose(0, 1)
+    want = torch.cat(
+        [
+            coupling.project.transpose(0, 1) @ applied
+            + coupling.coil @ coil
+            + coupling.electric.transpose(0, 1) @ body,
+            scatter_t @ (induced - applied) - coupling.electric @ coil,
+        ]
+    )
+    torch.testing.assert_close(operator(vector), want, rtol=1e-12, atol=0.0)
+
+
 def test_the_preconditioned_body_rows_are_the_body_operator_with_no_coil_current(
     device,
 ):
@@ -143,6 +187,29 @@ def test_every_port_solve_reaches_the_tolerance_it_was_given(device):
     assert all(residual <= TOLERANCE for residual in solution.residual)
     assert solution.coil.shape == (operator.coil.n_driven, operator.n_coil)
     assert solution.body.shape == (operator.coil.n_driven, operator.n_body)
+
+
+def test_a_mixed_precision_solve_gives_the_double_precision_port_matrix(device):
+    operator = _operator(device, ports=2)
+    double = solve_ports(operator, tol=TOLERANCE)
+    mixed = solve_ports(operator, tol=TOLERANCE, precision="mixed")
+    assert all(residual <= TOLERANCE for residual in mixed.residual)
+    assert mixed.coil.dtype == torch.complex128
+    want = _port_impedance(operator, double)
+    got = _port_impedance(operator, mixed)
+    assert float((got - want).abs().max() / want.abs().max()) <= 1e-6
+
+
+def test_the_coupled_operator_in_single_precision_is_the_double_one_rounded(device):
+    operator = _operator(device)
+    vector = _random(operator.n_coil + operator.n_body, seed=3).to(device)
+    double = operator(vector)
+    single = operator(vector.to(torch.complex64))
+    assert single.dtype == torch.complex64
+    error = torch.linalg.vector_norm(single.to(torch.complex128) - double)
+    # Single precision resolves about 1e-7; the coil rows cancel large terms,
+    # which costs up to two digits of that.
+    assert float(error / torch.linalg.vector_norm(double)) <= 1e-4
 
 
 def test_a_body_of_free_space_leaves_the_port_impedance_where_the_empty_coil_had_it(

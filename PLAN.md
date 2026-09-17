@@ -480,7 +480,14 @@ never imports mariepy.
 **Implementation.**
 
 - **torch.** It carries the numerical work on CPU or CUDA, with complex128 as the
-  working precision.
+  working precision: the operators are assembled in it, every Krylov basis is
+  kept in it, and every result is returned in it. A solve may take its
+  matrix-vector products in complex64 (`precision="mixed"`), which halves what
+  the products move through memory. Their rounding then caps the residual the
+  iteration can reach, so that iteration stops at the tolerance or a margin
+  above the rounding measured through the preconditioner on a random vector,
+  whichever is larger, and a complex128 solve started from its iterate reaches
+  the tolerance. The two solves' residual histories are reported as one.
 - **Other dependencies.** numpy is used for file input and output only, where VOP
   files are `.npz`. scipy is a test and optional dependency: special functions
   for the Mie reference, reading MARIE's MATLAB body files, and the global
@@ -500,7 +507,15 @@ never imports mariepy.
   face integrals of touching cells release the GIL and run on threads. A
   body kernel on a 60³ grid then assembles in about ten seconds for the
   piecewise-constant basis and half a minute for the piecewise-linear one,
-  a cost set by the near offsets rather than by the grid.
+  a cost set by the near offsets rather than by the grid. The solve's profile
+  named the second: the Fourier-domain multiply by the body symbols, which
+  torch takes with every symbol expanded at once and therefore with several
+  copies of the extended grid in memory. In C++ a symbol stays in its Tucker
+  form, contracted along each z-line as it is needed, and the multiply runs in
+  place on the transformed current over threads, so the product holds one
+  buffer of the extended grid and one component of it. It runs in complex128
+  and complex64; torch takes the product on CUDA, and on a grid small enough
+  that expanding the symbols costs less than starting the threads.
 - **Circulant embedding.** A Toeplitz block of `n` offsets sits inside any
   circulant of `2n - 1` rows or more, where MARIE always takes `2n`. The port
   takes the shortest length with no prime factor above seven, since an FFT of a

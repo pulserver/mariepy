@@ -685,13 +685,21 @@ def projected_coupling(
     component = torch.arange(n_components, device=grid.device)
     reach = (near.span - 1) // 2
 
+    fields = [
+        _projected_field(flat_weights, response)
+        .permute(0, 2, 1)
+        .reshape(-1, n_components)
+        for response in (block, curl)
+    ]
+    n_cube = near.span**3
+
     rows, columns, electric, magnetic = [], [], [], []
     for dof, cells in near_body_pairs(grid, near, chunk=chunk):
         local = unflatten(grid, cells) - near.centre[dof] + reach
         where = (local[:, 0] * near.span + local[:, 1]) * near.span + local[:, 2]
-        here = flat_weights[dof]
-        electric.append(torch.einsum("jcn,nj->nc", block[..., where], here).reshape(-1))
-        magnetic.append(torch.einsum("jcn,nj->nc", curl[..., where], here).reshape(-1))
+        flat = dof * n_cube + where
+        electric.append(fields[0][flat].reshape(-1))
+        magnetic.append(fields[1][flat].reshape(-1))
         rows.append(
             (component[None, :] * n_voxels + body_dof[cells][:, None]).reshape(-1)
         )
@@ -715,6 +723,8 @@ def coil_precorrection(
     near: NearLists,
     weights: torch.Tensor,
     response: tuple[torch.Tensor, torch.Tensor],
+    *,
+    chunk: int = 4096,
 ) -> torch.Tensor:
     """Undo the projection's share of the coil block, and put the true one back.
 
@@ -730,6 +740,8 @@ def coil_precorrection(
         The projection weights.
     response
         As in :func:`projected_coupling`; only the electric part is used.
+    chunk
+        Pairs of basis functions taken at a time.
 
     Returns
     -------
@@ -737,8 +749,11 @@ def coil_precorrection(
         Sparse ``(n_dof, n_dof)``, complex.
     """
     block, _ = response
-    flat_weights = weights.reshape(weights.shape[0], -1)
+    n_components = block.shape[1]
+    field = _projected_field(weights.reshape(weights.shape[0], -1), block)
+    field = field.permute(0, 2, 1).reshape(-1, n_components)
     reach = (near.span - 1) // 2
+    n_cube = near.span**3
     n_dof = coil.n_dof
 
     separation = (
@@ -746,19 +761,49 @@ def coil_precorrection(
     )
     observer, source = torch.nonzero(separation < near.distance, as_tuple=True)
 
-    local = near.expansion[observer] - near.centre[source][:, None, :] + reach
-    where = (local[..., 0] * near.span + local[..., 1]) * near.span + local[..., 2]
-    picked = block[..., where.reshape(-1)].reshape(
-        block.shape[0], block.shape[1], where.shape[0], where.shape[1]
+    projected = torch.empty(
+        observer.shape[0], dtype=torch.complex128, device=field.device
     )
-    projected = torch.einsum(
-        "jcpb,pj,pcb->p", picked, flat_weights[source], weights[observer]
-    )
+    for start in range(0, observer.shape[0], chunk):
+        o = observer[start : start + chunk]
+        q = source[start : start + chunk]
+        local = near.expansion[o] - near.centre[q][:, None, :] + reach
+        where = (local[..., 0] * near.span + local[..., 1]) * near.span + local[..., 2]
+        seen = field[q[:, None] * n_cube + where]
+        projected[start : start + chunk] = torch.einsum("pbc,pcb->p", seen, weights[o])
 
     values = impedance[observer, source] - projected
     return torch.sparse_coo_tensor(
         torch.stack([observer, source]), values, (n_dof, n_dof), check_invariants=False
     ).coalesce()
+
+
+def _projected_field(
+    weights: torch.Tensor, response: torch.Tensor, *, chunk: int = 256
+) -> torch.Tensor:
+    """Give the field each basis function's expansion block puts on its near cube.
+
+    Parameters
+    ----------
+    weights
+        Shape ``(n_dof, c * expansion ** 3)``, the projection weights flattened.
+    response
+        Shape ``(c * expansion ** 3, c, span ** 3)``, one of the pair
+        :func:`expansion_response` returns.
+    chunk
+        Basis functions taken at a time.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(n_dof, c, span ** 3)``.
+    """
+    return torch.cat(
+        [
+            torch.einsum("dj,jcn->dcn", weights[start : start + chunk], response)
+            for start in range(0, weights.shape[0], chunk)
+        ]
+    )
 
 
 def kernels(
@@ -830,7 +875,6 @@ def expansion_response(
     symbols_n: tuple,
     symbols_k: tuple,
     *,
-    chunk: int = 8,
     n_components: int = 3,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Give the field one expansion block puts on every cell of its near cube.
@@ -848,8 +892,6 @@ def expansion_response(
         Supplies ``j omega eps_0``.
     symbols_n, symbols_k
         The kernels compressed for the near cube, from :func:`kernels`.
-    chunk
-        Unit sources taken at a time.
     n_components
         Unknowns per cell: 3 for the constant basis, 12 for the linear one.
 
@@ -866,28 +908,19 @@ def expansion_response(
     offsets = near.expansion[0] - near.centre[0] + reach
     n_block = offsets.shape[0]
 
-    sources = torch.zeros(
-        (n_components, n_block, n_components, *shape),
-        dtype=torch.complex128,
-        device=grid.device,
-    )
-    place = torch.arange(n_block, device=grid.device)
-    for component in range(n_components):
-        sources[
-            component, place, component, offsets[:, 0], offsets[:, 1], offsets[:, 2]
-        ] = 1.0
-    sources = sources.reshape(n_components * n_block, n_components, *shape)
+    electric = vie.unit_responses(symbols_n, offsets, shape)
+    magnetic = vie.unit_responses(symbols_k, offsets, shape, curl=True)
 
-    electric, magnetic = [], []
-    for start in range(0, sources.shape[0], chunk):
-        piece = sources[start : start + chunk]
-        applied = vie.apply_n(symbols_n, piece) - vie.apply_g(piece, grid.resolution)
-        electric.append(applied / medium.electric_scaling)
-        magnetic.append(vie.apply_k(symbols_k, piece))
-    return (
-        torch.cat(electric).reshape(n_components * n_block, n_components, -1),
-        torch.cat(magnetic).reshape(n_components * n_block, n_components, -1),
-    )
+    # The Galerkin mass term of each unit current sits on its own cell.
+    weights = vie.mass(n_components, grid.resolution).to(electric.device)
+    component = torch.arange(n_components, device=grid.device)
+    place = torch.arange(n_block, device=grid.device)
+    cell = (offsets[:, 0] * span + offsets[:, 1]) * span + offsets[:, 2]
+    source = (component[:, None] * n_block + place[None, :]).reshape(-1)
+    electric[
+        source, component.repeat_interleave(n_block), cell.repeat(n_components)
+    ] -= weights.repeat_interleave(n_block).to(electric.dtype)
+    return electric / medium.electric_scaling, magnetic
 
 
 def assemble(

@@ -21,7 +21,7 @@ from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
 from mariepy.fields import Fields
-from mariepy.gmres import Solution, gmres
+from mariepy.gmres import Solution, gmres, refine
 from mariepy.system import CoupledOperator, ShieldedOperator
 from mariepy.tucker import circulant_tucker
 from mariepy.wire import CombinedCoil, WireCoil
@@ -117,17 +117,18 @@ class BodyOperator:
         ----------
         current
             Shape ``(3 * n_voxels,)``, or ``(12 * n_voxels,)`` in the linear
-            basis.
+            basis, complex128 or complex64; the product is taken in its
+            precision.
 
         Returns
         -------
         torch.Tensor
-            Same shape.
+            Same shape and precision.
         """
         field = self.body.from_dof(current)
         applied = vie.apply_n(self.symbols, field)
         contrast = self.body.contrast(self.medium)
-        reduced = contrast.reduced.unsqueeze(0)
+        reduced = contrast.reduced.to(current.dtype).unsqueeze(0)
         scattered = reduced * vie.apply_inverse_g(applied, self.body.resolution)
         return current - self.body.to_dof(scattered)
 
@@ -195,6 +196,7 @@ def solve_body(
     tol: float = 1e-5,
     restart: int = 50,
     maxit: int = 200,
+    precision: str = "double",
 ) -> Solution:
     """Solve for the polarisation current an incident field induces.
 
@@ -208,19 +210,32 @@ def solve_body(
         Target for the relative residual.
     restart, maxit
         Passed to :func:`mariepy.gmres.gmres`.
+    precision
+        ``"double"`` solves in complex128; ``"mixed"`` applies the operator in
+        complex64 and finishes in complex128, with
+        :func:`mariepy.gmres.refine`, to the same ``tol``.
 
     Returns
     -------
     mariepy.gmres.Solution
         The solved current and the residual history.
     """
-    return gmres(
+    return _krylov(precision)(
         operator,
         operator.right_hand_side(incident),
         tol=tol,
         restart=restart,
         maxit=maxit,
     )
+
+
+def _krylov(precision: str):
+    """Pick the Krylov solver a precision names."""
+    if precision == "double":
+        return gmres
+    if precision == "mixed":
+        return refine
+    raise ValueError(f"precision is 'double' or 'mixed', got {precision!r}")
 
 
 @dataclass(frozen=True)
@@ -256,6 +271,7 @@ def solve_ports(
     tol: float = 1e-5,
     restart: int = 50,
     maxit: int = 200,
+    precision: str = "double",
 ) -> PortSolution:
     """Drive each port in turn and solve the coupled system.
 
@@ -272,17 +288,20 @@ def solve_ports(
         Iterations per restart cycle.
     maxit
         Maximum restart cycles.
+    precision
+        ``"double"`` or ``"mixed"``, as :func:`solve_body` takes it.
 
     Returns
     -------
     PortSolution
         The coil and body currents of every port.
     """
+    krylov = _krylov(precision)
     drives = operator.right_hand_side()
     precondition = operator.preconditioner()
     solutions, residual, iterations = [], [], []
     for row in range(drives.shape[0]):
-        solution = gmres(
+        solution = krylov(
             operator,
             drives[row],
             preconditioner=precondition,
@@ -369,6 +388,7 @@ def solve(
     near_order: int = 15,
     linear: bool = False,
     shield: SurfaceCoil | None = None,
+    precision: str = "double",
 ) -> Result:
     """Drive one coil against one body, and return the port matrices and fields.
 
@@ -403,6 +423,8 @@ def solve(
         An RF shield around the coil and the body. Its coupling to the body is
         built as tensor trains to ``tol`` times a hundred, as MARIE's
         ``load_inputs.m`` sets ``tol_TT``.
+    precision
+        ``"double"`` or ``"mixed"``, as :func:`solve_body` takes it.
 
     Returns
     -------
@@ -441,7 +463,7 @@ def solve(
                 cell_order=cell_order,
             ),
         )
-    ports = solve_ports(operator, tol=tol)
+    ports = solve_ports(operator, tol=tol, precision=precision)
     admittance = network.symmetrise(
         network.port_admittance(
             operator.excitation, operator.conductors(ports.coil, ports.shield)

@@ -13,14 +13,17 @@ reports is the preconditioned one.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
 
-__all__ = ["Solution", "gmres"]
+__all__ = ["Solution", "gmres", "refine"]
 
 Operator = Callable[[torch.Tensor], torch.Tensor]
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,12 @@ def gmres(
             operator, apply_prec, x, residual, restart, tol * scale
         )
         history.extend(value / scale for value in cycle)
+        _log.info(
+            "GMRES cycle %d: %d iterations, relative residual %.3e",
+            restarts,
+            inner,
+            float(history[-1]),
+        )
 
     return Solution(
         x=x,
@@ -128,6 +137,85 @@ def gmres(
         inner=inner,
         restarts=restarts,
         converged=bool(history[-1] <= tol),
+    )
+
+
+# How far above the single-precision rounding of the products the first solve
+# of :func:`refine` stops.
+ROUNDING_MARGIN = 10.0
+
+
+def refine(
+    operator: Operator,
+    b: torch.Tensor,
+    *,
+    preconditioner: Operator | None = None,
+    restart: int = 50,
+    tol: float = 1e-5,
+    maxit: int = 200,
+    inner_dtype: torch.dtype = torch.complex64,
+) -> Solution:
+    """Solve ``operator(x) = b`` with the operator in single precision, finished in double.
+
+    The Krylov basis stays in ``b``'s precision, so the iteration converges as a
+    double-precision one does; only the products are taken in ``inner_dtype``.
+    Their rounding caps the residual that iteration can reach, so it stops at
+    ``tol`` or at :data:`ROUNDING_MARGIN` times that rounding, measured on a
+    random vector through the preconditioner, whichever is larger, and a second :func:`gmres`, with the operator in ``b``'s precision
+    and started from the first one's iterate, takes it to ``tol``.
+
+    Parameters
+    ----------
+    operator
+        Applies the system matrix to a vector in either precision, returning
+        the vector's precision.
+    b
+        Right-hand side, shape ``(n,)``, complex128.
+    preconditioner
+        Applies a left preconditioner in double precision.
+    restart
+        Iterations per restart cycle.
+    tol
+        Target for the preconditioned relative residual, taken in double
+        precision.
+    maxit
+        Maximum restart cycles of each of the two solves.
+    inner_dtype
+        Precision the products of the first solve are taken in.
+
+    Returns
+    -------
+    Solution
+        The iterate, and the two solves' residual histories joined; the second
+        starts from the first's true residual.
+    """
+
+    def rounded(vector: torch.Tensor) -> torch.Tensor:
+        return operator(vector.to(inner_dtype)).to(vector.dtype)
+
+    # The rounded products reach no closer than their own rounding, taken in the
+    # norm the tolerance is taken in, so the first solve stops a margin above
+    # it. A random vector reaches every block of the operator; a right-hand
+    # side may drive only some of them.
+    apply_prec = preconditioner if preconditioner is not None else (lambda v: v)
+    generator = torch.Generator().manual_seed(0)
+    probe = torch.complex(
+        torch.randn(b.shape, generator=generator, dtype=b.real.dtype),
+        torch.randn(b.shape, generator=generator, dtype=b.real.dtype),
+    ).to(b.device)
+    exact = apply_prec(operator(probe))
+    difference = apply_prec(rounded(probe)) - exact
+    rounding = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(exact)
+    reachable = max(tol, ROUNDING_MARGIN * float(rounding))
+    arguments = {"preconditioner": preconditioner, "restart": restart}
+    first = gmres(rounded, b, maxit=maxit, tol=reachable, **arguments)
+    finish = gmres(operator, b, maxit=maxit, x0=first.x, tol=tol, **arguments)
+    return Solution(
+        x=finish.x,
+        residuals=torch.cat([first.residuals, finish.residuals[1:]]),
+        inner=finish.inner,
+        restarts=first.restarts + finish.restarts,
+        converged=finish.converged,
     )
 
 
@@ -141,10 +229,12 @@ def _cycle(
 ) -> tuple[torch.Tensor, torch.Tensor, int, list[torch.Tensor]]:
     """Run one restart cycle of Arnoldi, and return the updated iterate."""
     beta = torch.linalg.vector_norm(residual)
-    basis = torch.zeros(
-        (residual.shape[0], restart + 1), dtype=residual.dtype, device=residual.device
+    # One Krylov vector per row, so the leading rows are contiguous and each
+    # projection is one BLAS call on them, conjugating only the short vector.
+    basis = torch.empty(
+        (restart + 1, residual.shape[0]), dtype=residual.dtype, device=residual.device
     )
-    basis[:, 0] = residual / beta
+    basis[0] = residual / beta
 
     hessenberg = torch.zeros(
         (restart + 1, restart), dtype=residual.dtype, device=residual.device
@@ -155,9 +245,10 @@ def _cycle(
     k = 0
 
     for k in range(1, restart + 1):
-        w = apply_prec(operator(basis[:, k - 1]))
-        hessenberg[:k, k - 1] = basis[:, :k].conj().transpose(0, 1) @ w
-        w = w - basis[:, :k] @ hessenberg[:k, k - 1]
+        w = apply_prec(operator(basis[k - 1]))
+        projection = (basis[:k] @ w.conj()).conj()
+        hessenberg[:k, k - 1] = projection
+        w = w - basis[:k].transpose(0, 1) @ projection
 
         subdiagonal = torch.linalg.vector_norm(w)
         hessenberg[k, k - 1] = subdiagonal
@@ -169,13 +260,13 @@ def _cycle(
         # iterate this step gives is exact; dividing by it would give NaN.
         if subdiagonal <= torch.finfo(residual.real.dtype).eps * beta:
             break
-        basis[:, k] = w / subdiagonal
+        basis[k] = w / subdiagonal
 
         if history[-1] < target:
             break
 
-    x = x + basis[:, :k] @ y
-    residual = basis[:, : defect.shape[0]] @ defect
+    x = x + basis[:k].transpose(0, 1) @ y
+    residual = basis[: defect.shape[0]].transpose(0, 1) @ defect
     return x, residual, k, history
 
 

@@ -1,16 +1,15 @@
 """MARIE's multilayer sphere under a plane wave, against the layered Mie series.
 
 usage, from the repository root:
-    python examples/multilayer_mie.py <marie-tools>/data/bodies/Scatterers/2mm/Multilayer_Sphere.mat [linear] [cpu|cuda]
-    python examples/multilayer_mie.py --pitch 0.008 [linear] [cpu|cuda]
+    python examples/multilayer_mie.py <marie-tools>/data/bodies/Scatterers/2mm/Multilayer_Sphere.mat [linear] [mixed] [cpu|cuda]
+    python examples/multilayer_mie.py --pitch 0.008 [linear] [mixed] [cpu|cuda]
 
-MARIE's file is 2 mm, which the linear basis turns into 10.8 million unknowns:
-a restarted GMRES holds fifty of those as its Krylov basis, 8.7 GB, and one
-operator application holds another 5.4 GB, so it wants more than 16 GB of
-memory and upwards of an hour. The question the comparison answers -- whether
-the linear basis beats the constant one -- is a comparison between bases on one
-grid, so ``--pitch`` builds the same sphere at a coarser pitch, where both bases
-finish in a couple of minutes.
+``linear`` gives the body the piecewise-linear basis, twelve unknowns per voxel
+where the constant basis has three; ``mixed`` applies the operator in single
+precision and finishes in double. MARIE's file is 2 mm, where the linear basis wants a
+workstation's memory; ``--pitch`` builds the same sphere at a coarser pitch,
+where both bases finish in a couple of minutes, and the comparison between
+bases on one grid is the same question.
 """
 import sys, time
 import numpy as np
@@ -53,14 +52,16 @@ def built(pitch, device):
 arguments = sys.argv[1:]
 medium = Medium(3.0063)
 if arguments[0] == "--pitch":
-    pitch, arguments = float(arguments[1]), arguments[2:]
-    device = arguments[1] if len(arguments) > 1 else "cpu"
-    body = built(pitch, device)
+    source, arguments = float(arguments[1]), arguments[2:]
 else:
-    path, arguments = arguments[0], arguments[1:]
-    device = arguments[1] if len(arguments) > 1 else "cpu"
-    body = VoxelBody.read_marie(path, device=device)
-linear = bool(arguments) and arguments[0] == "linear"
+    source, arguments = arguments[0], arguments[1:]
+linear = "linear" in arguments
+precision = "mixed" if "mixed" in arguments else "double"
+device = "cuda" if "cuda" in arguments else "cpu"
+if isinstance(source, float):
+    body = built(source, device)
+else:
+    body = VoxelBody.read_marie(source, device=device)
 omega_eps0 = medium.angular_frequency * medium.permittivity
 indices = [np.conj(np.sqrt(complex(e, -s / omega_eps0))) for e, s in zip(eps, sigma)]
 
@@ -68,7 +69,7 @@ t0 = time.time()
 op = BodyOperator.build(body, medium, linear=linear)
 t1 = time.time()
 inc = plane_wave(body, medium, linear=linear)
-sol = solve_body(op, inc, tol=1e-6, maxit=400)
+sol = solve_body(op, inc, tol=1e-6, maxit=400, precision=precision)
 t2 = time.time()
 total = op.total_field(sol.x, inc)
 print(f"assembly {t1-t0:.0f}s solve {t2-t1:.0f}s iterations {len(sol.residuals)-1} converged {sol.converged}", flush=True)

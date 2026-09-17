@@ -1,6 +1,7 @@
 """Run one MARIE example case end to end and report the physics checks.
 
 usage: run_case.py <input.json> --data <marie-tools>/data [--device cpu|cuda] [--quick]
+                   [--precision double|mixed] [--shift DX DY DZ]
 
 The data folder is that of https://github.com/cloudmrhub/marie-tools.
 """
@@ -19,11 +20,18 @@ parser.add_argument("input")
 parser.add_argument("--data", required=True, help="marie-tools data folder")
 parser.add_argument("--device", default="cpu")
 parser.add_argument("--quick", action="store_true", help="low quadrature orders")
+parser.add_argument("--precision", default="double", choices=("double", "mixed"))
 parser.add_argument("--out", default=None)
+parser.add_argument("--shift", type=float, nargs=3, default=None, metavar=("DX", "DY", "DZ"),
+                    help="translate the body, in metres, to place it inside the coil")
 args = parser.parse_args()
 
 t0 = time.time()
 case = read_case(args.input, data=args.data, device=args.device)
+if args.shift is not None:
+    import dataclasses
+    origin = tuple(o + d for o, d in zip(case.body.origin, args.shift))
+    case = dataclasses.replace(case, body=dataclasses.replace(case.body, origin=origin))
 coil = case.coil
 print(f"case read in {time.time()-t0:.0f}s: voxels {case.body.n_voxels}, grid {case.body.shape}, "
       f"coil unknowns {coil.n_dof}, driven {coil.n_driven}, shield {case.shield is not None}, "
@@ -40,7 +48,10 @@ print(f"coil nodes inside tissue voxels: {int(hits)}", flush=True)
 
 orders = {"far_order": 2, "medium_order": 2, "near_order": 4} if args.quick else {}
 t1 = time.time()
-result = solve(case.body, coil, case.medium, linear=case.linear, shield=case.shield, **orders)
+result = solve(
+    case.body, coil, case.medium, linear=case.linear, shield=case.shield,
+    precision=args.precision, **orders,
+)
 t2 = time.time()
 op = result.operator
 raw = network.port_admittance(op.excitation, op.conductors(result.ports.coil, result.ports.shield))

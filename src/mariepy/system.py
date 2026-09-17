@@ -14,6 +14,8 @@ to itself at the same time.
 
 from __future__ import annotations
 
+import dataclasses
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -58,6 +60,9 @@ class CoupledOperator:
     medium: Medium
     system: CoilSystem
     coupling: Coupling
+    _derived: dict = dataclasses.field(
+        default_factory=dict, init=False, repr=False, compare=False
+    )
 
     @property
     def n_coil(self) -> int:
@@ -75,19 +80,21 @@ class CoupledOperator:
         Parameters
         ----------
         vector
-            Shape ``(n_coil + n_body,)``, complex.
+            Shape ``(n_coil + n_body,)``, complex128 or complex64; the product
+            is taken in its precision.
 
         Returns
         -------
         torch.Tensor
-            Same shape.
+            Same shape and precision.
         """
         coil_current = vector[: self.n_coil]
         body_current = vector[self.n_coil :]
         scaling = self.medium.electric_scaling
+        products = self._products(vector.dtype)
 
-        on_body = _apply(self.coupling.scatter, body_current)
-        on_grid = _apply(self.coupling.project, coil_current) + on_body
+        on_body = products.place(body_current)
+        on_grid = _apply(products.project, coil_current) + on_body
         n_components = self.coupling.n_components
         field = on_grid.reshape(n_components, *self.coupling.grid.shape)
         applied = (
@@ -97,7 +104,7 @@ class CoupledOperator:
 
         induced = (
             vie.apply_g(
-                self._contrast_inverse()
+                self._contrast_inverse(vector.dtype)
                 * on_body.reshape(n_components, *self.coupling.grid.shape),
                 self.coupling.grid.resolution,
             ).reshape(-1)
@@ -105,14 +112,12 @@ class CoupledOperator:
         )
 
         coil_out = (
-            _apply(self.coupling.project.transpose(0, 1), applied)
-            + _apply(self.coupling.coil, coil_current)
-            + _apply(self.coupling.electric.transpose(0, 1), body_current)
+            _apply(products.project_transpose, applied)
+            + _apply(products.coil, coil_current)
+            + _apply(products.electric_transpose, body_current)
         )
-        body_out = (
-            -_apply(self.coupling.scatter.transpose(0, 1), applied)
-            + _apply(self.coupling.scatter.transpose(0, 1), induced)
-            - _apply(self.coupling.electric, coil_current)
+        body_out = products.take(induced - applied) - _apply(
+            products.electric, coil_current
         )
         return torch.cat([coil_out, body_out])
 
@@ -177,8 +182,18 @@ class CoupledOperator:
 
         return apply
 
-    def _contrast_inverse(self) -> torch.Tensor:
+    def _products(self, dtype: torch.dtype) -> _SparseProducts:
+        """Give the coupling's sparse matrices in one precision, as the product applies them."""
+        cache = self._derived
+        if ("products", dtype) not in cache:
+            cache["products", dtype] = _SparseProducts.build(self.coupling, dtype)
+        return cache["products", dtype]
+
+    def _contrast_inverse(self, dtype: torch.dtype) -> torch.Tensor:
         """Give ``1 / Mc`` over the extended grid, zero where there is no tissue."""
+        cache = self._derived
+        if ("contrast", dtype) in cache:
+            return cache["contrast", dtype]
         grid = self.coupling.grid
         inverse = torch.zeros(grid.shape, dtype=torch.complex128, device=grid.device)
         start = grid.body_origin
@@ -190,12 +205,62 @@ class CoupledOperator:
             start[1] : start[1] + self.body.shape[1],
             start[2] : start[2] + self.body.shape[2],
         ] = block
-        return inverse
+        cache["contrast", dtype] = inverse.to(dtype)
+        return cache["contrast", dtype]
 
 
 def _apply(matrix: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
     """Multiply a sparse matrix by a vector."""
     return torch.sparse.mm(matrix, vector[:, None])[:, 0]
+
+
+@dataclass(frozen=True)
+class _SparseProducts:
+    """The coupling's matrices as compressed rows, with their transposes.
+
+    The scatter matrix places each body unknown on one grid entry, so it is
+    kept as that entry's index and applied by indexing.
+    """
+
+    project: torch.Tensor
+    project_transpose: torch.Tensor
+    electric: torch.Tensor
+    electric_transpose: torch.Tensor
+    coil: torch.Tensor
+    placement: torch.Tensor
+    n_grid: int
+
+    @classmethod
+    def build(cls, coupling: Coupling, dtype: torch.dtype) -> _SparseProducts:
+        scatter = coupling.scatter.coalesce()
+        rows, columns = scatter.indices()
+        placement = torch.empty_like(rows)
+        placement[columns] = rows
+
+        def rows_of(matrix: torch.Tensor) -> torch.Tensor:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "Sparse CSR tensor support")
+                return matrix.coalesce().to(dtype).to_sparse_csr()
+
+        return cls(
+            project=rows_of(coupling.project),
+            project_transpose=rows_of(coupling.project.transpose(0, 1)),
+            electric=rows_of(coupling.electric),
+            electric_transpose=rows_of(coupling.electric.transpose(0, 1)),
+            coil=rows_of(coupling.coil),
+            placement=placement,
+            n_grid=scatter.shape[0],
+        )
+
+    def place(self, body: torch.Tensor) -> torch.Tensor:
+        """Put body unknowns on the extended grid, zero elsewhere."""
+        out = torch.zeros(self.n_grid, dtype=body.dtype, device=body.device)
+        out[self.placement] = body
+        return out
+
+    def take(self, grid: torch.Tensor) -> torch.Tensor:
+        """Read the body unknowns back off the extended grid."""
+        return grid[self.placement]
 
 
 @dataclass(frozen=True)
@@ -283,17 +348,22 @@ class ShieldedOperator:
         Parameters
         ----------
         vector
-            Shape ``(n_shield + n_coil + n_body,)``, complex.
+            Shape ``(n_shield + n_coil + n_body,)``, complex128 or complex64.
 
         Returns
         -------
         torch.Tensor
-            Same shape.
+            Same shape and precision.
         """
         from mariepy import shield as shield_module
 
         coil_current, body_current, shield_current = self.split(vector)
-        inner = self.coupled(vector[self.n_shield :])
+        inner = self.coupled(vector[self.n_shield :]).to(torch.complex128)
+        # The shield's tensor trains and dense blocks are small beside the
+        # body, so they stay in double precision whatever the vector's.
+        coil_current = coil_current.to(torch.complex128)
+        body_current = body_current.to(torch.complex128)
+        shield_current = shield_current.to(torch.complex128)
         coil_out = (
             inner[: self.n_coil]
             + self.shield.coil_coupling.transpose(0, 1) @ shield_current
@@ -308,7 +378,7 @@ class ShieldedOperator:
                 self.shield.electric, body_current, self.body
             )
         )
-        return torch.cat([shield_out, coil_out, body_out])
+        return torch.cat([shield_out, coil_out, body_out]).to(vector.dtype)
 
     @property
     def excitation(self) -> torch.Tensor:

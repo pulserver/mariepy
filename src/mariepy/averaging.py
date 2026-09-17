@@ -633,7 +633,9 @@ def face_cubes(
 
     sides = []
     for axis, sign in itertools.product(range(3), (1, -1)):
-        side = torch.full((centre.shape[0],), math.nan, dtype=torch.float64)
+        side = torch.full(
+            (centre.shape[0],), math.nan, dtype=torch.float64, device=mass.device
+        )
         settled = torch.zeros(centre.shape[0], dtype=torch.bool, device=mass.device)
         reach = float(start + 1)
         while not bool(settled.all()) and reach <= max(shape):
@@ -648,7 +650,12 @@ def face_cubes(
                     centre[found],
                     axis,
                     sign,
-                    torch.full((int(found.sum()),), reach, dtype=torch.float64),
+                    torch.full(
+                        (int(found.sum()),),
+                        reach,
+                        dtype=torch.float64,
+                        device=mass.device,
+                    ),
                     target_mass,
                 )
                 settled |= found
