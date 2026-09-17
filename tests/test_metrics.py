@@ -59,6 +59,16 @@ def test_the_coil_adds_its_resistance_between_every_pair_of_channels():
     expected = coil @ loss.real.to(coil.dtype) @ coil.conj().T
     torch.testing.assert_close(got, expected)
 
+    sparse = metrics.noise_covariance(
+        field,
+        torch.zeros(1, 1, 1),
+        torch.ones(1, 1, 1),
+        0.01,
+        coil=coil,
+        loss=loss.to_sparse(),
+    )
+    torch.testing.assert_close(sparse, expected)
+
 
 def test_one_channel_s_snr_is_its_sensitivity_over_the_root_of_its_noise():
     medium = Medium(3.0)

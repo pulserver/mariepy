@@ -253,8 +253,9 @@ def test_a_lumped_element_adds_its_impedance_over_the_edges_it_spans(device):
         loaded[load.dofs[:, None], load.dofs[None, :]],
         value * lengths[:, None] * lengths[None, :],
     )
+    dense = loss.to_dense()
     torch.testing.assert_close(
-        loss[load.dofs[:, None], load.dofs[None, :]],
+        dense[load.dofs[:, None], load.dofs[None, :]],
         resistance * lengths[:, None] * lengths[None, :],
     )
     driven = coil.ports[0]
@@ -348,3 +349,71 @@ def test_a_plane_wave_needs_a_direction_of_propagation(device):
     coil = _loop(device)
     with pytest.raises(ValueError, match="direction of propagation"):
         sie.plane_wave_excitation(coil, _medium(), direction=(0.0, 0.0, 0.0))
+
+
+def test_the_losses_reach_only_the_conductor_and_the_elements_they_sit_on(device):
+    mesh = SurfaceMesh.loop(
+        radius=RADIUS, width=WIDTH, n_around=16, n_across=2, ports=2, device=device
+    )
+    elements = (
+        Port(
+            tag=1,
+            kind="port",
+            load="capacitorSeries",
+            value=0.0,
+            quality=1.0,
+            voltage=1.0,
+        ),
+        Port(
+            tag=2,
+            kind="element",
+            load="capacitor",
+            value=3.3e-12,
+            quality=250.0,
+            voltage=0.0,
+        ),
+    )
+    coil = SurfaceCoil.build(mesh, elements)
+    system = sie.assemble(coil, _medium())
+
+    assert system.copper_loss.is_sparse
+    assert system.lumped_loss.is_sparse
+    assert system.loss.is_sparse
+    torch.testing.assert_close(
+        system.loss.to_dense(),
+        system.copper_loss.to_dense() + system.lumped_loss.to_dense(),
+    )
+
+    shares = torch.zeros(
+        (coil.n_dof, coil.n_dof), dtype=torch.bool, device=coil.mesh.device
+    )
+    dof = coil.dof_of_triangle()
+    for triangle in range(coil.mesh.n_triangles):
+        here = dof[triangle][dof[triangle] >= 0]
+        shares[here[:, None], here[None, :]] = True
+    reached = system.copper_loss.to_dense() != 0
+    assert bool((reached <= shares).all())
+
+    element = next(port for port in coil.ports if port.kind == "element")
+    spanned = torch.zeros_like(shares)
+    spanned[element.dofs[:, None], element.dofs[None, :]] = True
+    assert bool(((system.lumped_loss.to_dense() != 0) <= spanned).all())
+
+
+def test_a_perfect_conductor_loses_nothing_to_copper(device):
+    coil = _loop(device)
+    system = sie.assemble(coil, _medium(), surface_resistance=0.0)
+    assert system.copper_loss.is_sparse
+    assert not bool(system.copper_loss.to_dense().any())
+
+
+def test_two_coils_joined_on_the_diagonal_keep_each_block_where_it_was(device):
+    first = sie.assemble(_loop(device, n_around=8, n_across=1), _medium()).copper_loss
+    second = sie.assemble(_loop(device, n_around=6, n_across=1), _medium()).copper_loss
+    joined = sie.block_diagonal(first, second).to_dense()
+
+    n = first.shape[0]
+    torch.testing.assert_close(joined[:n, :n], first.to_dense())
+    torch.testing.assert_close(joined[n:, n:], second.to_dense())
+    assert not bool(joined[:n, n:].any())
+    assert not bool(joined[n:, :n].any())

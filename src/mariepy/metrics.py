@@ -124,8 +124,8 @@ def noise_covariance(
         the conductor out.
     loss
         The conductor's and lumped elements' resistance, shape
-        ``(n_dof, n_dof)``: :attr:`mariepy.sie.CoilSystem.copper_loss` plus
-        :attr:`mariepy.sie.CoilSystem.lumped_loss`.
+        ``(n_dof, n_dof)``, dense or sparse:
+        :attr:`mariepy.sie.CoilSystem.loss`.
 
     Returns
     -------
@@ -146,7 +146,7 @@ def noise_covariance(
     )
     if coil is not None and loss is not None:
         resistance = loss.real.to(coil.dtype)
-        covariance = covariance + coil @ resistance @ coil.conj().transpose(0, 1)
+        covariance = covariance + coil @ (resistance @ coil.conj().transpose(0, 1))
     return covariance
 
 

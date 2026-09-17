@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from mariepy import cosim, fields, metrics, network
+from mariepy import cosim, fields, metrics, network, sie
 from mariepy.inputs import read_case
 from mariepy.solver import solve
 
@@ -89,13 +89,9 @@ for side, mapping in (("transmit", closed.transmit), ("receive", closed.receive)
     print(f"{side}: absorbed per unit incident wave [W] {p_abs.cpu().numpy()}")
     print(f"{side}: mean |B1+| per port [uT per sqrt(W)] {(b1p.abs()[:, mask].mean(1) * 1e6 / math.sqrt(0.5)).cpu().numpy()}")
     coil_current = cosim.calibrate(op.conductors(result.ports.coil, result.ports.shield), mapping)
-    loss = op.system.copper_loss + op.system.lumped_loss
+    loss = op.system.loss
     if case.shield is not None:
-        n_s = op.n_shield
-        full = torch.zeros((n_s + op.n_coil,) * 2, dtype=loss.dtype, device=loss.device)
-        full[:n_s, :n_s] = op.shield.system.copper_loss + op.shield.system.lumped_loss
-        full[n_s:, n_s:] = loss
-        loss = full
+        loss = sie.block_diagonal(op.shield.system.loss, loss)
     psi = metrics.noise_covariance(e, case.body.conductivity, mask, case.body.resolution, coil=coil_current, loss=loss)
     if side == "receive":
         snr = metrics.snr(b1m, psi, case.medium, case.body.resolution, mask)
