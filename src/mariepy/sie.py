@@ -35,6 +35,7 @@ from mariepy.quadrature import gauss_legendre_1d, gauss_triangle
 __all__ = [
     "CoilSystem",
     "assemble",
+    "block_diagonal",
     "coupling_matrix",
     "edge_block",
     "impedance",
@@ -70,15 +71,22 @@ class CoilSystem:
         Delta-gap drive of each port, shape ``(n_driven, n_dof)``, complex.
     copper_loss
         The part of the self block that the conductor's surface resistance
-        contributes, same shape as ``impedance``.
+        contributes, sparse, same shape as ``impedance``. It reaches only
+        basis functions that share a triangle.
     lumped_loss
-        The resistive part of the lumped loads, same shape.
+        The resistive part of the lumped loads, sparse, same shape. It reaches
+        only the edges the elements sit on.
     """
 
     impedance: torch.Tensor
     excitation: torch.Tensor
     copper_loss: torch.Tensor
     lumped_loss: torch.Tensor
+
+    @property
+    def loss(self) -> torch.Tensor:
+        """The conductor's and the lumped elements' resistance together, sparse."""
+        return (self.copper_loss + self.lumped_loss).coalesce()
 
 
 def assemble(
@@ -166,7 +174,7 @@ def impedance(
     matrix : torch.Tensor
         Shape ``(n_dof, n_dof)``, complex.
     copper_loss : torch.Tensor
-        The surface-resistance part of it, same shape.
+        The surface-resistance part of it, same shape, sparse.
     """
     wavenumber = medium.wavenumber
     device = coil.mesh.device
@@ -197,11 +205,12 @@ def impedance(
     _scatter(matrix, coil, same, self_block(coil, wavenumber, order=self_order))
 
     matrix = matrix * (medium.impedance / (4.0 * torch.pi))
-    copper = torch.zeros_like(matrix)
+    empty = torch.zeros(0, dtype=torch.complex128, device=device)
+    copper = _gather(coil, same[:0], empty.reshape(0, 3, 3))
     if surface_resistance:
         block = surface_block(coil, surface_resistance)
         _scatter(matrix, coil, same, block)
-        _scatter(copper, coil, same, block)
+        copper = _gather(coil, same, block)
     return matrix, copper
 
 
@@ -512,12 +521,12 @@ def lumped_loads(
     loaded : torch.Tensor
         The matrix with every lumped element added.
     loss : torch.Tensor
-        The resistive part of what was added.
+        The resistive part of what was added, sparse.
     """
     loaded = matrix.clone()
-    loss = torch.zeros_like(matrix)
     lengths = coil.dof_lengths().to(torch.complex128)
     by_tag = {port.tag: port for port in coil.ports}
+    index, values = [], []
 
     for port in coil.ports:
         if port.kind != "element":
@@ -525,8 +534,10 @@ def lumped_loads(
         value, resistance = port.impedance(angular_frequency)
         here = lengths[port.dofs]
         rows, columns = torch.meshgrid(port.dofs, port.dofs, indexing="ij")
-        loaded[rows, columns] += value * here[:, None] * here[None, :]
-        loss[rows, columns] += resistance * here[:, None] * here[None, :]
+        outer = here[:, None] * here[None, :]
+        loaded[rows, columns] += value * outer
+        index.append(torch.stack([rows.reshape(-1), columns.reshape(-1)]))
+        values.append((resistance * outer).reshape(-1))
 
         if port.load == "mutual_inductor" and port.coupled_tag is not None:
             partner = by_tag[port.coupled_tag]
@@ -539,7 +550,7 @@ def lumped_loads(
                 * here[:, None]
                 * there[None, :]
             )
-    return loaded, loss
+    return loaded, _sparse_sum(index, values, coil.n_dof, matrix.device)
 
 
 def port_excitation(coil: SurfaceCoil) -> torch.Tensor:
@@ -725,3 +736,54 @@ def _scatter(
     columns = dof[pairs[:, 1]][:, None, :].expand(-1, 3, 3)
     keep = (rows >= 0) & (columns >= 0)
     matrix.index_put_((rows[keep], columns[keep]), blocks[keep], accumulate=True)
+
+
+def block_diagonal(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
+    """Place two sparse matrices on the diagonal of one, in the order given.
+
+    Parameters
+    ----------
+    first, second
+        Sparse square matrices.
+
+    Returns
+    -------
+    torch.Tensor
+        Sparse, of the two sizes together, with nothing off the blocks.
+    """
+    first, second = first.coalesce(), second.coalesce()
+    offset = first.shape[0]
+    index = torch.cat([first.indices(), second.indices() + offset], dim=1)
+    size = offset + second.shape[0]
+    return torch.sparse_coo_tensor(
+        index, torch.cat([first.values(), second.values()]), (size, size)
+    ).coalesce()
+
+
+def _sparse_sum(
+    index: list[torch.Tensor],
+    values: list[torch.Tensor],
+    n_dof: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sum entries given as index and value lists into one sparse matrix."""
+    if not index:
+        index = [torch.zeros((2, 0), dtype=torch.int64, device=device)]
+        values = [torch.zeros(0, dtype=torch.complex128, device=device)]
+    return torch.sparse_coo_tensor(
+        torch.cat(index, dim=1), torch.cat(values), (n_dof, n_dof)
+    ).coalesce()
+
+
+def _gather(
+    coil: SurfaceCoil, pairs: torch.Tensor, blocks: torch.Tensor
+) -> torch.Tensor:
+    """Collect local blocks into a sparse matrix, dropping edges that carry no basis."""
+    dof = coil.dof_of_triangle()
+    rows = dof[pairs[:, 0]][:, :, None].expand(-1, 3, 3)
+    columns = dof[pairs[:, 1]][:, None, :].expand(-1, 3, 3)
+    keep = (rows >= 0) & (columns >= 0)
+    index = torch.stack([rows[keep], columns[keep]])
+    return torch.sparse_coo_tensor(
+        index, blocks[keep], (coil.n_dof, coil.n_dof)
+    ).coalesce()

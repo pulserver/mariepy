@@ -32,7 +32,7 @@ from mariepy.constants import COPPER_CONDUCTIVITY, VACUUM_PERMEABILITY, Medium
 from mariepy.coupling import _cell_rule, _electric, _magnetic
 from mariepy.mesh import _section
 from mariepy.quadrature import gauss_legendre_1d, gauss_triangle
-from mariepy.sie import CoilSystem
+from mariepy.sie import CoilSystem, block_diagonal
 
 __all__ = [
     "WIRE_RADIUS",
@@ -370,6 +370,15 @@ class _Segments:
     weights: torch.Tensor  # (q,)
 
 
+def _diagonal_sparse(diagonal: torch.Tensor) -> torch.Tensor:
+    """Carry a diagonal as a sparse square matrix."""
+    n = diagonal.shape[0]
+    index = torch.arange(n, device=diagonal.device)
+    return torch.sparse_coo_tensor(
+        torch.stack([index, index]), diagonal, (n, n)
+    ).coalesce()
+
+
 def _segments(coil: WireCoil, order: int) -> _Segments:
     weights, nodes = gauss_legendre_1d(order, device=coil.device, dtype=torch.float64)
     u = (nodes + 1) / 2
@@ -422,7 +431,8 @@ def impedance(
         The EFIE matrix with the copper loss on its diagonal, shape
         ``(n_dof, n_dof)``: MARIE's ``Z`` before the lumped loads.
     copper : torch.Tensor
-        The copper loss alone.
+        The copper loss alone, sparse: a wire basis function loses power only
+        on its own two segments.
     """
     k = medium.wavenumber
     a = coil.radius
@@ -464,8 +474,9 @@ def impedance(
     )
     resistance = (1 / conductivity) / (math.pi * (2 * a - depth) * depth)
     left, right = coil.left_lengths(), coil.right_lengths()
-    copper = torch.diag(resistance * (left + right).abs() / 3).to(torch.complex128)
-    return matrix + copper, copper
+    diagonal = (resistance * (left + right).abs() / 3).to(torch.complex128)
+    copper = _diagonal_sparse(diagonal)
+    return matrix + torch.diag(diagonal), copper
 
 
 def _regular(s: _Segments, src, obs, k, a):
@@ -573,10 +584,10 @@ def lumped_loads(
     loaded : torch.Tensor
         The matrix with every element added.
     loss : torch.Tensor
-        The resistive part of what was added.
+        The resistive part of what was added, sparse.
     """
     loaded = matrix.clone()
-    loss = torch.zeros_like(matrix)
+    loss = torch.zeros(coil.n_dof, dtype=matrix.dtype, device=matrix.device)
     by_tag = {port.tag: port for port in coil.ports}
     for port in coil.ports:
         if port.kind != "element":
@@ -585,13 +596,13 @@ def lumped_loads(
         first, second = port.dofs.tolist()
         for dof in (first, second):
             loaded[dof, dof] += 0.5 * value
-            loss[dof, dof] += 0.5 * resistance
+            loss[dof] += 0.5 * resistance
         if port.load == "mutual_inductor" and port.coupled_tag is not None:
             partner = by_tag[port.coupled_tag].dofs.tolist()
             mutual = 1j * angular_frequency * port.coupled_value
             loaded[first, partner[0]] += 0.5 * mutual
             loaded[second, partner[1]] += 0.5 * mutual
-    return loaded, loss
+    return loaded, _diagonal_sparse(loss)
 
 
 def port_excitation(coil: WireCoil) -> torch.Tensor:
@@ -951,9 +962,6 @@ def assemble_combined(
             dim=0,
         )
 
-    empty = torch.zeros(
-        (n_wire, n_surface), dtype=torch.complex128, device=cross.device
-    )
     excitation = torch.cat(
         [
             torch.nn.functional.pad(wire_system.excitation, (0, n_surface)),
@@ -964,6 +972,6 @@ def assemble_combined(
     return CoilSystem(
         impedance=blocks(wire_system.impedance, surface_system.impedance, cross),
         excitation=excitation,
-        copper_loss=blocks(wire_system.copper_loss, surface_system.copper_loss, empty),
-        lumped_loss=blocks(wire_system.lumped_loss, surface_system.lumped_loss, empty),
+        copper_loss=block_diagonal(wire_system.copper_loss, surface_system.copper_loss),
+        lumped_loss=block_diagonal(wire_system.lumped_loss, surface_system.lumped_loss),
     )

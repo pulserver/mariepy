@@ -163,7 +163,7 @@ def test_the_copper_loss_is_the_skin_resistance_over_each_hat(slow_loop):
     per_length = 1 / (5.96e7 * math.pi * (2 * coil.radius - depth) * depth)
     hat = (coil.left_lengths() + coil.right_lengths()) / 3
     torch.testing.assert_close(
-        torch.diagonal(system.copper_loss).real, per_length * hat
+        torch.diagonal(system.copper_loss.to_dense()).real, per_length * hat
     )
 
 
