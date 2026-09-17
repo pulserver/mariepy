@@ -5,7 +5,7 @@ Electromagnetic simulation of MRI transmit coils and virtual observation points 
 [![Tests](https://github.com/pulserver/mariepy/actions/workflows/test-ci.yml/badge.svg)](https://github.com/pulserver/mariepy/actions/workflows/test-ci.yml)
 [![codecov](https://codecov.io/gh/pulserver/mariepy/branch/main/graph/badge.svg)](https://codecov.io/gh/pulserver/mariepy)
 [![PyPI](https://img.shields.io/pypi/v/mariepy.svg)](https://pypi.org/project/mariepy/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License: GPL v3+](https://img.shields.io/badge/License-GPLv3%2B-blue.svg)](LICENSE)
 
 ## Install
 
@@ -120,3 +120,13 @@ the model and the maps (`pip install "mariepy[plot]"`).
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Licence
+
+Copyright (C) 2026 Matteo Cencini. mariepy is free software under the GNU
+General Public License, version 3 or any later version; see [LICENSE](LICENSE). Code it carries from other projects,
+and their notices, are listed in [THIRD_PARTY.md](THIRD_PARTY.md).
+
+The licence covers the program. The files it writes, such as VOP files and
+field maps, are the user's and carry whatever terms their body models impose
+(see `PLAN.md`), so projects under any licence can read them.

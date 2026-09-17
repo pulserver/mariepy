@@ -69,7 +69,7 @@ src/mariepy/
     solver.py               drives geometry, operators, solve, network, fields
     inputs.py               a MARIE simulation file, read into body, coil and medium
 
-src/cpp/                    -> mariepy._ext, MIT
+src/cpp/                    -> mariepy._ext, GPL-3.0-or-later
     module.cpp              bindings
     coupling.cpp            the N and K coupling kernels, over threads
 
@@ -93,7 +93,7 @@ tests/
 ```
 
 The two extensions are separate targets in `CMakeLists.txt` and separate
-`install(TARGETS ...)` lines. `_ext` is MIT and links nothing from
+`install(TARGETS ...)` lines. `_ext` links nothing from
 `src/cpp_lgpl/`; `_directfn` carries the LGPL notice of each source it compiles
 and is loaded through the same `_accelerators.require` path, which names the
 module in its error.
