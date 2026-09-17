@@ -280,3 +280,18 @@ def test_the_default_region_keeps_its_clearance_from_the_conductors(device):
     gap = (centres[:, None, :] - points[None, :, :]).abs().amax(dim=-1).min()
     assert float(gap) > 0.015 - RESOLUTION / 2
     assert bool(region.any())
+
+
+def test_the_sampled_basis_leaves_the_coupling_within_its_own_tolerance(device):
+    # What the basis leaves of the coupling's action is what the compressed
+    # perturbation inherits, so it is measured against the operator, not
+    # against the sampling the basis came from, and it follows the tolerance
+    # the sampling was asked for.
+    _, coarse = _built(device, exact=False, tol=1e-3)
+    _, fine = _built(device, exact=False, tol=1e-5)
+    missed = {}
+    for tol, built in ((1e-3, coarse), (1e-5, fine)):
+        basis, _ = implicit._coupling_range(built.operator, tol=tol, block=16, checks=2)
+        missed[tol] = implicit._missed(built.operator, basis, 3)
+        assert missed[tol] <= 10 * tol
+    assert missed[1e-5] < 0.1 * missed[1e-3]

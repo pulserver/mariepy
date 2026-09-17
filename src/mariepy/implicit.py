@@ -20,12 +20,12 @@ coil, the frequency and the grid, never on the tissue, so it is compressed once
 over the region of a grid a body may occupy and serves every body within it.
 
 The compression departs from MARIE 2.0's, which samples ``Zbc`` by cross
-approximation and keeps factors the size of the grid. Here the coupling's range
-is found from the coil's side: a randomized Nyström approximation of the Gram
-matrix ``Zbc^H Zbc`` gives the right singular vectors of ``Zbc``, and the
-perturbation is truncated in that basis. What is kept per coil is therefore a
-handful of coil current patterns; each body turns them into its own factors
-with one product each, and both factors are taken on the body's own voxels.
+approximation. Here the coupling's range is found from the coil's side: a
+randomized Nyström approximation of the Gram matrix ``Zbc^H Zbc`` gives the
+right singular vectors of ``Zbc``, and what the basis leaves of the coupling's
+action is measured against the operator itself. The perturbation is truncated
+in that basis and its factors are taken over the whole region once, so a body
+only selects the rows of the voxels it occupies.
 """
 
 from __future__ import annotations
@@ -211,6 +211,7 @@ class CoilPerturbation:
         tol: float = 1e-3,
         region: torch.Tensor | None = None,
         block: int = 16,
+        checks: int = 2,
         impedance: torch.Tensor | None = None,
         system: CoilSystem | None = None,
         linear: bool = False,
@@ -243,6 +244,9 @@ class CoilPerturbation:
         block
             Random coil currents drawn at a time while the coupling's range is
             sampled; each costs two products on the extended grid.
+        checks
+            Random coil currents the basis is measured against once it is
+            found, each costing two more products.
         impedance
             The coil matrix to eliminate the coil with. By default the coil's own
             method-of-moments matrix; the coupled operator's coil block makes
@@ -284,7 +288,7 @@ class CoilPerturbation:
         factors = torch.linalg.lu_factor(impedance)
         drive = torch.linalg.lu_solve(*factors, system.excitation.transpose(0, 1))
 
-        basis, singular = _coupling_range(operator, tol=tol, block=block)
+        basis, singular = _coupling_range(operator, tol=tol, block=block, checks=checks)
         # Zbc V = Q S, so the perturbation is Q (S V^H Zc^-1 conj(V) S) Q^T.
         inverse = torch.linalg.lu_solve(*factors, basis.conj())
         core = singular[:, None] * (basis.conj().transpose(0, 1) @ inverse)
@@ -534,13 +538,20 @@ class BodyPerturbation:
 
 
 def _coupling_range(
-    operator: CoupledOperator, *, tol: float, block: int
+    operator: CoupledOperator, *, tol: float, block: int, checks: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Find the coupling's right singular vectors above a relative tolerance.
 
     A randomized Nyström approximation of ``G = Zbc^H Zbc`` (Tropp et al., SIAM
     J. Matrix Anal. Appl. 38 (2017) 1454) grows by ``block`` columns until its
-    smallest kept eigenvalue falls below ``tol**2`` times its largest.
+    smallest kept eigenvalue falls below ``tol**2`` times its largest. Each
+    column costs two products on the extended grid; the coupling's rank over a
+    head-sized region runs to several hundred, so this is what a build spends
+    its time on.
+
+    What the basis leaves of the coupling's action is measured on ``checks``
+    random coil currents and logged, since it is the bound the compressed
+    perturbation inherits.
 
     Returns
     -------
@@ -553,9 +564,12 @@ def _coupling_range(
     device = operator.system.impedance.device
     generator = torch.Generator().manual_seed(0)
 
-    def gram(column: torch.Tensor) -> torch.Tensor:
-        field = operator.couple(column)
-        return operator.couple_transpose(field.conj()).conj()
+    def gram(columns: torch.Tensor) -> torch.Tensor:
+        held = []
+        for k in range(columns.shape[1]):
+            field = operator.couple(columns[:, k])
+            held.append(operator.couple_transpose(field.conj()).conj())
+        return torch.stack(held, dim=1)
 
     test = torch.zeros((n_coil, 0), dtype=torch.complex128, device=device)
     sketch = torch.zeros_like(test)
@@ -569,10 +583,7 @@ def _coupling_range(
             fresh = fresh - test @ (test.conj().transpose(0, 1) @ fresh)
         fresh, _ = torch.linalg.qr(fresh)
         test = torch.cat([test, fresh], dim=1)
-        sketch = torch.cat(
-            [sketch, torch.stack([gram(fresh[:, k]) for k in range(width)], dim=1)],
-            dim=1,
-        )
+        sketch = torch.cat([sketch, gram(fresh)], dim=1)
         vectors, values = _nystrom(test, sketch)
         kept = values > (tol**2) * values[0]
         _log.info(
@@ -584,7 +595,38 @@ def _coupling_range(
         if int(kept.sum()) <= test.shape[1] - block // 2 or test.shape[1] >= n_coil:
             break
     singular = torch.sqrt(values[kept]).to(torch.complex128)
-    return vectors[:, kept], singular
+    basis = vectors[:, kept]
+    _log.info(
+        "the basis leaves %.2e of the coupling's action on a random current",
+        _missed(operator, basis, checks),
+    )
+    return basis, singular
+
+
+def _missed(operator: CoupledOperator, basis: torch.Tensor, checks: int) -> float:
+    """How much of the coupling's action on random coil currents a basis leaves.
+
+    The coupling through the operator is what the basis has to hold, so that is
+    what it is measured against.
+    """
+    generator = torch.Generator().manual_seed(1)
+    shape = (operator.n_coil,)
+    device = basis.device
+    worst = 0.0
+    for _ in range(checks):
+        current = torch.complex(
+            torch.randn(shape, generator=generator, dtype=torch.float64),
+            torch.randn(shape, generator=generator, dtype=torch.float64),
+        ).to(device)
+        whole = operator.couple(current)
+        held = operator.couple(basis @ (basis.conj().transpose(0, 1) @ current))
+        worst = max(
+            worst,
+            float(
+                torch.linalg.vector_norm(whole - held) / torch.linalg.vector_norm(whole)
+            ),
+        )
+    return worst
 
 
 def _nystrom(

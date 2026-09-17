@@ -258,11 +258,24 @@ The port departs from MARIE 2.0 in three places:
   the grid. Here the coupling's range is found from the coil's side, by a
   randomized Nyström approximation (Tropp et al., SIAM J. Matrix Anal. Appl. 38
   (2017) 1454) of the Gram matrix `Zbc^H Zbc`, whose eigenvectors are the right
-  singular vectors of `Zbc`. The rank that truncation keeps is what the build
-  then carries to the body: the factors are taken over the whole region once,
-  in complex64, and a body selects the rows of the voxels it occupies, so no
-  coupling product is taken per body. Their right-hand side stays in
-  complex128, where the solve starts from it.
+  singular vectors of `Zbc`. Each sampled current costs two convolutions, and
+  the coupling's rank over a head-sized region runs to several hundred, so this
+  is what a build spends its time on. `pfft.coupling_rows` integrates rows of
+  `Zbc` directly instead, at one kernel evaluation per basis function and no
+  convolution — ten times cheaper per sample — but a random sample of rows
+  estimates the Gram with an error that falls only as its square root, and on a
+  head at 6 mm no sample short of the whole region reaches the tail that `tol`
+  asks for: measured, the basis leaves 1.4e-1 of the coupling's action at 1024
+  cells of 40316, 2.8e-2 at 4096 and 3.0e-3 at all of them, whichever way the
+  cells are drawn. Sampling rows therefore pays only with the pivoting that
+  chooses each one against what the basis so far misses, which is what MARIE
+  2.0's cross approximation does and what its grid-sized factors are the price
+  of. What the basis leaves is reported on every build, since the compressed
+  perturbation inherits it. The rank that truncation keeps is what the build then carries to
+  the body: the factors are taken over the whole region once, in complex64, and
+  a body selects the rows of the voxels it occupies, so no coupling product is
+  taken per body. Their right-hand side stays in complex128, where the solve
+  starts from it.
 - The region must keep its distance from the conductors. Tissue beside a
   conductor sees the near field of each of its edges, which no low-rank
   perturbation holds: a head mask dilated into the coil kept more than 480
