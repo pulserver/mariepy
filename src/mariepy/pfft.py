@@ -24,6 +24,7 @@ refers to.
 
 from __future__ import annotations
 
+import dataclasses
 import math
 from dataclasses import dataclass
 
@@ -50,6 +51,7 @@ __all__ = [
     "projected_coupling",
     "projection",
     "projection_matrix",
+    "restrict",
     "scatter_matrix",
 ]
 
@@ -1017,6 +1019,83 @@ def assemble(
         symbols_n=symbols_n,
         symbols_k=symbols_k,
         linear=linear,
+    )
+
+
+def restrict(coupling: Coupling, mask: torch.Tensor) -> Coupling:
+    """Take a coupling assembled over a whole body grid down to one body inside it.
+
+    Every entry of the near corrections belongs to one basis function and one
+    cell, whatever else the grid holds, so a coupling assembled once with every
+    cell of the body grid counted as body serves any body on that grid: its
+    rows are selected and the scatter rebuilt.
+
+    Parameters
+    ----------
+    coupling
+        Assembled by :func:`assemble` for a body whose mask covers its whole
+        grid.
+    mask
+        The body to keep, on that grid, shape ``(n1, n2, n3)``, boolean.
+
+    Returns
+    -------
+    Coupling
+        The coupling :func:`assemble` gives for a body with ``mask`` on the same
+        grid.
+
+    Raises
+    ------
+    ValueError
+        If ``coupling`` was not assembled over its whole body grid, or ``mask``
+        is not that grid's shape.
+    """
+    grid = coupling.grid
+    start = grid.body_origin
+    box = grid.mask[
+        start[0] : start[0] + mask.shape[0],
+        start[1] : start[1] + mask.shape[1],
+        start[2] : start[2] + mask.shape[2],
+    ]
+    if tuple(box.shape) != tuple(mask.shape) or int(grid.mask.sum()) != mask.numel():
+        raise ValueError(
+            "the coupling must be assembled over every cell of a body grid of "
+            f"shape {tuple(mask.shape)}"
+        )
+    placed = torch.zeros_like(grid.mask)
+    placed[
+        start[0] : start[0] + mask.shape[0],
+        start[1] : start[1] + mask.shape[1],
+        start[2] : start[2] + mask.shape[2],
+    ] = mask.to(grid.mask.device)
+    kept = dataclasses.replace(grid, mask=placed)
+
+    n_box = mask.numel()
+    n_components = coupling.n_components
+    numbering = torch.full((n_box,), -1, dtype=torch.int64, device=grid.device)
+    inside = mask.reshape(-1).to(grid.device)
+    numbering[inside] = torch.arange(int(inside.sum()), device=grid.device)
+    n_voxels = int(inside.sum())
+
+    def rows_of(matrix: torch.Tensor) -> torch.Tensor:
+        matrix = matrix.coalesce()
+        row, column = matrix.indices()
+        component, cell = row // n_box, row % n_box
+        new = numbering[cell]
+        keep = new >= 0
+        return torch.sparse_coo_tensor(
+            torch.stack([component[keep] * n_voxels + new[keep], column[keep]]),
+            matrix.values()[keep],
+            (n_components * n_voxels, matrix.shape[1]),
+            check_invariants=False,
+        ).coalesce()
+
+    return dataclasses.replace(
+        coupling,
+        grid=kept,
+        scatter=scatter_matrix(kept, n_components),
+        electric=rows_of(coupling.electric),
+        magnetic=rows_of(coupling.magnetic),
     )
 
 

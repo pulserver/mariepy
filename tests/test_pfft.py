@@ -257,3 +257,56 @@ def _direct_dense(grid, coil, medium, near, body):
         for component in range(3):
             out[component * n_voxels + numbering[cells], dof] = value[:, component]
     return out
+
+
+def _whole_grid(body):
+    """The body's grid with every cell counted as body."""
+    return VoxelBody(
+        permittivity=torch.ones_like(body.permittivity),
+        conductivity=torch.zeros_like(body.conductivity),
+        mask=torch.ones_like(body.mask),
+        resolution=body.resolution,
+        origin=body.origin,
+    )
+
+
+@pytest.mark.parametrize("linear", [False, True], ids=["constant", "linear"])
+def test_a_coupling_over_the_whole_grid_restricts_to_the_body_s_own(linear, device):
+    body = _body(device)
+    coil = _coil(device)
+    medium = _medium()
+    impedance = sie.assemble(coil, medium).impedance
+    orders = {"far_order": 2, "medium_order": 2, "near_order": 4, "linear": linear}
+    own = pfft.assemble(body, coil, impedance, medium, distance=DISTANCE, **orders)
+    whole = pfft.assemble(
+        _whole_grid(body), coil, impedance, medium, distance=DISTANCE, **orders
+    )
+    restricted = pfft.restrict(whole, body.mask)
+
+    assert bool((restricted.grid.mask == own.grid.mask).all())
+    for name in ("project", "scatter", "electric", "magnetic", "coil"):
+        torch.testing.assert_close(
+            getattr(restricted, name).to_dense(),
+            getattr(own, name).to_dense(),
+            rtol=1e-12,
+            atol=0.0,
+        )
+
+
+def test_restricting_a_coupling_of_one_body_is_refused(device):
+    body = _body(device)
+    coil = _coil(device)
+    medium = _medium()
+    impedance = sie.assemble(coil, medium).impedance
+    own = pfft.assemble(
+        body,
+        coil,
+        impedance,
+        medium,
+        distance=DISTANCE,
+        far_order=2,
+        medium_order=2,
+        near_order=4,
+    )
+    with pytest.raises(ValueError, match="every cell"):
+        pfft.restrict(own, body.mask)
