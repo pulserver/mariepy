@@ -428,11 +428,17 @@ What this leaves uncovered is recorded rather than implied away:
 
 ## Constraints
 
-**Code licence.** mariepy is MIT.
+**Code licence.** mariepy is GPL-3.0-or-later. It is a standalone program,
+and what other projects take from it is its output: a VOP file, or a field map,
+which the licence of the program does not reach. pypulseqpp reads the file and
+never imports mariepy.
 
-- **Permissive code** (MIT, BSD, Apache-2.0) may be ported with its copyright
-  notice kept, and each ported source is listed in `THIRD_PARTY.md`. This covers
-  MARIE 3.0 itself and TT-Toolbox's `dmrg_cross`.
+- **Code under a licence compatible with GPL-3.0** — MIT, BSD, Apache-2.0,
+  LGPL, and GPL-2.0-or-later or GPL-3.0-or-later — may be ported with its
+  copyright notice kept, and each ported source is listed in
+  `THIRD_PARTY.md`. This covers MARIE 3.0 itself, TT-Toolbox's `dmrg_cross`,
+  and MARIE 2.0 (GPL-3.0-or-later), whose coil-implicit solve the package
+  takes up.
 - **MARIE files kept verbatim as a test oracle** are listed the same way. MARIE
   3.0 is MIT, so a source a check compares against is kept rather than described:
   a comparison a developer must set up is a comparison that does not run. Such
@@ -442,20 +448,20 @@ What this leaves uncovered is recorded rather than implied away:
 - **CoSimPy** (MIT, <https://github.com/umbertozanovello/CoSimPy>) enters with
   the VOP compression stage, as the source of the compression core and as a
   test dependency, and is listed in `THIRD_PARTY.md` then.
-- **MARIE's LGPL files** stay outside the MIT code:
-  - the DIRECTFN singular integrals, built as a separate extension module with
-    their notice;
+- **MARIE's LGPL files** keep their own notice:
+  - the DIRECTFN singular integrals, built as a separate extension module that
+    carries it;
   - the Dunavant triangle quadrature files, whose rules are taken from Dunavant
     (1985) and checked by polynomial exactness, so the LGPL files themselves are
     not carried.
-- **Excluded:** GPL, AGPL, non-commercial or unlicensed code, and model weights
-  under such terms. MathWorks' `iterapp.m` and `iterchk.m` are excluded too, and
-  so are two quadrature files MARIE ships without a licence: `gauss_1d.m`,
-  Burkardt's `LEGENDRE_SET`, and `getLebedevSphere.m`, a translation of Laikov's
-  routines. Gauss–Legendre nodes and weights come from the Golub–Welsch
-  eigenvalue problem instead, and the 26 Lebedev directions — the only part of
-  that rule the precorrected FFT projection uses, since it discards the weights —
-  are the three octahedral orbits, generated in code.
+- **Excluded:** GPL-2.0-only, AGPL, non-commercial or unlicensed code, and model
+  weights under such terms. MathWorks' `iterapp.m` and `iterchk.m` are excluded
+  too, and so are two quadrature files MARIE ships without a licence:
+  `gauss_1d.m`, Burkardt's `LEGENDRE_SET`, and `getLebedevSphere.m`, a
+  translation of Laikov's routines. Gauss–Legendre nodes and weights come from
+  the Golub–Welsch eigenvalue problem instead, and the 26 Lebedev directions —
+  the only part of that rule the precorrected FFT projection uses, since it
+  discards the weights — are the three octahedral orbits, generated in code.
 
 **Data.**
 

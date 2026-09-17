@@ -32,8 +32,8 @@ set_target_properties(_ext PROPERTIES
 install(TARGETS _ext DESTINATION mariepy)
 
 # The DIRECTFN singular integrals, as distributed in MARIE 3.0, carry an LGPL
-# notice. They build as their own module so that the notice stays with them and
-# never reaches the MIT sources in `_ext`. See src/cpp_lgpl/NOTICE.md.
+# notice. They build as their own module, which carries that notice, apart
+# from the package's own kernels in `_ext`. See src/cpp_lgpl/NOTICE.md.
 #
 # The voxel family links as its own sources stand. The three RWG sources each
 # define the same helpers at file scope, so each is compiled through a wrapper

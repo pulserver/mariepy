@@ -26,8 +26,10 @@ The code implements the direct evaluation method of:
 
 ## Why this is a separate module
 
-mariepy is MIT. These sources are not, so they build as `mariepy._directfn`,
-their own extension module, and nothing here is compiled into `mariepy._ext`.
+These sources carry their own LGPL notice, which the module that compiles
+them carries too, so they build as `mariepy._directfn`, their own extension
+module, and nothing here is compiled into `mariepy._ext`. The LGPL lets them
+combine with the rest of mariepy, which is GPL-3.0-or-later.
 `module_directfn.cpp` and the `rwg_namespace_*.cpp` wrappers are derivatives of
 the sources they bind and include, so they live here and carry the same licence.
 

@@ -1,7 +1,7 @@
 """Loading the compiled kernels that ship inside the wheel.
 
 The package ships two extension modules, each built for every interpreter it
-supports: ``mariepy._ext`` holds the MIT kernels, and ``mariepy._directfn`` the
+supports: ``mariepy._ext`` holds the package's own kernels, and ``mariepy._directfn`` the
 DIRECTFN singular integrals, which carry their own licence. A kernel that will
 not import therefore means a broken installation -- most often a wheel built
 for one interpreter imported from another -- and never an optional extra a
@@ -47,7 +47,7 @@ def require(attribute: str | None = None, module: str = _DEFAULT_MODULE) -> Any:
         Symbol the caller needs. Checked here, so a binary that predates the
         symbol fails at the load rather than at the call.
     module
-        Which extension to load: ``mariepy._ext`` for the MIT kernels, or
+        Which extension to load: ``mariepy._ext`` for the package's own kernels, or
         ``mariepy._directfn`` for the DIRECTFN singular integrals.
 
     Returns
