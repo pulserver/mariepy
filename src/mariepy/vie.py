@@ -526,7 +526,7 @@ def _apply_linear(symbols, current, index, sign):
     out = torch.zeros_like(transformed)
 
     for (pair, which), entries in _linear_uses(index, sign).items():
-        expanded = symbols[pair][which].expand()
+        expanded = symbols[pair][which].expand().to(current.dtype)
         for row, column, scale in entries:
             # Fused, because the padded grid is large and this runs 144 times:
             # writing it as a sum would allocate two of them per term.
@@ -551,7 +551,7 @@ def _apply(symbols, current, index, sign):
     padded = symbols[0].shape
 
     transformed = torch.fft.fftn(current, s=padded, dim=(-3, -2, -1))
-    expanded = [symbol.expand() for symbol in symbols]
+    expanded = [symbol.expand().to(current.dtype) for symbol in symbols]
 
     out = torch.zeros_like(transformed)
     for row in range(3):
@@ -680,12 +680,12 @@ _COMPILED_MIN_CELLS = 64**3
 def _compiled(current: torch.Tensor, padded) -> bool:
     """Say whether a product runs in the compiled kernel.
 
-    It does for complex128 on the CPU, on an extended grid large enough that
+    It does for complex128 or complex64 on the CPU, on an extended grid large enough that
     the expanded symbols, not the threads, set the cost.
     """
     return (
         current.device.type == "cpu"
-        and current.dtype == torch.complex128
+        and current.dtype in (torch.complex128, torch.complex64)
         and padded[0] * padded[1] * padded[2] >= _COMPILED_MIN_CELLS
     )
 
@@ -704,12 +704,12 @@ def _apply_compiled(symbols, terms, current: torch.Tensor) -> torch.Tensor:
     n_components = current.shape[-4]
     flat = current.reshape(-1, n_components, *grid)
     result = torch.empty_like(flat)
-    cores = [symbol.core.resolve_conj().contiguous().numpy() for symbol in symbols]
-    factors = [
-        factor.resolve_conj().contiguous().numpy()
-        for symbol in symbols
-        for factor in symbol.factors
-    ]
+
+    def native(tensor):
+        return tensor.resolve_conj().to(current.dtype).contiguous().numpy()
+
+    cores = [native(symbol.core) for symbol in symbols]
+    factors = [native(factor) for symbol in symbols for factor in symbol.factors]
     rows, columns, which, scales = (list(column) for column in zip(*terms, strict=True))
     buffer = torch.empty((n_components, *padded), dtype=current.dtype)
     for item in range(flat.shape[0]):

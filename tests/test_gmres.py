@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from mariepy.gmres import gmres
+from mariepy.gmres import gmres, refine
 
 
 def _system(n, device, seed=0, conditioning=1.0):
@@ -142,3 +142,56 @@ def test_gmres_rejects_a_right_hand_side_that_is_not_a_vector():
 def test_gmres_rejects_a_restart_cycle_of_no_iterations():
     with pytest.raises(ValueError, match="at least one iteration"):
         gmres(lambda v: v, torch.ones(3, dtype=torch.complex128), restart=0)
+
+
+def _any_precision(matrix):
+    """Apply a matrix in the precision of the vector it is given."""
+    return lambda v: matrix.to(v.dtype) @ v
+
+
+@pytest.mark.parametrize("tol", [1e-4, 1e-8, 1e-12])
+def test_refinement_reaches_a_double_precision_tolerance_from_single_precision_solves(
+    tol, device
+):
+    matrix, exact = _system(40, device, conditioning=3.0)
+    b = matrix @ exact
+    solution = refine(_any_precision(matrix), b, tol=tol, restart=40)
+    assert solution.converged
+    assert solution.x.dtype == torch.complex128
+    assert _relative_residual(matrix, solution.x, b) <= tol
+
+
+def test_refinement_iterates_in_single_precision(device):
+    matrix, exact = _system(30, device, conditioning=3.0)
+    seen = set()
+
+    def operator(v):
+        seen.add(v.dtype)
+        return matrix.to(v.dtype) @ v
+
+    refine(operator, matrix @ exact, tol=1e-10, restart=30)
+    assert seen == {torch.complex64, torch.complex128}
+
+
+def test_refinement_takes_a_left_preconditioner_in_double_precision(device):
+    matrix, exact = _system(30, device, conditioning=3.0)
+    diagonal = torch.linspace(1.0, 50.0, 30, dtype=torch.float64, device=device)
+    scaled = diagonal[:, None] * matrix
+    b = scaled @ exact
+    solution = refine(
+        _any_precision(scaled),
+        b,
+        preconditioner=lambda v: v / diagonal.to(v.dtype),
+        tol=1e-10,
+        restart=30,
+    )
+    assert solution.converged
+    assert torch.allclose(solution.x, exact, atol=1e-8)
+
+
+def test_refinement_returns_immediately_for_a_zero_right_hand_side(device):
+    matrix, _ = _system(10, device)
+    b = torch.zeros(10, dtype=torch.complex128, device=device)
+    solution = refine(_any_precision(matrix), b)
+    assert solution.converged
+    assert not bool(solution.x.any())

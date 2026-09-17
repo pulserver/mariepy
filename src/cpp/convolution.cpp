@@ -19,6 +19,7 @@
 #include <functional>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -30,19 +31,16 @@ namespace py = pybind11;
 
 namespace {
 
-using complex_t = std::complex<double>;
-using ComplexArray = py::array_t<complex_t, py::array::c_style | py::array::forcecast>;
-
-struct Symbol {
-    const complex_t *core;
+template <typename R> struct Symbol {
+    const std::complex<R> *core;
     std::size_t r1, r2, r3;
-    const complex_t *f1, *f2; // (r1, L1), (r2, L2)
-    std::vector<double> f3_re, f3_im; // (r3, L3), split so the z-loops vectorise
+    const std::complex<R> *f1, *f2; // (r1, L1), (r2, L2)
+    std::vector<R> f3_re, f3_im;     // (r3, L3), split so the z-loops vectorise
 };
 
-struct Term {
+template <typename R> struct Term {
     std::size_t row, column, symbol;
-    double scale;
+    R scale;
 };
 
 // An AVX2 clone beside the baseline one, chosen by the loader, where the
@@ -53,20 +51,22 @@ struct Term {
 #define MARIEPY_CLONES
 #endif
 
-MARIEPY_CLONES
-void multiply_slabs(std::size_t begin, std::size_t end, const std::vector<Symbol> &symbols,
-                    const std::vector<Term> &terms, std::size_t n_components,
-                    std::size_t l1, std::size_t l2, std::size_t l3, complex_t *data)
+template <typename R>
+void multiply_slabs(std::size_t begin, std::size_t end,
+                    const std::vector<Symbol<R>> &symbols,
+                    const std::vector<Term<R>> &terms, std::size_t n_components,
+                    std::size_t l1, std::size_t l2, std::size_t l3, std::complex<R> *data)
 {
+    using complex_t = std::complex<R>;
     const std::size_t n_symbols = symbols.size();
     std::size_t widest = 0;
     for (const auto &s : symbols) {
         widest = std::max(widest, s.r3);
     }
     std::vector<complex_t> pencil(widest); // a core contracted at x and y
-    std::vector<double> line_re(n_symbols * l3), line_im(n_symbols * l3);
-    std::vector<double> in_re(n_components * l3), in_im(n_components * l3);
-    std::vector<double> out_re(n_components * l3), out_im(n_components * l3);
+    std::vector<R> line_re(n_symbols * l3), line_im(n_symbols * l3);
+    std::vector<R> in_re(n_components * l3), in_im(n_components * l3);
+    std::vector<R> out_re(n_components * l3), out_im(n_components * l3);
     std::vector<std::vector<complex_t>> slabs(n_symbols);
     for (std::size_t s = 0; s < n_symbols; ++s) {
         slabs[s].resize(symbols[s].r2 * symbols[s].r3);
@@ -75,7 +75,7 @@ void multiply_slabs(std::size_t begin, std::size_t end, const std::vector<Symbol
 
     for (std::size_t x = begin; x < end; ++x) {
         for (std::size_t s = 0; s < n_symbols; ++s) {
-            const Symbol &sym = symbols[s];
+            const Symbol<R> &sym = symbols[s];
             auto &out = slabs[s];
             std::fill(out.begin(), out.end(), complex_t(0.0));
             for (std::size_t a = 0; a < sym.r1; ++a) {
@@ -88,7 +88,7 @@ void multiply_slabs(std::size_t begin, std::size_t end, const std::vector<Symbol
         }
         for (std::size_t y = 0; y < l2; ++y) {
             for (std::size_t s = 0; s < n_symbols; ++s) {
-                const Symbol &sym = symbols[s];
+                const Symbol<R> &sym = symbols[s];
                 const auto &xs = slabs[s];
                 std::fill(pencil.begin(), pencil.begin() + sym.r3, complex_t(0.0));
                 for (std::size_t b = 0; b < sym.r2; ++b) {
@@ -98,15 +98,15 @@ void multiply_slabs(std::size_t begin, std::size_t end, const std::vector<Symbol
                         pencil[c] += w * row[c];
                     }
                 }
-                double *const lr = line_re.data() + s * l3;
-                double *const li = line_im.data() + s * l3;
-                std::fill(lr, lr + l3, 0.0);
-                std::fill(li, li + l3, 0.0);
+                R *const lr = line_re.data() + s * l3;
+                R *const li = line_im.data() + s * l3;
+                std::fill(lr, lr + l3, R(0));
+                std::fill(li, li + l3, R(0));
                 for (std::size_t c = 0; c < sym.r3; ++c) {
-                    const double wr = pencil[c].real();
-                    const double wi = pencil[c].imag();
-                    const double *const fr = sym.f3_re.data() + c * l3;
-                    const double *const fi = sym.f3_im.data() + c * l3;
+                    const R wr = pencil[c].real();
+                    const R wi = pencil[c].imag();
+                    const R *const fr = sym.f3_re.data() + c * l3;
+                    const R *const fi = sym.f3_im.data() + c * l3;
                     for (std::size_t z = 0; z < l3; ++z) {
                         lr[z] += wr * fr[z] - wi * fi[z];
                         li[z] += wr * fi[z] + wi * fr[z];
@@ -116,23 +116,23 @@ void multiply_slabs(std::size_t begin, std::size_t end, const std::vector<Symbol
             const std::size_t offset = (x * l2 + y) * l3;
             for (std::size_t c = 0; c < n_components; ++c) {
                 const complex_t *const cell = data + c * volume + offset;
-                double *const ir = in_re.data() + c * l3;
-                double *const ii = in_im.data() + c * l3;
+                R *const ir = in_re.data() + c * l3;
+                R *const ii = in_im.data() + c * l3;
                 for (std::size_t z = 0; z < l3; ++z) {
                     ir[z] = cell[z].real();
                     ii[z] = cell[z].imag();
                 }
             }
-            std::fill(out_re.begin(), out_re.end(), 0.0);
-            std::fill(out_im.begin(), out_im.end(), 0.0);
-            for (const Term &t : terms) {
-                const double *const lr = line_re.data() + t.symbol * l3;
-                const double *const li = line_im.data() + t.symbol * l3;
-                const double *const ir = in_re.data() + t.column * l3;
-                const double *const ii = in_im.data() + t.column * l3;
-                double *const orr = out_re.data() + t.row * l3;
-                double *const oi = out_im.data() + t.row * l3;
-                const double scale = t.scale;
+            std::fill(out_re.begin(), out_re.end(), R(0));
+            std::fill(out_im.begin(), out_im.end(), R(0));
+            for (const Term<R> &t : terms) {
+                const R *const lr = line_re.data() + t.symbol * l3;
+                const R *const li = line_im.data() + t.symbol * l3;
+                const R *const ir = in_re.data() + t.column * l3;
+                const R *const ii = in_im.data() + t.column * l3;
+                R *const orr = out_re.data() + t.row * l3;
+                R *const oi = out_im.data() + t.row * l3;
+                const R scale = t.scale;
                 for (std::size_t z = 0; z < l3; ++z) {
                     orr[z] += scale * (lr[z] * ir[z] - li[z] * ii[z]);
                     oi[z] += scale * (lr[z] * ii[z] + li[z] * ir[z]);
@@ -140,8 +140,8 @@ void multiply_slabs(std::size_t begin, std::size_t end, const std::vector<Symbol
             }
             for (std::size_t c = 0; c < n_components; ++c) {
                 complex_t *const cell = data + c * volume + offset;
-                const double *const orr = out_re.data() + c * l3;
-                const double *const oi = out_im.data() + c * l3;
+                const R *const orr = out_re.data() + c * l3;
+                const R *const oi = out_im.data() + c * l3;
                 for (std::size_t z = 0; z < l3; ++z) {
                     cell[z] = complex_t(orr[z], oi[z]);
                 }
@@ -150,9 +150,43 @@ void multiply_slabs(std::size_t begin, std::size_t end, const std::vector<Symbol
     }
 }
 
-void multiply_symbols(py::array_t<complex_t, py::array::c_style> buffer,
-                      const std::vector<ComplexArray> &cores,
-                      const std::vector<ComplexArray> &factors,
+// The clones are made per precision: a template cannot carry target_clones.
+MARIEPY_CLONES
+void multiply_slabs_double(std::size_t begin, std::size_t end,
+                           const std::vector<Symbol<double>> &symbols,
+                           const std::vector<Term<double>> &terms,
+                           std::size_t n_components, std::size_t l1, std::size_t l2,
+                           std::size_t l3, std::complex<double> *data)
+{
+    multiply_slabs<double>(begin, end, symbols, terms, n_components, l1, l2, l3, data);
+}
+
+MARIEPY_CLONES
+void multiply_slabs_single(std::size_t begin, std::size_t end,
+                           const std::vector<Symbol<float>> &symbols,
+                           const std::vector<Term<float>> &terms,
+                           std::size_t n_components, std::size_t l1, std::size_t l2,
+                           std::size_t l3, std::complex<float> *data)
+{
+    multiply_slabs<float>(begin, end, symbols, terms, n_components, l1, l2, l3, data);
+}
+
+template <typename R>
+using SlabFunction = void (*)(std::size_t, std::size_t, const std::vector<Symbol<R>> &,
+                              const std::vector<Term<R>> &, std::size_t, std::size_t,
+                              std::size_t, std::size_t, std::complex<R> *);
+
+template <typename R> SlabFunction<R> slabs_of();
+template <> SlabFunction<double> slabs_of<double>() { return multiply_slabs_double; }
+template <> SlabFunction<float> slabs_of<float>() { return multiply_slabs_single; }
+
+template <typename R>
+void multiply_symbols(
+    py::array_t<std::complex<R>, py::array::c_style> buffer,
+    const std::vector<py::array_t<std::complex<R>, py::array::c_style | py::array::forcecast>>
+        &cores,
+    const std::vector<py::array_t<std::complex<R>, py::array::c_style | py::array::forcecast>>
+        &factors,
                       const std::vector<std::size_t> &rows,
                       const std::vector<std::size_t> &columns,
                       const std::vector<std::size_t> &which,
@@ -168,7 +202,8 @@ void multiply_symbols(py::array_t<complex_t, py::array::c_style> buffer,
     if (factors.size() != 3 * cores.size()) {
         throw std::invalid_argument("each core needs three factors");
     }
-    std::vector<Symbol> symbols;
+    using complex_t = std::complex<R>;
+    std::vector<Symbol<R>> symbols;
     symbols.reserve(cores.size());
     for (std::size_t s = 0; s < cores.size(); ++s) {
         const auto &core = cores[s];
@@ -183,7 +218,7 @@ void multiply_symbols(py::array_t<complex_t, py::array::c_style> buffer,
             || static_cast<std::size_t>(f3.shape(1)) != l3) {
             throw std::invalid_argument("a symbol does not match the buffer's grid");
         }
-        Symbol symbol{core.data(),
+        Symbol<R> symbol{core.data(),
                       static_cast<std::size_t>(core.shape(0)),
                       static_cast<std::size_t>(core.shape(1)),
                       static_cast<std::size_t>(core.shape(2)),
@@ -205,13 +240,13 @@ void multiply_symbols(py::array_t<complex_t, py::array::c_style> buffer,
     if (columns.size() != n_terms || which.size() != n_terms || scales.size() != n_terms) {
         throw std::invalid_argument("rows, columns, symbols and scales must align");
     }
-    std::vector<Term> terms(n_terms);
+    std::vector<Term<R>> terms(n_terms);
     for (std::size_t t = 0; t < n_terms; ++t) {
         if (rows[t] >= n_components || columns[t] >= n_components
             || which[t] >= symbols.size()) {
             throw std::invalid_argument("a term indexes past the components or symbols");
         }
-        terms[t] = {rows[t], columns[t], which[t], scales[t]};
+        terms[t] = {rows[t], columns[t], which[t], static_cast<R>(scales[t])};
     }
     complex_t *data = buffer.mutable_data();
     {
@@ -226,11 +261,11 @@ void multiply_symbols(py::array_t<complex_t, py::array::c_style> buffer,
             if (begin >= end) {
                 break;
             }
-            threads.emplace_back(multiply_slabs, begin, end, std::cref(symbols),
+            threads.emplace_back(slabs_of<R>(), begin, end, std::cref(symbols),
                                  std::cref(terms), n_components, l1, l2, l3, data);
         }
-        multiply_slabs(0, std::min(share, l1), symbols, terms, n_components, l1, l2, l3,
-                       data);
+        slabs_of<R>()(0, std::min(share, l1), symbols, terms, n_components, l1, l2, l3,
+                      data);
         for (auto &thread : threads) {
             thread.join();
         }
@@ -241,15 +276,19 @@ void multiply_symbols(py::array_t<complex_t, py::array::c_style> buffer,
 
 void bind_convolution(py::module_ &module)
 {
-    module.def("multiply_symbols", &multiply_symbols, py::arg("buffer"), py::arg("cores"),
-               py::arg("factors"), py::arg("rows"), py::arg("columns"),
+    module.def("multiply_symbols", &multiply_symbols<double>, py::arg("buffer").noconvert(),
+               py::arg("cores"), py::arg("factors"), py::arg("rows"), py::arg("columns"),
                py::arg("symbols"), py::arg("scales"), py::arg("n_threads"),
                R"doc(Multiply a transformed current by Tucker-compressed symbols, in place.
 
-``buffer`` is ``(C, L1, L2, L3)`` complex128 and C-contiguous. Symbol ``s`` is
+``buffer`` is ``(C, L1, L2, L3)``, complex128 or complex64, and C-contiguous;
+the symbols are taken in the buffer's precision. Symbol ``s`` is
 ``cores[s]`` of shape ``(r1, r2, r3)`` expanded through ``factors[3 s]``,
 ``factors[3 s + 1]`` and ``factors[3 s + 2]``, of shapes ``(r1, L1)``,
 ``(r2, L2)`` and ``(r3, L3)``. On return, component ``i`` of each cell holds
 the sum over terms ``t`` with ``rows[t] == i`` of
 ``scales[t] * symbol[symbols[t]] * component columns[t]`` of the input.)doc");
+    module.def("multiply_symbols", &multiply_symbols<float>, py::arg("buffer").noconvert(),
+               py::arg("cores"), py::arg("factors"), py::arg("rows"), py::arg("columns"),
+               py::arg("symbols"), py::arg("scales"), py::arg("n_threads"));
 }

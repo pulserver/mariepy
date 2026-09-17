@@ -18,7 +18,7 @@ from dataclasses import dataclass
 
 import torch
 
-__all__ = ["Solution", "gmres"]
+__all__ = ["Solution", "gmres", "refine"]
 
 Operator = Callable[[torch.Tensor], torch.Tensor]
 
@@ -128,6 +128,119 @@ def gmres(
         inner=inner,
         restarts=restarts,
         converged=bool(history[-1] <= tol),
+    )
+
+
+# Relative residual a single-precision inner solve is asked for. complex64
+# resolves about 1e-7 of a vector's norm, and the conditioning of these systems
+# costs one or two digits of that.
+INNER_TOLERANCE = 1e-5
+
+
+def refine(
+    operator: Operator,
+    b: torch.Tensor,
+    *,
+    preconditioner: Operator | None = None,
+    restart: int = 50,
+    tol: float = 1e-5,
+    maxit: int = 200,
+    inner_dtype: torch.dtype = torch.complex64,
+) -> Solution:
+    """Solve ``operator(x) = b`` by GMRES in single precision, refined in double.
+
+    Each refinement takes the residual in ``b``'s precision, solves for the
+    correction by :func:`gmres` in ``inner_dtype``, and adds it. The Krylov
+    basis and every product inside the inner solves are single precision; the
+    residual that decides convergence is not.
+
+    Parameters
+    ----------
+    operator
+        Applies the system matrix to a vector in either precision, returning
+        the vector's precision.
+    b
+        Right-hand side, shape ``(n,)``, complex128.
+    preconditioner
+        Applies a left preconditioner in double precision.
+    restart
+        Iterations per restart cycle of the inner solves.
+    tol
+        Target for the preconditioned relative residual, taken in double
+        precision.
+    maxit
+        Maximum restart cycles, over all inner solves together.
+    inner_dtype
+        Precision of the inner solves.
+
+    Returns
+    -------
+    Solution
+        The iterate and the residual history. The history holds the inner
+        solves' estimates, scaled to ``b``, and ends on the double-precision
+        residual.
+
+    Raises
+    ------
+    ValueError
+        ``b`` is not one-dimensional.
+    """
+    if b.ndim != 1:
+        raise ValueError(f"the right-hand side must be a vector, got {b.ndim} axes")
+    apply_prec = preconditioner if preconditioner is not None else (lambda v: v)
+
+    def inner_operator(vector: torch.Tensor) -> torch.Tensor:
+        return operator(vector).to(inner_dtype)
+
+    def inner_prec(vector: torch.Tensor) -> torch.Tensor:
+        return apply_prec(vector.to(b.dtype)).to(inner_dtype)
+
+    x = torch.zeros_like(b)
+    scale = torch.linalg.vector_norm(apply_prec(b))
+    if scale == 0:
+        return Solution(
+            x=x,
+            residuals=torch.zeros(1, dtype=b.real.dtype, device=b.device),
+            inner=0,
+            restarts=0,
+            converged=True,
+        )
+    residual = b.clone()
+    relative = torch.linalg.vector_norm(apply_prec(residual)) / scale
+    history = [relative]
+    restarts = 0
+    inner = 0
+    while relative > tol and restarts < maxit:
+        correction = gmres(
+            inner_operator,
+            residual.to(inner_dtype),
+            preconditioner=inner_prec,
+            restart=restart,
+            tol=max(INNER_TOLERANCE, 0.5 * tol / float(relative)),
+            maxit=maxit - restarts,
+        )
+        restarts += correction.restarts
+        inner = correction.inner
+        estimates = [
+            (value * relative).to(b.real.dtype) for value in correction.residuals[1:-1]
+        ]
+        x = x + correction.x.to(b.dtype)
+        residual = b - operator(x)
+        previous, relative = (
+            relative,
+            torch.linalg.vector_norm(apply_prec(residual)) / scale,
+        )
+        history.extend([*estimates, relative])
+        # A correction that does not lower the double-precision residual means
+        # single precision has nothing left to resolve.
+        if relative >= previous:
+            break
+    return Solution(
+        x=x,
+        residuals=torch.stack(history),
+        inner=inner,
+        restarts=restarts,
+        converged=bool(relative <= tol),
     )
 
 

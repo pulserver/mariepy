@@ -189,6 +189,29 @@ def test_every_port_solve_reaches_the_tolerance_it_was_given(device):
     assert solution.body.shape == (operator.coil.n_driven, operator.n_body)
 
 
+def test_a_mixed_precision_solve_gives_the_double_precision_port_matrix(device):
+    operator = _operator(device, ports=2)
+    double = solve_ports(operator, tol=TOLERANCE)
+    mixed = solve_ports(operator, tol=TOLERANCE, precision="mixed")
+    assert all(residual <= TOLERANCE for residual in mixed.residual)
+    assert mixed.coil.dtype == torch.complex128
+    want = _port_impedance(operator, double)
+    got = _port_impedance(operator, mixed)
+    assert float((got - want).abs().max() / want.abs().max()) <= 1e-6
+
+
+def test_the_coupled_operator_in_single_precision_is_the_double_one_rounded(device):
+    operator = _operator(device)
+    vector = _random(operator.n_coil + operator.n_body, seed=3).to(device)
+    double = operator(vector)
+    single = operator(vector.to(torch.complex64))
+    assert single.dtype == torch.complex64
+    error = torch.linalg.vector_norm(single.to(torch.complex128) - double)
+    # Single precision resolves about 1e-7; the coil rows cancel large terms,
+    # which costs up to two digits of that.
+    assert float(error / torch.linalg.vector_norm(double)) <= 1e-4
+
+
 def test_a_body_of_free_space_leaves_the_port_impedance_where_the_empty_coil_had_it(
     device,
 ):

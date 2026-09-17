@@ -311,10 +311,15 @@ def _random_symbols(padded, per_set, n_sets, seed, device="cpu"):
     )
 
 
+@pytest.mark.parametrize(
+    ("dtype", "tolerance"),
+    [(torch.complex128, 1e-12), (torch.complex64, 1e-5)],
+    ids=["double", "single"],
+)
 @pytest.mark.parametrize("linear", [False, True], ids=["constant", "linear"])
 @pytest.mark.parametrize("curl", [False, True], ids=["n", "k"])
 def test_the_compiled_product_matches_the_torch_one_across_a_port_axis(
-    linear, curl, monkeypatch
+    linear, curl, dtype, tolerance, monkeypatch
 ):
     shape = (4, 3, 5)
     padded = tuple(tucker.transform_length(n) for n in shape)
