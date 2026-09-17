@@ -203,3 +203,21 @@ def test_single_precision_products_leave_the_iteration_count_of_a_double_solve(d
     double = gmres(lambda v: matrix @ v, b, tol=1e-6, restart=60)
     mixed = refine(_any_precision(matrix), b, tol=1e-6, restart=60)
     assert len(mixed.residuals) - 1 <= len(double.residuals) - 1 + 3
+
+
+def test_refinement_converges_when_the_rounding_exceeds_the_tolerance(device):
+    matrix, exact = _system(40, device, conditioning=3.0)
+    b = matrix @ exact
+    generator = torch.Generator().manual_seed(8)
+    noise = torch.randn((40, 40), dtype=torch.float64, generator=generator)
+    perturbed = matrix + 1e-4 * noise.to(matrix.device)
+
+    def operator(v):
+        # A product whose single-precision form is off by 1e-4, far above tol.
+        if v.dtype == torch.complex64:
+            return (perturbed @ v.to(torch.complex128)).to(v.dtype)
+        return matrix @ v
+
+    solution = refine(operator, b, tol=1e-10, restart=40, maxit=5)
+    assert solution.converged
+    assert _relative_residual(matrix, solution.x, b) <= 1e-10

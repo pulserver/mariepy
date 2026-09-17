@@ -131,6 +131,11 @@ def gmres(
     )
 
 
+# How far above the single-precision rounding of the products the first solve
+# of :func:`refine` stops.
+ROUNDING_MARGIN = 10.0
+
+
 def refine(
     operator: Operator,
     b: torch.Tensor,
@@ -145,9 +150,10 @@ def refine(
 
     The Krylov basis stays in ``b``'s precision, so the iteration converges as a
     double-precision one does; only the products are taken in ``inner_dtype``.
-    Their rounding caps the residual that iteration truly reaches, and a second
-    :func:`gmres`, with the operator in ``b``'s precision and started from the
-    first one's iterate, takes it to ``tol``.
+    Their rounding caps the residual that iteration can reach, so it stops at
+    ``tol`` or at :data:`ROUNDING_MARGIN` times that rounding, whichever is
+    larger, and a second :func:`gmres`, with the operator in ``b``'s precision
+    and started from the first one's iterate, takes it to ``tol``.
 
     Parameters
     ----------
@@ -178,9 +184,16 @@ def refine(
     def rounded(vector: torch.Tensor) -> torch.Tensor:
         return operator(vector.to(inner_dtype)).to(vector.dtype)
 
-    arguments = {"preconditioner": preconditioner, "restart": restart, "tol": tol}
-    first = gmres(rounded, b, maxit=maxit, **arguments)
-    finish = gmres(operator, b, maxit=maxit, x0=first.x, **arguments)
+    # The rounded products reach no closer than their own rounding, measured on
+    # the right-hand side, so the first solve stops a margin above it.
+    exact = operator(b)
+    rounding = torch.linalg.vector_norm(rounded(b) - exact) / torch.linalg.vector_norm(
+        exact
+    )
+    reachable = max(tol, ROUNDING_MARGIN * float(rounding))
+    arguments = {"preconditioner": preconditioner, "restart": restart}
+    first = gmres(rounded, b, maxit=maxit, tol=reachable, **arguments)
+    finish = gmres(operator, b, maxit=maxit, x0=first.x, tol=tol, **arguments)
     return Solution(
         x=finish.x,
         residuals=torch.cat([first.residuals, finish.residuals[1:]]),
