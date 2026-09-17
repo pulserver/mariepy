@@ -685,7 +685,7 @@ def projected_coupling(
     weights: torch.Tensor,
     response: tuple[torch.Tensor, torch.Tensor],
     *,
-    chunk: int = 4096,
+    block: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Take the same interactions as the projection delivers them, to be subtracted.
 
@@ -705,8 +705,11 @@ def projected_coupling(
     response
         The electric and magnetic response of one expansion block, from
         :func:`expansion_response`.
-    chunk
-        Basis-function-and-cell pairs taken at a time.
+    block
+        Basis functions taken at a time. Each one's field over its near cube is
+        held while its pairs are read, so this sets the working memory: the
+        piecewise-linear basis carries twelve components of ``span ** 3`` cells
+        per basis function.
 
     Returns
     -------
@@ -716,29 +719,26 @@ def projected_coupling(
         The same for the magnetic coupling.
     """
     del medium
-    block, curl = response
-    n_components = block.shape[1]
+    responses = response
+    n_components = responses[0].shape[1]
     flat_weights = weights.reshape(weights.shape[0], -1)
     body_dof = body_numbering(grid)
     n_voxels = int(grid.mask.sum())
     component = torch.arange(n_components, device=grid.device)
     reach = (near.span - 1) // 2
-
-    fields = [
-        _projected_field(flat_weights, response)
-        .permute(0, 2, 1)
-        .reshape(-1, n_components)
-        for response in (block, curl)
-    ]
     n_cube = near.span**3
 
     rows, columns, electric, magnetic = [], [], [], []
-    for dof, cells in near_body_pairs(grid, near, chunk=chunk):
+    for begin, dof, cells in _near_body_blocks(grid, near, block):
         local = unflatten(grid, cells) - near.centre[dof] + reach
         where = (local[:, 0] * near.span + local[:, 1]) * near.span + local[:, 2]
-        flat = dof * n_cube + where
-        electric.append(fields[0][flat].reshape(-1))
-        magnetic.append(fields[1][flat].reshape(-1))
+        flat = (dof - begin) * n_cube + where
+        run = flat_weights[begin : begin + block]
+        for store, each in ((electric, responses[0]), (magnetic, responses[1])):
+            field = (
+                _projected_field(run, each).permute(0, 2, 1).reshape(-1, n_components)
+            )
+            store.append(field[flat].reshape(-1))
         rows.append(
             (component[None, :] * n_voxels + body_dof[cells][:, None]).reshape(-1)
         )
@@ -764,6 +764,7 @@ def coil_precorrection(
     response: tuple[torch.Tensor, torch.Tensor],
     *,
     chunk: int = 4096,
+    block: int = 256,
 ) -> torch.Tensor:
     """Undo the projection's share of the coil block, and put the true one back.
 
@@ -781,16 +782,18 @@ def coil_precorrection(
         As in :func:`projected_coupling`; only the electric part is used.
     chunk
         Pairs of basis functions taken at a time.
+    block
+        Basis functions whose field over the near cube is held at a time, as in
+        :func:`projected_coupling`.
 
     Returns
     -------
     torch.Tensor
         Sparse ``(n_dof, n_dof)``, complex.
     """
-    block, _ = response
-    n_components = block.shape[1]
-    field = _projected_field(weights.reshape(weights.shape[0], -1), block)
-    field = field.permute(0, 2, 1).reshape(-1, n_components)
+    electric, _ = response
+    n_components = electric.shape[1]
+    flat_weights = weights.reshape(weights.shape[0], -1)
     reach = (near.span - 1) // 2
     n_cube = near.span**3
     n_dof = coil.n_dof
@@ -799,17 +802,30 @@ def coil_precorrection(
         (near.centre[:, None, :] - near.centre[None, :, :]).abs().max(dim=-1).values
     )
     observer, source = torch.nonzero(separation < near.distance, as_tuple=True)
+    # Sorted by source, so each run of pairs needs only its own sources' fields.
+    order = torch.argsort(source, stable=True)
+    observer, source = observer[order], source[order]
+    starts = list(range(0, n_dof, block))
+    edges = torch.searchsorted(
+        source, torch.tensor([*starts, n_dof], device=source.device)
+    )
 
     projected = torch.empty(
-        observer.shape[0], dtype=torch.complex128, device=field.device
+        observer.shape[0], dtype=torch.complex128, device=weights.device
     )
-    for start in range(0, observer.shape[0], chunk):
-        o = observer[start : start + chunk]
-        q = source[start : start + chunk]
-        local = near.expansion[o] - near.centre[q][:, None, :] + reach
-        where = (local[..., 0] * near.span + local[..., 1]) * near.span + local[..., 2]
-        seen = field[q[:, None] * n_cube + where]
-        projected[start : start + chunk] = torch.einsum("pbc,pcb->p", seen, weights[o])
+    for begin, first, last in zip(starts, edges[:-1], edges[1:], strict=True):
+        field = _projected_field(flat_weights[begin : begin + block], electric)
+        field = field.permute(0, 2, 1).reshape(-1, n_components)
+        for start in range(int(first), int(last), chunk):
+            stop = min(start + chunk, int(last))
+            o = observer[start:stop]
+            q = source[start:stop]
+            local = near.expansion[o] - near.centre[q][:, None, :] + reach
+            where = (local[..., 0] * near.span + local[..., 1]) * near.span + local[
+                ..., 2
+            ]
+            seen = field[(q - begin)[:, None] * n_cube + where]
+            projected[start:stop] = torch.einsum("pbc,pcb->p", seen, weights[o])
 
     values = impedance[observer, source] - projected
     return torch.sparse_coo_tensor(
@@ -1201,24 +1217,45 @@ def near_body_pairs(grid: ExtendedGrid, near: NearLists, *, chunk: int = 4096):
     tuple of torch.Tensor
         The basis function of each pair and the flat grid cell of each pair.
     """
-    reach = (near.span - 1) // 2
-    steps = torch.arange(-reach, reach + 1, device=grid.device)
-    cube = torch.cartesian_prod(steps, steps, steps)
-    inside = grid.mask.reshape(-1)
-    limits = torch.tensor(grid.shape, device=grid.device)
-
     dofs, cells = [], []
-    for dof in range(near.centre.shape[0]):
-        index = near.centre[dof][None, :] + cube
-        held = ((index >= 0) & (index < limits)).all(dim=1)
-        flat = grid.flatten(index[held])
-        flat = flat[inside[flat]]
-        if flat.numel() == 0:
-            continue
-        dofs.append(torch.full_like(flat, dof))
-        cells.append(flat)
+    for _, block_dofs, block_cells in _near_body_blocks(
+        grid, near, near.centre.shape[0]
+    ):
+        dofs.append(block_dofs)
+        cells.append(block_cells)
     if not cells:
         return
     dofs, cells = torch.cat(dofs), torch.cat(cells)
     for start in range(0, cells.numel(), chunk):
         yield dofs[start : start + chunk], cells[start : start + chunk]
+
+
+def _near_body_blocks(grid: ExtendedGrid, near: NearLists, block: int):
+    """Yield each run of ``block`` basis functions with the body cells it reaches.
+
+    Yields
+    ------
+    tuple
+        The run's first basis function, the basis function of each pair, and the
+        flat grid cell of each pair.
+    """
+    reach = (near.span - 1) // 2
+    steps = torch.arange(-reach, reach + 1, device=grid.device)
+    cube = torch.cartesian_prod(steps, steps, steps)
+    inside = grid.mask.reshape(-1)
+    limits = torch.tensor(grid.shape, device=grid.device)
+    n_dof = near.centre.shape[0]
+
+    for begin in range(0, n_dof, block):
+        dofs, cells = [], []
+        for dof in range(begin, min(begin + block, n_dof)):
+            index = near.centre[dof][None, :] + cube
+            held = ((index >= 0) & (index < limits)).all(dim=1)
+            flat = grid.flatten(index[held])
+            flat = flat[inside[flat]]
+            if flat.numel() == 0:
+                continue
+            dofs.append(torch.full_like(flat, dof))
+            cells.append(flat)
+        if cells:
+            yield begin, torch.cat(dofs), torch.cat(cells)
