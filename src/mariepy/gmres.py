@@ -141,10 +141,12 @@ def _cycle(
 ) -> tuple[torch.Tensor, torch.Tensor, int, list[torch.Tensor]]:
     """Run one restart cycle of Arnoldi, and return the updated iterate."""
     beta = torch.linalg.vector_norm(residual)
-    basis = torch.zeros(
-        (residual.shape[0], restart + 1), dtype=residual.dtype, device=residual.device
+    # One Krylov vector per row, so the leading rows are contiguous and each
+    # projection is one BLAS call on them, conjugating only the short vector.
+    basis = torch.empty(
+        (restart + 1, residual.shape[0]), dtype=residual.dtype, device=residual.device
     )
-    basis[:, 0] = residual / beta
+    basis[0] = residual / beta
 
     hessenberg = torch.zeros(
         (restart + 1, restart), dtype=residual.dtype, device=residual.device
@@ -155,9 +157,10 @@ def _cycle(
     k = 0
 
     for k in range(1, restart + 1):
-        w = apply_prec(operator(basis[:, k - 1]))
-        hessenberg[:k, k - 1] = basis[:, :k].conj().transpose(0, 1) @ w
-        w = w - basis[:, :k] @ hessenberg[:k, k - 1]
+        w = apply_prec(operator(basis[k - 1]))
+        projection = (basis[:k] @ w.conj()).conj()
+        hessenberg[:k, k - 1] = projection
+        w = w - basis[:k].transpose(0, 1) @ projection
 
         subdiagonal = torch.linalg.vector_norm(w)
         hessenberg[k, k - 1] = subdiagonal
@@ -169,13 +172,13 @@ def _cycle(
         # iterate this step gives is exact; dividing by it would give NaN.
         if subdiagonal <= torch.finfo(residual.real.dtype).eps * beta:
             break
-        basis[:, k] = w / subdiagonal
+        basis[k] = w / subdiagonal
 
         if history[-1] < target:
             break
 
-    x = x + basis[:, :k] @ y
-    residual = basis[:, : defect.shape[0]] @ defect
+    x = x + basis[:k].transpose(0, 1) @ y
+    residual = basis[: defect.shape[0]].transpose(0, 1) @ defect
     return x, residual, k, history
 
 

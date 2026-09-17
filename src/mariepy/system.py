@@ -14,6 +14,8 @@ to itself at the same time.
 
 from __future__ import annotations
 
+import functools
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
@@ -85,9 +87,10 @@ class CoupledOperator:
         coil_current = vector[: self.n_coil]
         body_current = vector[self.n_coil :]
         scaling = self.medium.electric_scaling
+        products = self._products
 
-        on_body = _apply(self.coupling.scatter, body_current)
-        on_grid = _apply(self.coupling.project, coil_current) + on_body
+        on_body = products.place(body_current)
+        on_grid = _apply(products.project, coil_current) + on_body
         n_components = self.coupling.n_components
         field = on_grid.reshape(n_components, *self.coupling.grid.shape)
         applied = (
@@ -97,7 +100,7 @@ class CoupledOperator:
 
         induced = (
             vie.apply_g(
-                self._contrast_inverse()
+                self._contrast_inverse
                 * on_body.reshape(n_components, *self.coupling.grid.shape),
                 self.coupling.grid.resolution,
             ).reshape(-1)
@@ -105,14 +108,12 @@ class CoupledOperator:
         )
 
         coil_out = (
-            _apply(self.coupling.project.transpose(0, 1), applied)
-            + _apply(self.coupling.coil, coil_current)
-            + _apply(self.coupling.electric.transpose(0, 1), body_current)
+            _apply(products.project_transpose, applied)
+            + _apply(products.coil, coil_current)
+            + _apply(products.electric_transpose, body_current)
         )
-        body_out = (
-            -_apply(self.coupling.scatter.transpose(0, 1), applied)
-            + _apply(self.coupling.scatter.transpose(0, 1), induced)
-            - _apply(self.coupling.electric, coil_current)
+        body_out = products.take(induced - applied) - _apply(
+            products.electric, coil_current
         )
         return torch.cat([coil_out, body_out])
 
@@ -177,6 +178,12 @@ class CoupledOperator:
 
         return apply
 
+    @functools.cached_property
+    def _products(self) -> _SparseProducts:
+        """The coupling's sparse matrices in the form the product applies them."""
+        return _SparseProducts.build(self.coupling)
+
+    @functools.cached_property
     def _contrast_inverse(self) -> torch.Tensor:
         """Give ``1 / Mc`` over the extended grid, zero where there is no tissue."""
         grid = self.coupling.grid
@@ -196,6 +203,55 @@ class CoupledOperator:
 def _apply(matrix: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
     """Multiply a sparse matrix by a vector."""
     return torch.sparse.mm(matrix, vector[:, None])[:, 0]
+
+
+@dataclass(frozen=True)
+class _SparseProducts:
+    """The coupling's matrices as compressed rows, with their transposes.
+
+    The scatter matrix places each body unknown on one grid entry, so it is
+    kept as that entry's index and applied by indexing.
+    """
+
+    project: torch.Tensor
+    project_transpose: torch.Tensor
+    electric: torch.Tensor
+    electric_transpose: torch.Tensor
+    coil: torch.Tensor
+    placement: torch.Tensor
+    n_grid: int
+
+    @classmethod
+    def build(cls, coupling: Coupling) -> _SparseProducts:
+        scatter = coupling.scatter.coalesce()
+        rows, columns = scatter.indices()
+        placement = torch.empty_like(rows)
+        placement[columns] = rows
+
+        def rows_of(matrix: torch.Tensor) -> torch.Tensor:
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", "Sparse CSR tensor support")
+                return matrix.coalesce().to_sparse_csr()
+
+        return cls(
+            project=rows_of(coupling.project),
+            project_transpose=rows_of(coupling.project.transpose(0, 1)),
+            electric=rows_of(coupling.electric),
+            electric_transpose=rows_of(coupling.electric.transpose(0, 1)),
+            coil=rows_of(coupling.coil),
+            placement=placement,
+            n_grid=scatter.shape[0],
+        )
+
+    def place(self, body: torch.Tensor) -> torch.Tensor:
+        """Put body unknowns on the extended grid, zero elsewhere."""
+        out = torch.zeros(self.n_grid, dtype=body.dtype, device=body.device)
+        out[self.placement] = body
+        return out
+
+    def take(self, grid: torch.Tensor) -> torch.Tensor:
+        """Read the body unknowns back off the extended grid."""
+        return grid[self.placement]
 
 
 @dataclass(frozen=True)

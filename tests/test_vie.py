@@ -259,6 +259,117 @@ def test_the_fft_path_reproduces_the_dense_operator(n_components, index, sign, d
     assert torch.allclose(got, expected, atol=1e-10)
 
 
+@pytest.mark.parametrize(
+    ("n_components", "index", "sign"),
+    [(6, vie._DYADIC_INDEX, None), (3, vie._CURL_INDEX, vie._CURL_SIGN)],
+    ids=["n", "k"],
+)
+def test_the_compiled_product_reproduces_the_dense_operator(
+    n_components, index, sign, monkeypatch
+):
+    monkeypatch.setattr(vie, "_COMPILED_MIN_CELLS", 1)
+    shape = (3, 4, 2)
+    kernel = _stored_kernel(shape, n_components, "cpu")
+    symbols = tucker.circulant_tucker(kernel, tol=None)
+    generator = torch.Generator(device="cpu").manual_seed(5)
+    current = torch.complex(
+        torch.randn((3, *shape), generator=generator, dtype=torch.float64),
+        torch.randn((3, *shape), generator=generator, dtype=torch.float64),
+    )
+    assert vie._compiled(current, symbols[0].shape)
+
+    apply = vie.apply_n if n_components == 6 else vie.apply_k
+    got = apply(symbols, current)
+
+    dense = _dense_operator(kernel, shape, index, sign)
+    flat = current.reshape(3, -1).transpose(0, 1).reshape(-1)
+    expected = (dense @ flat).reshape(-1, 3).transpose(0, 1).reshape(3, *shape)
+    assert torch.allclose(got, expected, atol=1e-10)
+
+
+def _random_symbols(padded, per_set, n_sets, seed, device="cpu"):
+    """Tucker symbols of distinct ranks, one tuple per set, or one tuple if ``n_sets`` is 0."""
+    generator = torch.Generator(device="cpu").manual_seed(seed)
+
+    def draw(*shape):
+        return torch.complex(
+            torch.randn(shape, generator=generator, dtype=torch.float64),
+            torch.randn(shape, generator=generator, dtype=torch.float64),
+        ).to(device)
+
+    def one(rank):
+        return tucker.CirculantSymbol(
+            core=draw(*rank),
+            factors=tuple(draw(r, n) for r, n in zip(rank, padded, strict=True)),
+        )
+
+    ranks = [(2, 3, 4), (3, 1, 2), (4, 2, 3)]
+    if n_sets == 0:
+        return tuple(one(ranks[i % 3]) for i in range(per_set))
+    return tuple(
+        tuple(one(ranks[(i + j) % 3]) for j in range(per_set)) for i in range(n_sets)
+    )
+
+
+@pytest.mark.parametrize("linear", [False, True], ids=["constant", "linear"])
+@pytest.mark.parametrize("curl", [False, True], ids=["n", "k"])
+def test_the_compiled_product_matches_the_torch_one_across_a_port_axis(
+    linear, curl, monkeypatch
+):
+    shape = (4, 3, 5)
+    padded = tuple(tucker.transform_length(n) for n in shape)
+    symbols = _random_symbols(
+        padded, 3 if curl else 6, len(vie.PAIRS) if linear else 0, seed=3
+    )
+    generator = torch.Generator(device="cpu").manual_seed(9)
+    n_components = 12 if linear else 3
+    current = torch.complex(
+        torch.randn(
+            (2, n_components, *shape), generator=generator, dtype=torch.float64
+        ),
+        torch.randn(
+            (2, n_components, *shape), generator=generator, dtype=torch.float64
+        ),
+    )
+    apply = vie.apply_k if curl else vie.apply_n
+
+    monkeypatch.setattr(vie, "_COMPILED_MIN_CELLS", 1)
+    compiled = apply(symbols, current)
+    monkeypatch.setattr(vie, "_COMPILED_MIN_CELLS", 10**12)
+    reference = apply(symbols, current)
+    torch.testing.assert_close(compiled, reference, rtol=1e-12, atol=1e-12)
+
+
+@pytest.mark.parametrize("linear", [False, True], ids=["constant", "linear"])
+@pytest.mark.parametrize("curl", [False, True], ids=["n", "k"])
+def test_a_unit_response_is_the_product_applied_to_a_unit_current(linear, curl, device):
+    shape = (5, 5, 5)
+    padded = tuple(tucker.transform_length(n) for n in shape)
+    symbols = _random_symbols(
+        padded, 3 if curl else 6, len(vie.PAIRS) if linear else 0, seed=4, device=device
+    )
+    offsets = torch.tensor([[1, 2, 3], [2, 2, 2], [4, 0, 1]], device=device)
+    n_components = 12 if linear else 3
+    n_offsets = offsets.shape[0]
+
+    sources = torch.zeros(
+        (n_components, n_offsets, n_components, *shape),
+        dtype=torch.complex128,
+        device=device,
+    )
+    for component in range(n_components):
+        for place, (i, j, k) in enumerate(offsets.tolist()):
+            sources[component, place, component, i, j, k] = 1.0
+    sources = sources.reshape(n_components * n_offsets, n_components, *shape)
+    apply = vie.apply_k if curl else vie.apply_n
+    expected = apply(symbols, sources).reshape(
+        n_components * n_offsets, n_components, -1
+    )
+
+    got = vie.unit_responses(symbols, offsets, shape, curl=curl)
+    torch.testing.assert_close(got, expected, rtol=1e-12, atol=1e-12)
+
+
 def test_the_fft_path_carries_a_leading_port_axis(device):
     shape = (3, 4, 2)
     symbols = tucker.circulant_tucker(_stored_kernel(shape, 6, device), tol=None)

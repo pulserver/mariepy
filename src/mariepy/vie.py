@@ -44,6 +44,7 @@ __all__ = [
     "green_k",
     "green_n",
     "mass",
+    "unit_responses",
     "volume_volume_k",
     "volume_volume_n",
 ]
@@ -516,26 +517,15 @@ def _apply_linear(symbols, current, index, sign):
     output entry ``4 * p + l`` gathers every input entry ``4 * q + l'`` through
     the stored pair and component that carry ``(l, l')`` and ``(p, q)``.
     """
+    if _compiled(current, symbols[0][0].shape):
+        return _apply_compiled(*_product_terms(symbols, index, sign, True), current)
+
     grid = current.shape[-3:]
     padded = symbols[0][0].shape
     transformed = torch.fft.fftn(current, s=padded, dim=(-3, -2, -1))
     out = torch.zeros_like(transformed)
 
-    uses = {}
-    for p in range(3):
-        for q in range(3):
-            which = index[p][q]
-            if which is None:
-                continue
-            component_sign = 1.0 if sign is None else sign[p][q]
-            for test in range(4):
-                for basis in range(4):
-                    pair, pair_sign = PAIR_OF[test][basis]
-                    uses.setdefault((pair, which), []).append(
-                        (4 * p + test, 4 * q + basis, component_sign * pair_sign)
-                    )
-
-    for (pair, which), entries in uses.items():
+    for (pair, which), entries in _linear_uses(index, sign).items():
         expanded = symbols[pair][which].expand()
         for row, column, scale in entries:
             # Fused, because the padded grid is large and this runs 144 times:
@@ -554,6 +544,9 @@ def _apply(symbols, current, index, sign):
         raise ValueError(
             f"a current must end in (3, n1, n2, n3), got {tuple(current.shape)}"
         )
+    if _compiled(current, symbols[0].shape):
+        return _apply_compiled(*_product_terms(symbols, index, sign, False), current)
+
     grid = current.shape[-3:]
     padded = symbols[0].shape
 
@@ -573,6 +566,172 @@ def _apply(symbols, current, index, sign):
 
     field = torch.fft.ifftn(out, dim=(-3, -2, -1))
     return field[..., : grid[0], : grid[1], : grid[2]]
+
+
+@functools.cache
+def _linear_uses(index, sign):
+    """Group the 144 terms of a linear-basis product by the symbol they read.
+
+    Returns a mapping from ``(pair, component)`` to the ``(row, column, sign)``
+    entries that symbol weighs.
+    """
+    uses = {}
+    for p in range(3):
+        for q in range(3):
+            which = index[p][q]
+            if which is None:
+                continue
+            component_sign = 1.0 if sign is None else sign[p][q]
+            for test in range(4):
+                for basis in range(4):
+                    pair, pair_sign = PAIR_OF[test][basis]
+                    uses.setdefault((pair, which), []).append(
+                        (4 * p + test, 4 * q + basis, component_sign * pair_sign)
+                    )
+    return uses
+
+
+def _product_terms(symbols, index, sign, linear: bool):
+    """List a product's symbols flat, and its terms as (row, column, symbol, sign)."""
+    if not linear:
+        terms = [
+            (
+                row,
+                column,
+                index[row][column],
+                1.0 if sign is None else sign[row][column],
+            )
+            for row in range(3)
+            for column in range(3)
+            if index[row][column] is not None
+        ]
+        return list(symbols), terms
+    per_pair = len(symbols[0])
+    terms = [
+        (row, column, pair * per_pair + which, scale)
+        for (pair, which), entries in _linear_uses(index, sign).items()
+        for row, column, scale in entries
+    ]
+    return [symbol for row in symbols for symbol in row], terms
+
+
+def unit_responses(
+    symbols, offsets: torch.Tensor, shape, *, curl: bool = False
+) -> torch.Tensor:
+    """Apply N, or K, to a unit current at each of several cells.
+
+    The product is a convolution on the extended grid, so the field of a unit
+    current is the inverse transform of a symbol, shifted to the cell. That
+    gives every response from one transform per symbol.
+
+    Parameters
+    ----------
+    symbols
+        As :func:`apply_n` takes them, or as :func:`apply_k` does when
+        ``curl``.
+    offsets
+        Shape ``(m, 3)``, integer: the cells carrying the unit currents.
+    shape
+        The grid the currents and the fields are on.
+    curl
+        Apply K rather than N.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(c * m, c, n1 * n2 * n3)``, with ``c`` 3 or 12 by the symbols'
+        basis: entry ``(k * m + i, l)`` is component ``l`` of the field of a
+        unit current in component ``k`` at ``offsets[i]``, as :func:`apply_n`
+        or :func:`apply_k` gives it.
+    """
+    linear = not hasattr(symbols[0], "expand")
+    index, sign = (_CURL_INDEX, _CURL_SIGN) if curl else (_DYADIC_INDEX, None)
+    flat, terms = _product_terms(symbols, index, sign, linear)
+    n_components = 12 if linear else 3
+    padded = flat[0].shape
+    device = offsets.device
+    kernels = torch.stack(
+        [torch.fft.ifftn(symbol.expand()).reshape(-1) for symbol in flat]
+    )
+    axes = [torch.arange(extent, device=device) for extent in shape]
+    cells = torch.cartesian_prod(*axes)
+    lengths = torch.tensor(padded, device=device)
+    shifted = (cells[None, :, :] - offsets[:, None, :]) % lengths
+    where = (shifted[..., 0] * padded[1] + shifted[..., 1]) * padded[2] + shifted[
+        ..., 2
+    ]
+
+    n_offsets = offsets.shape[0]
+    out = torch.zeros(
+        (n_components, n_offsets, n_components, cells.shape[0]),
+        dtype=kernels.dtype,
+        device=device,
+    )
+    for row, column, which, scale in terms:
+        out[column, :, row, :] += scale * kernels[which][where]
+    return out.reshape(n_components * n_offsets, n_components, -1)
+
+
+# Below this many cells on the extended grid, expanding the symbols costs less
+# than starting the kernel's threads, and torch's batched product is faster.
+_COMPILED_MIN_CELLS = 64**3
+
+
+def _compiled(current: torch.Tensor, padded) -> bool:
+    """Say whether a product runs in the compiled kernel.
+
+    It does for complex128 on the CPU, on an extended grid large enough that
+    the expanded symbols, not the threads, set the cost.
+    """
+    return (
+        current.device.type == "cpu"
+        and current.dtype == torch.complex128
+        and padded[0] * padded[1] * padded[2] >= _COMPILED_MIN_CELLS
+    )
+
+
+def _apply_compiled(symbols, terms, current: torch.Tensor) -> torch.Tensor:
+    """Convolve a current through :func:`mariepy._ext.multiply_symbols`.
+
+    The multiply runs in place on one buffer of the extended grid, and each
+    output component is transformed back and cropped on its own, so the product
+    never holds more than that buffer and one extra component of it.
+    """
+    multiply = _accelerators.require("multiply_symbols")
+    grid = current.shape[-3:]
+    padded = symbols[0].shape
+    batch = current.shape[:-4]
+    n_components = current.shape[-4]
+    flat = current.reshape(-1, n_components, *grid)
+    result = torch.empty_like(flat)
+    cores = [symbol.core.resolve_conj().contiguous().numpy() for symbol in symbols]
+    factors = [
+        factor.resolve_conj().contiguous().numpy()
+        for symbol in symbols
+        for factor in symbol.factors
+    ]
+    rows, columns, which, scales = (list(column) for column in zip(*terms, strict=True))
+    buffer = torch.empty((n_components, *padded), dtype=current.dtype)
+    for item in range(flat.shape[0]):
+        for component in range(n_components):
+            buffer[component] = torch.fft.fftn(
+                flat[item, component], s=padded, dim=(-3, -2, -1)
+            )
+        multiply(
+            buffer.numpy(),
+            cores,
+            factors,
+            rows,
+            columns,
+            which,
+            [float(scale) for scale in scales],
+            torch.get_num_threads(),
+        )
+        for component in range(n_components):
+            result[item, component] = torch.fft.ifftn(buffer[component])[
+                : grid[0], : grid[1], : grid[2]
+            ]
+    return result.reshape(*batch, n_components, *grid)
 
 
 def mass(n_components: int, resolution: float) -> torch.Tensor:
