@@ -174,7 +174,6 @@ class CoilPerturbation:
         *,
         tol: float = 1e-3,
         region: torch.Tensor | None = None,
-        clearance: float = 5e-3,
         block: int = 16,
         impedance: torch.Tensor | None = None,
         system: CoilSystem | None = None,
@@ -187,7 +186,9 @@ class CoilPerturbation:
         Parameters
         ----------
         grid
-            The grid bodies will be given on; its tissue is ignored.
+            The grid bodies will be given on, and by default, through its mask,
+            where they may put tissue: one body, or the union of a population's
+            masks. Its tissue properties are ignored.
         coil
             The coil, its basis and its ports.
         medium
@@ -197,11 +198,11 @@ class CoilPerturbation:
             values against the largest, and of the perturbation's tail against
             its largest singular value.
         region
-            Where on the grid bodies may put tissue, boolean. By default every
-            voxel :func:`tissue_region` keeps at ``clearance``. The rank the
-            perturbation needs grows as the region nears the conductors.
-        clearance
-            Distance kept from the conductors when ``region`` is not given.
+            Where on the grid bodies may put tissue, boolean, in place of
+            ``grid``'s mask; :func:`tissue_region` gives an envelope that keeps a
+            clearance from the conductors. The build's cost and the rank the
+            perturbation needs both grow with the region, and fastest near the
+            conductors.
         block
             Random coil currents drawn at a time while the coupling's range is
             sampled; each costs two products on the extended grid.
@@ -224,9 +225,7 @@ class CoilPerturbation:
             Ready to solve any body within the region.
         """
         system = assemble_coil(coil, medium) if system is None else system
-        if region is None:
-            region = tissue_region(grid, coil, clearance)
-        box = _region_body(grid, region)
+        box = _region_body(grid, grid.mask if region is None else region)
         coupling = pfft.assemble(
             box,
             coil,
