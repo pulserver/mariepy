@@ -16,6 +16,10 @@ from mariepy.system import CoupledOperator
 RESOLUTION = 0.01
 ORDERS = {"far_order": 2, "medium_order": 2, "near_order": 4}
 
+# What the coupled operator's projection of the far coupling leaves against the
+# coupling integrated directly, on the case below, through a solve.
+PROJECTED_COUPLING = 1e-5
+
 _BUILT: dict = {}
 _SYSTEMS: dict = {}
 
@@ -97,6 +101,23 @@ def _built(device, *, exact, store=torch.complex64, tol=None):
     return _BUILT[key]
 
 
+def _wide(device):
+    """A region with many more cells than the coupling's rank, for the sampling."""
+    key = (device, "wide")
+    if key not in _BUILT:
+        coil = _coil(device, n_around=32, n_across=2)
+        medium = _medium()
+        if (device, False) not in _SYSTEMS:
+            _SYSTEMS[device, False] = assemble_coil(coil, medium)
+        system = _SYSTEMS[device, False]
+        body = VoxelBody.sphere(0.03, 0.005, 52.0, 0.55, padding=2, device=device)
+        coupling = pfft.assemble(body, coil, system.impedance, medium, **ORDERS)
+        _BUILT[key] = CoupledOperator(
+            body=body, coil=coil, medium=medium, system=system, coupling=coupling
+        )
+    return _BUILT[key]
+
+
 def _coupled(body, perturbation):
     box = perturbation.operator
     return CoupledOperator(
@@ -141,14 +162,20 @@ def test_eliminating_the_coil_block_gives_the_coupled_solve(device):
     implicit_result = perturbation.solve(body, tol=1e-11, precision="double")
     coupled = solve_ports(_coupled(body, perturbation), tol=1e-11)
 
+    # The perturbation is integrated directly where the coupled operator
+    # projects its far interactions, so what is left between the two is that
+    # projection, not the truncation or the solve.
     scale = coupled.body.abs().max()
     assert (
-        float((implicit_result.ports.body - coupled.body).abs().max() / scale) <= 1e-7
+        float((implicit_result.ports.body - coupled.body).abs().max() / scale)
+        <= PROJECTED_COUPLING
     )
     want = network.symmetrise(
         network.port_admittance(perturbation.operator.system.excitation, coupled.coil)
     )
-    torch.testing.assert_close(implicit_result.admittance, want, rtol=1e-7, atol=0.0)
+    torch.testing.assert_close(
+        implicit_result.admittance, want, rtol=PROJECTED_COUPLING, atol=0.0
+    )
 
 
 @pytest.mark.slow
@@ -211,28 +238,26 @@ def test_a_body_smaller_than_the_grid_reuses_the_build(device):
     result = perturbation.solve(smaller, tol=1e-11, precision="double")
     coupled = solve_ports(_coupled(smaller, perturbation), tol=1e-11)
     scale = coupled.body.abs().max()
-    assert float((result.ports.body - coupled.body).abs().max() / scale) <= 1e-7
+    assert (
+        float((result.ports.body - coupled.body).abs().max() / scale)
+        <= PROJECTED_COUPLING
+    )
 
 
-def test_a_body_takes_the_factors_its_own_coupling_products_would_give(device):
-    body, perturbation = _built(device, exact=True)
-    coordinates = body.coordinates()
-    inside = (coordinates**2).sum(dim=0) <= 0.012**2
-    smaller = dataclasses.replace(body, mask=body.mask & inside)
-    prepared = perturbation.prepare(smaller)
-    operator = prepared.operator
+def test_the_cross_approximation_reproduces_the_coupling_it_samples(device):
+    operator = _wide(device)
+    grid = operator.coupling.grid
+    cells = grid.body_cells()
+    order = torch.argsort(pfft.body_numbering(grid)[cells])
+    whole = pfft.coupling_rows(grid, operator.coil, operator.medium, cells[order])
 
-    for factor, patterns in (
-        (prepared.left, perturbation.left),
-        (prepared.right, perturbation.right),
-        (prepared.right_hand_side, perturbation.drive),
-    ):
-        columns = torch.stack(
-            [operator.couple(patterns[:, k]) for k in range(patterns.shape[1])], dim=1
-        )
-        assert factor.shape == columns.shape
-        error = (factor.to(torch.complex128) - columns).abs().max()
-        assert float(error) <= 1e-6 * float(columns.abs().max())
+    coupling, coil_side, _ = implicit._cross_coupling(
+        operator, tol=1e-3, rank=100, iterations=30, stalls=10, checks=1, orders={}
+    )
+    error = (whole - coupling @ coil_side).abs().max() / whole.abs().max()
+    assert float(error) <= 1e-3
+    assert coil_side.shape[0] < operator.n_coil
+    assert coil_side.shape[0] < int(grid.mask.sum())
 
 
 def test_single_precision_factors_give_the_double_precision_currents(device):
@@ -282,16 +307,22 @@ def test_the_default_region_keeps_its_clearance_from_the_conductors(device):
     assert bool(region.any())
 
 
-def test_the_sampled_basis_leaves_the_coupling_within_its_own_tolerance(device):
-    # What the basis leaves of the coupling's action is what the compressed
-    # perturbation inherits, so it is measured against the operator, not
-    # against the sampling the basis came from, and it follows the tolerance
-    # the sampling was asked for.
-    _, coarse = _built(device, exact=False, tol=1e-3)
-    _, fine = _built(device, exact=False, tol=1e-5)
-    missed = {}
-    for tol, built in ((1e-3, coarse), (1e-5, fine)):
-        basis, _ = implicit._coupling_range(built.operator, tol=tol, block=16, checks=2)
-        missed[tol] = implicit._missed(built.operator, basis, 3)
-        assert missed[tol] <= 10 * tol
-    assert missed[1e-5] < 0.1 * missed[1e-3]
+def test_the_cross_approximation_follows_the_tolerance_it_is_given(device):
+    # What the approximation leaves of the coupling's action is what the
+    # compressed perturbation inherits, so it is measured against the operator,
+    # not against the rows and columns it was fitted on.
+    operator = _wide(device)
+    left = {}
+    for tol in (1e-2, 1e-4):
+        coupling, coil_side, _ = implicit._cross_coupling(
+            operator,
+            tol=tol,
+            rank=100,
+            iterations=30,
+            stalls=10,
+            checks=2,
+            orders={},
+        )
+        left[tol] = implicit._missed(operator, coupling, coil_side, 2)
+        assert left[tol] <= 10 * tol
+    assert left[1e-4] < left[1e-2]

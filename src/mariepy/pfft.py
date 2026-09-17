@@ -684,6 +684,7 @@ def coupling_rows(
     medium: Medium,
     cells: torch.Tensor,
     *,
+    dofs: torch.Tensor | None = None,
     triangle_order: int = 4,
     cell_order: int = 2,
     linear: bool = False,
@@ -707,6 +708,8 @@ def coupling_rows(
     cells
         Flat indices of the cells to take, as :func:`body_numbering` numbers
         the grid.
+    dofs
+        Which basis functions to take, or None for every one.
     triangle_order, cell_order
         Quadrature orders, as :func:`direct_coupling` takes them.
     linear
@@ -717,17 +720,19 @@ def coupling_rows(
     Returns
     -------
     torch.Tensor
-        Shape ``(c * len(cells), n_dof)`` with ``c`` 3 or 12, complex, the rows
-        running component-major over ``cells`` as the body's unknowns run over
-        its own.
+        Shape ``(c * len(cells), len(dofs))`` with ``c`` 3 or 12, complex, the
+        rows running component-major over ``cells`` as the body's unknowns run
+        over its own.
     """
     volume = grid.resolution**3
     terms = range(4) if linear else range(1)
     n_components = 3 * len(terms)
     points = grid.centres(unflatten(grid, cells))
     n_cells = points.shape[0]
+    taken = torch.arange(coil.n_dof, device=grid.device) if dofs is None else dofs
+    n_taken = int(taken.numel())
     out = torch.zeros(
-        (3, len(terms), n_cells, coil.n_dof),
+        (3, len(terms), n_cells, n_taken),
         dtype=torch.complex128,
         device=grid.device,
     )
@@ -737,10 +742,9 @@ def coupling_rows(
         "cell_order": cell_order,
     }
     stride = max(1, chunk // max(1, n_cells))
-    for start in range(0, coil.n_dof, stride):
-        width = min(stride, coil.n_dof - start)
-        dofs = torch.arange(start, start + width, device=grid.device)
-        paired = dofs.repeat_interleave(n_cells)
+    for start in range(0, n_taken, stride):
+        width = min(stride, n_taken - start)
+        paired = taken[start : start + width].repeat_interleave(n_cells)
         seen = points.repeat(width, 1)
         for index, term in enumerate(terms):
             field = _field(
@@ -748,7 +752,7 @@ def coupling_rows(
             )
             field = field.reshape(width, n_cells, 3).permute(2, 1, 0)
             out[:, index, :, start : start + width] = volume * field
-    return out.reshape(n_components * n_cells, coil.n_dof)
+    return out.reshape(n_components * n_cells, n_taken)
 
 
 def projected_coupling(

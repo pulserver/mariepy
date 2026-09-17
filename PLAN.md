@@ -254,28 +254,38 @@ iteration.
 
 The port departs from MARIE 2.0 in three places:
 
-- MARIE 2.0 samples `Zbc` by cross approximation and keeps factors the size of
-  the grid. Here the coupling's range is found from the coil's side, by a
-  randomized Nyström approximation (Tropp et al., SIAM J. Matrix Anal. Appl. 38
-  (2017) 1454) of the Gram matrix `Zbc^H Zbc`, whose eigenvectors are the right
-  singular vectors of `Zbc`. Each sampled current costs two convolutions, and
-  the coupling's rank over a head-sized region runs to several hundred, so this
-  is what a build spends its time on. `pfft.coupling_rows` integrates rows of
-  `Zbc` directly instead, at one kernel evaluation per basis function and no
-  convolution — ten times cheaper per sample — but a random sample of rows
-  estimates the Gram with an error that falls only as its square root, and on a
-  head at 6 mm no sample short of the whole region reaches the tail that `tol`
-  asks for: measured, the basis leaves 1.4e-1 of the coupling's action at 1024
-  cells of 40316, 2.8e-2 at 4096 and 3.0e-3 at all of them, whichever way the
-  cells are drawn. Sampling rows therefore pays only with the pivoting that
-  chooses each one against what the basis so far misses, which is what MARIE
-  2.0's cross approximation does and what its grid-sized factors are the price
-  of. What the basis leaves is reported on every build, since the compressed
-  perturbation inherits it. The rank that truncation keeps is what the build then carries to
-  the body: the factors are taken over the whole region once, in complex64, and
-  a body selects the rows of the voxels it occupies, so no coupling product is
-  taken per body. Their right-hand side stays in complex128, where the solve
-  starts from it.
+- The coupling is approximated by MARIE 2.0's own cross approximation
+  (`cross_cheb_2d.m`, with `sample_rows.m`, `sample_cols.m` and `maxvol.m`):
+  rows and columns of `Zbc` are integrated directly, at one kernel evaluation
+  per entry and no convolution, sampled columns span a body-side basis and
+  sampled rows a coil-side one, and the core is fitted on the sampled submatrix
+  through their pseudo-inverses. Each round takes the columns where the
+  coil-side basis has the largest volume and the rows of a Chebyshev grid one
+  step finer, and it stops when the core's singular values settle to `tol`.
+  Where MARIE 2.0 subsamples the rows of its chosen cells at random to bound
+  their number, every component of a chosen cell is kept here: the rows only
+  have to span the row space, and keeping them whole leaves the submatrix in
+  the order the body numbers its own unknowns.
+
+  The pivoting is what makes the sampling affordable, and is not incidental: a
+  random sample of rows estimates the Gram of `Zbc` with an error that falls
+  only as its square root, and measured on a head at 6 mm, a basis from 1024
+  cells of 40316 leaves 1.4e-1 of the coupling's action, 4096 leaves 2.8e-2,
+  and every row leaves 3.0e-3, whichever way the cells are drawn — so a random
+  sample reaches `tol` only by taking nearly the whole region. Holding
+  rank-many grid-sized columns while it pivots is what that costs, and is why
+  MARIE 2.0 keeps factors the size of the grid.
+
+  The perturbation is then the small matrix `C Zc^-1 C^T` between the
+  coupling's factors, truncated at `tol`, which leaves the factors over the
+  whole region, in complex64: a body selects the rows of the voxels it
+  occupies, and no product on the extended grid is taken per body. Their
+  right-hand side stays in complex128, where the solve starts from it.
+- The coupling the perturbation holds is the one the quadrature gives, where
+  the coupled operator projects its far interactions onto the grid, so the two
+  differ by that projection — as they do already in the coil matrix below.
+  What the approximation leaves of the operator's own coupling is measured on
+  every build, on random coil currents, since the perturbation inherits it.
 - The region must keep its distance from the conductors. Tissue beside a
   conductor sees the near field of each of its edges, which no low-rank
   perturbation holds: a head mask dilated into the coil kept more than 480
