@@ -30,6 +30,7 @@ with one product each, and both factors are taken on the body's own voxels.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
@@ -49,6 +50,8 @@ from mariepy.wire import CombinedCoil, WireCoil
 __all__ = ["BodyPerturbation", "CoilPerturbation", "tissue_region"]
 
 Coil = SurfaceCoil | WireCoil | CombinedCoil
+
+_log = logging.getLogger(__name__)
 
 
 def tissue_region(grid: VoxelBody, coil: Coil, clearance: float) -> torch.Tensor:
@@ -521,6 +524,12 @@ def _coupling_range(
         )
         vectors, values = _nystrom(test, sketch)
         kept = values > (tol**2) * values[0]
+        _log.info(
+            "coupling range: %d coil currents sampled, %d singular values above %g",
+            test.shape[1],
+            int(kept.sum()),
+            tol,
+        )
         if int(kept.sum()) <= test.shape[1] - block // 2 or test.shape[1] >= n_coil:
             break
     singular = torch.sqrt(values[kept]).to(torch.complex128)
