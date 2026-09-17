@@ -5,8 +5,8 @@ usage, from the repository root:
     python examples/multilayer_mie.py --pitch 0.008 [linear] [mixed] [cpu|cuda]
 
 ``linear`` gives the body the piecewise-linear basis, twelve unknowns per voxel
-where the constant basis has three; ``mixed`` iterates in single precision and
-refines in double. MARIE's file is 2 mm, where the linear basis wants a
+where the constant basis has three; ``mixed`` applies the operator in single
+precision and finishes in double. MARIE's file is 2 mm, where the linear basis wants a
 workstation's memory; ``--pitch`` builds the same sphere at a coarser pitch,
 where both bases finish in a couple of minutes, and the comparison between
 bases on one grid is the same question.

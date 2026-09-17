@@ -150,7 +150,7 @@ def _any_precision(matrix):
 
 
 @pytest.mark.parametrize("tol", [1e-4, 1e-8, 1e-12])
-def test_refinement_reaches_a_double_precision_tolerance_from_single_precision_solves(
+def test_refinement_reaches_a_double_precision_tolerance_from_single_precision_products(
     tol, device
 ):
     matrix, exact = _system(40, device, conditioning=3.0)
@@ -161,7 +161,7 @@ def test_refinement_reaches_a_double_precision_tolerance_from_single_precision_s
     assert _relative_residual(matrix, solution.x, b) <= tol
 
 
-def test_refinement_iterates_in_single_precision(device):
+def test_refinement_takes_its_products_in_single_precision(device):
     matrix, exact = _system(30, device, conditioning=3.0)
     seen = set()
 
@@ -195,3 +195,11 @@ def test_refinement_returns_immediately_for_a_zero_right_hand_side(device):
     solution = refine(_any_precision(matrix), b)
     assert solution.converged
     assert not bool(solution.x.any())
+
+
+def test_single_precision_products_leave_the_iteration_count_of_a_double_solve(device):
+    matrix, exact = _system(60, device, conditioning=2.0)
+    b = matrix @ exact
+    double = gmres(lambda v: matrix @ v, b, tol=1e-6, restart=60)
+    mixed = refine(_any_precision(matrix), b, tol=1e-6, restart=60)
+    assert len(mixed.residuals) - 1 <= len(double.residuals) - 1 + 3

@@ -131,12 +131,6 @@ def gmres(
     )
 
 
-# Relative residual each single-precision inner solve is asked for. A single-
-# precision Krylov estimate drifts below the true residual well before 1e-6,
-# so asking for less per solve and refining more often costs fewer products.
-INNER_TOLERANCE = 1e-2
-
-
 def refine(
     operator: Operator,
     b: torch.Tensor,
@@ -147,12 +141,13 @@ def refine(
     maxit: int = 200,
     inner_dtype: torch.dtype = torch.complex64,
 ) -> Solution:
-    """Solve ``operator(x) = b`` by GMRES in single precision, refined in double.
+    """Solve ``operator(x) = b`` with the operator in single precision, finished in double.
 
-    Each refinement takes the residual in ``b``'s precision, solves for the
-    correction by :func:`gmres` in ``inner_dtype``, and adds it. The Krylov
-    basis and every product inside the inner solves are single precision; the
-    residual that decides convergence is not.
+    The Krylov basis stays in ``b``'s precision, so the iteration converges as a
+    double-precision one does; only the products are taken in ``inner_dtype``.
+    Their rounding caps the residual that iteration truly reaches, and a second
+    :func:`gmres`, with the operator in ``b``'s precision and started from the
+    first one's iterate, takes it to ``tol``.
 
     Parameters
     ----------
@@ -164,83 +159,34 @@ def refine(
     preconditioner
         Applies a left preconditioner in double precision.
     restart
-        Iterations per restart cycle of the inner solves.
+        Iterations per restart cycle.
     tol
         Target for the preconditioned relative residual, taken in double
         precision.
     maxit
-        Maximum restart cycles, over all inner solves together.
+        Maximum restart cycles of each of the two solves.
     inner_dtype
-        Precision of the inner solves.
+        Precision the products of the first solve are taken in.
 
     Returns
     -------
     Solution
-        The iterate and the residual history. The history holds the inner
-        solves' estimates, scaled to ``b``, and ends on the double-precision
-        residual.
-
-    Raises
-    ------
-    ValueError
-        ``b`` is not one-dimensional.
+        The iterate, and the two solves' residual histories joined; the second
+        starts from the first's true residual.
     """
-    if b.ndim != 1:
-        raise ValueError(f"the right-hand side must be a vector, got {b.ndim} axes")
-    apply_prec = preconditioner if preconditioner is not None else (lambda v: v)
 
-    def inner_operator(vector: torch.Tensor) -> torch.Tensor:
-        return operator(vector).to(inner_dtype)
+    def rounded(vector: torch.Tensor) -> torch.Tensor:
+        return operator(vector.to(inner_dtype)).to(vector.dtype)
 
-    def inner_prec(vector: torch.Tensor) -> torch.Tensor:
-        return apply_prec(vector.to(b.dtype)).to(inner_dtype)
-
-    x = torch.zeros_like(b)
-    scale = torch.linalg.vector_norm(apply_prec(b))
-    if scale == 0:
-        return Solution(
-            x=x,
-            residuals=torch.zeros(1, dtype=b.real.dtype, device=b.device),
-            inner=0,
-            restarts=0,
-            converged=True,
-        )
-    residual = b.clone()
-    relative = torch.linalg.vector_norm(apply_prec(residual)) / scale
-    history = [relative]
-    restarts = 0
-    inner = 0
-    while relative > tol and restarts < maxit:
-        correction = gmres(
-            inner_operator,
-            residual.to(inner_dtype),
-            preconditioner=inner_prec,
-            restart=restart,
-            tol=max(INNER_TOLERANCE, 0.5 * tol / float(relative)),
-            maxit=maxit - restarts,
-        )
-        restarts += correction.restarts
-        inner = correction.inner
-        estimates = [
-            (value * relative).to(b.real.dtype) for value in correction.residuals[1:-1]
-        ]
-        x = x + correction.x.to(b.dtype)
-        residual = b - operator(x)
-        previous, relative = (
-            relative,
-            torch.linalg.vector_norm(apply_prec(residual)) / scale,
-        )
-        history.extend([*estimates, relative])
-        # A correction that does not lower the double-precision residual means
-        # single precision has nothing left to resolve.
-        if relative >= previous:
-            break
+    arguments = {"preconditioner": preconditioner, "restart": restart, "tol": tol}
+    first = gmres(rounded, b, maxit=maxit, **arguments)
+    finish = gmres(operator, b, maxit=maxit, x0=first.x, **arguments)
     return Solution(
-        x=x,
-        residuals=torch.stack(history),
-        inner=inner,
-        restarts=restarts,
-        converged=bool(relative <= tol),
+        x=finish.x,
+        residuals=torch.cat([first.residuals, finish.residuals[1:]]),
+        inner=finish.inner,
+        restarts=first.restarts + finish.restarts,
+        converged=finish.converged,
     )
 
 

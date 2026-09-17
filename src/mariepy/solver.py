@@ -211,9 +211,9 @@ def solve_body(
     restart, maxit
         Passed to :func:`mariepy.gmres.gmres`.
     precision
-        ``"double"`` solves in complex128; ``"mixed"`` iterates in complex64
-        and refines in complex128, with :func:`mariepy.gmres.refine`, to the
-        same ``tol``.
+        ``"double"`` solves in complex128; ``"mixed"`` applies the operator in
+        complex64 and finishes in complex128, with
+        :func:`mariepy.gmres.refine`, to the same ``tol``.
 
     Returns
     -------
