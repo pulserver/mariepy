@@ -17,6 +17,7 @@ RESOLUTION = 0.01
 ORDERS = {"far_order": 2, "medium_order": 2, "near_order": 4}
 
 _BUILT: dict = {}
+_SYSTEMS: dict = {}
 
 
 def _medium():
@@ -56,15 +57,18 @@ def _coil_block(operator):
     return torch.stack(columns, dim=1)
 
 
-def _built(device, *, exact, store=torch.complex64):
-    key = (device, exact, store)
+def _built(device, *, exact, store=torch.complex64, tol=None):
+    tol = (1e-12 if exact else 1e-3) if tol is None else tol
+    key = (device, exact, store, tol)
     if key not in _BUILT:
         body = _body(device)
         # The compressed build needs a coil fine enough for its coupling to have
         # a rank below its own size; the exact one is checked on a coarse coil.
         coil = _coil(device) if exact else _coil(device, n_around=32, n_across=2)
         medium = _medium()
-        system = assemble_coil(coil, medium)
+        if (device, exact) not in _SYSTEMS:
+            _SYSTEMS[device, exact] = assemble_coil(coil, medium)
+        system = _SYSTEMS[device, exact]
         impedance = None
         region = torch.ones_like(body.mask) if exact else None
         if exact:
@@ -82,7 +86,7 @@ def _built(device, *, exact, store=torch.complex64):
             body,
             coil,
             medium,
-            tol=1e-12 if exact else 1e-3,
+            tol=tol,
             region=region,
             impedance=impedance,
             system=system,
@@ -145,6 +149,41 @@ def test_eliminating_the_coil_block_gives_the_coupled_solve(device):
         network.port_admittance(perturbation.operator.system.excitation, coupled.coil)
     )
     torch.testing.assert_close(implicit_result.admittance, want, rtol=1e-7, atol=0.0)
+
+
+@pytest.mark.slow
+def test_the_port_matrix_follows_the_elimination_matrix_and_not_the_truncation(device):
+    # The coupled operator keeps the coil's own matrix on near pairs of basis
+    # functions and projects the far ones, so which of the two the coil is
+    # eliminated with is what the port matrix sees. Tightening the truncation
+    # leaves it where it was; eliminating with the coupled operator's own coil
+    # block takes it to the coupled solve.
+    body, perturbation = _built(device, exact=False)
+    operator = _coupled(body, perturbation)
+    coupled = solve_ports(operator, tol=1e-11)
+    want = network.symmetrise(
+        network.port_admittance(operator.system.excitation, coupled.coil)
+    )
+
+    def error(built):
+        result = built.solve(body, tol=1e-11, precision="double")
+        return float((result.admittance - want).abs().max() / want.abs().max())
+
+    coarse = error(perturbation)
+    tightened = error(_built(device, exact=False, tol=1e-5)[1])
+    eliminated = error(
+        implicit.CoilPerturbation.build(
+            body,
+            _coil(device, n_around=32, n_across=2),
+            _medium(),
+            tol=1e-3,
+            impedance=_coil_block(operator),
+            system=operator.system,
+            **ORDERS,
+        )
+    )
+    assert tightened > 0.5 * coarse
+    assert eliminated < 0.01 * coarse
 
 
 def test_the_compressed_perturbation_is_the_exact_one_within_its_tolerance(device):
