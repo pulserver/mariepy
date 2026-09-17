@@ -151,8 +151,8 @@ def refine(
     The Krylov basis stays in ``b``'s precision, so the iteration converges as a
     double-precision one does; only the products are taken in ``inner_dtype``.
     Their rounding caps the residual that iteration can reach, so it stops at
-    ``tol`` or at :data:`ROUNDING_MARGIN` times that rounding, whichever is
-    larger, and a second :func:`gmres`, with the operator in ``b``'s precision
+    ``tol`` or at :data:`ROUNDING_MARGIN` times that rounding, measured on a
+    random vector through the preconditioner, whichever is larger, and a second :func:`gmres`, with the operator in ``b``'s precision
     and started from the first one's iterate, takes it to ``tol``.
 
     Parameters
@@ -184,12 +184,19 @@ def refine(
     def rounded(vector: torch.Tensor) -> torch.Tensor:
         return operator(vector.to(inner_dtype)).to(vector.dtype)
 
-    # The rounded products reach no closer than their own rounding, measured on
-    # the right-hand side, so the first solve stops a margin above it.
-    exact = operator(b)
-    rounding = torch.linalg.vector_norm(rounded(b) - exact) / torch.linalg.vector_norm(
-        exact
-    )
+    # The rounded products reach no closer than their own rounding, taken in the
+    # norm the tolerance is taken in, so the first solve stops a margin above
+    # it. A random vector reaches every block of the operator; a right-hand
+    # side may drive only some of them.
+    apply_prec = preconditioner if preconditioner is not None else (lambda v: v)
+    generator = torch.Generator().manual_seed(0)
+    probe = torch.complex(
+        torch.randn(b.shape, generator=generator, dtype=b.real.dtype),
+        torch.randn(b.shape, generator=generator, dtype=b.real.dtype),
+    ).to(b.device)
+    exact = apply_prec(operator(probe))
+    difference = apply_prec(rounded(probe)) - exact
+    rounding = torch.linalg.vector_norm(difference) / torch.linalg.vector_norm(exact)
     reachable = max(tol, ROUNDING_MARGIN * float(rounding))
     arguments = {"preconditioner": preconditioner, "restart": restart}
     first = gmres(rounded, b, maxit=maxit, tol=reachable, **arguments)

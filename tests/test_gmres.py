@@ -221,3 +221,34 @@ def test_refinement_converges_when_the_rounding_exceeds_the_tolerance(device):
     solution = refine(operator, b, tol=1e-10, restart=40, maxit=5)
     assert solution.converged
     assert _relative_residual(matrix, solution.x, b) <= 1e-10
+
+
+def test_refinement_measures_the_rounding_through_the_preconditioner(device):
+    """A preconditioner that amplifies the rounding must not stall the first solve."""
+    matrix, exact = _system(40, device, conditioning=3.0)
+    b = matrix @ exact
+    generator = torch.Generator().manual_seed(9)
+    noise = torch.randn((40, 40), dtype=torch.float64, generator=generator)
+    perturbed = matrix + 1e-9 * noise.to(matrix.device)
+
+    def operator(v):
+        if v.dtype == torch.complex64:
+            return (perturbed @ v.to(torch.complex128)).to(v.dtype)
+        return matrix @ v
+
+    amplified = torch.ones(40, dtype=torch.float64, device=device)
+    amplified[:5] = 1e5
+    solution = refine(
+        operator,
+        b,
+        preconditioner=lambda v: v * amplified.to(v.dtype),
+        tol=1e-10,
+        restart=40,
+        maxit=5,
+    )
+    assert solution.converged
+    residual = amplified * (b - matrix @ solution.x)
+    relative = torch.linalg.vector_norm(residual) / torch.linalg.vector_norm(
+        amplified * b
+    )
+    assert float(relative) <= 1e-10
