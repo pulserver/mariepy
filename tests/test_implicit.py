@@ -56,8 +56,8 @@ def _coil_block(operator):
     return torch.stack(columns, dim=1)
 
 
-def _built(device, *, exact):
-    key = (device, exact)
+def _built(device, *, exact, store=torch.complex64):
+    key = (device, exact, store)
     if key not in _BUILT:
         body = _body(device)
         # The compressed build needs a coil fine enough for its coupling to have
@@ -86,6 +86,7 @@ def _built(device, *, exact):
             region=region,
             impedance=impedance,
             system=system,
+            store=store,
             **ORDERS,
         )
         _BUILT[key] = (body, perturbation)
@@ -156,7 +157,7 @@ def test_the_compressed_perturbation_is_the_exact_one_within_its_tolerance(devic
     exact = operator.couple(
         torch.linalg.lu_solve(*perturbation.factors, back[:, None])[:, 0]
     )
-    compressed = prepared.left @ (prepared.right.transpose(0, 1) @ vector)
+    compressed = prepared.perturb(vector)
     error = torch.linalg.vector_norm(compressed - exact)
     assert float(error / torch.linalg.vector_norm(exact)) <= 1e-2
     assert perturbation.rank < operator.n_coil
@@ -172,6 +173,40 @@ def test_a_body_smaller_than_the_grid_reuses_the_build(device):
     coupled = solve_ports(_coupled(smaller, perturbation), tol=1e-11)
     scale = coupled.body.abs().max()
     assert float((result.ports.body - coupled.body).abs().max() / scale) <= 1e-7
+
+
+def test_a_body_takes_the_factors_its_own_coupling_products_would_give(device):
+    body, perturbation = _built(device, exact=True)
+    coordinates = body.coordinates()
+    inside = (coordinates**2).sum(dim=0) <= 0.012**2
+    smaller = dataclasses.replace(body, mask=body.mask & inside)
+    prepared = perturbation.prepare(smaller)
+    operator = prepared.operator
+
+    for factor, patterns in (
+        (prepared.left, perturbation.left),
+        (prepared.right, perturbation.right),
+        (prepared.right_hand_side, perturbation.drive),
+    ):
+        columns = torch.stack(
+            [operator.couple(patterns[:, k]) for k in range(patterns.shape[1])], dim=1
+        )
+        assert factor.shape == columns.shape
+        error = (factor.to(torch.complex128) - columns).abs().max()
+        assert float(error) <= 1e-6 * float(columns.abs().max())
+
+
+def test_single_precision_factors_give_the_double_precision_currents(device):
+    body, single = _built(device, exact=True)
+    _, double = _built(device, exact=True, store=torch.complex128)
+    assert single.region_left.dtype == torch.complex64
+    assert double.region_left.dtype == torch.complex128
+    # The right-hand side stays in double whatever the factors are kept in.
+    assert single.region_drive.dtype == torch.complex128
+
+    one = single.solve(body, tol=1e-11, precision="double").ports.body
+    other = double.solve(body, tol=1e-11, precision="double").ports.body
+    assert float((one - other).abs().max() / other.abs().max()) <= 1e-6
 
 
 def test_a_mixed_precision_solve_gives_the_double_precision_currents(device):

@@ -117,6 +117,32 @@ def _conductor_points(coil: Coil, spacing: float) -> torch.Tensor:
     return samples.reshape(-1, 3)
 
 
+def _coupled(operator: CoupledOperator, patterns: torch.Tensor) -> torch.Tensor:
+    """Carry coil current patterns to the body, one coupling product each.
+
+    In double precision whatever the solve's: the patterns are scaled by the
+    inverse of the coupling's singular values, and their products cancel to
+    that extent.
+    """
+    columns = [operator.couple(patterns[:, k]) for k in range(patterns.shape[1])]
+    return torch.stack(columns, dim=1)
+
+
+def _region_rows(
+    region: torch.Tensor, mask: torch.Tensor, n_components: int
+) -> torch.Tensor:
+    """Give the rows of a region's unknowns that belong to a body within it.
+
+    A grid's unknowns run component by component over the cells its mask keeps,
+    in the mask's own order, so a body's rows are the region rows of the cells
+    it occupies, repeated for each component.
+    """
+    inside = mask.to(region.device)[region]
+    cells = torch.nonzero(inside, as_tuple=True)[0]
+    offsets = int(region.sum()) * torch.arange(n_components, device=cells.device)
+    return (offsets[:, None] + cells[None, :]).reshape(-1)
+
+
 def _region_body(grid: VoxelBody, region: torch.Tensor) -> VoxelBody:
     """Free space on a grid, with a region of it counted as body."""
     return VoxelBody(
@@ -148,6 +174,13 @@ class CoilPerturbation:
         drives in free space.
     left, right
         Coil current patterns, shape ``(n_coil, rank)`` each.
+    region_left, region_right
+        ``Zbc L`` and ``Zbc R`` over the whole region, shape
+        ``(n_region, rank)`` each, in the precision :meth:`build` stored them
+        in. A body takes its own factors from their rows.
+    region_drive
+        ``Zbc Zc^-1 F`` over the whole region, shape ``(n_region, n_ports)``,
+        complex128: it is the right-hand side each solve starts from.
     singular_values
         The singular values of ``Zbc`` over the region that the basis kept.
     """
@@ -158,6 +191,9 @@ class CoilPerturbation:
     drive: torch.Tensor
     left: torch.Tensor
     right: torch.Tensor
+    region_left: torch.Tensor
+    region_right: torch.Tensor
+    region_drive: torch.Tensor
     singular_values: torch.Tensor
 
     @property
@@ -179,6 +215,7 @@ class CoilPerturbation:
         system: CoilSystem | None = None,
         linear: bool = False,
         coupling_tol: float = 1e-7,
+        store: torch.dtype = torch.complex64,
         **orders,
     ) -> CoilPerturbation:
         """Compress a coil's perturbation over a grid.
@@ -216,6 +253,11 @@ class CoilPerturbation:
             Give the body the piecewise-linear basis.
         coupling_tol
             Tucker tolerance of the precorrected FFT coupling.
+        store
+            Precision the region-sized factors are kept in. They hold
+            ``rank`` vectors over the region, so complex64 halves what the
+            build carries, at a rounding far below ``tol``. Their right-hand
+            side stays complex128.
         **orders
             Quadrature orders, as :func:`mariepy.pfft.assemble` takes them.
 
@@ -252,6 +294,8 @@ class CoilPerturbation:
         scaled = basis / singular[None, :]
         left = scaled @ (u[:, :rank] * s[None, :rank])
         right = scaled @ vh[:rank].transpose(0, 1)
+
+        _log.info("perturbation rank %d of %d sampled", rank, basis.shape[1])
         return cls(
             operator=operator,
             impedance=impedance,
@@ -259,11 +303,14 @@ class CoilPerturbation:
             drive=drive,
             left=left,
             right=right,
+            region_left=_coupled(operator, left).to(store),
+            region_right=_coupled(operator, right).to(store),
+            region_drive=_coupled(operator, drive),
             singular_values=singular,
         )
 
     def prepare(self, body: VoxelBody) -> BodyPerturbation:
-        """Turn the coil patterns into one body's factors.
+        """Take one body's factors from the region's, by its own rows.
 
         Parameters
         ----------
@@ -302,22 +349,13 @@ class CoilPerturbation:
             system=box.system,
             coupling=pfft.restrict(box.coupling, body.mask),
         )
-
-        # In double precision whatever the solve's: the patterns are scaled by
-        # the inverse of the coupling's singular values, and their products
-        # cancel to that extent.
-        def coupled(patterns: torch.Tensor) -> torch.Tensor:
-            columns = [
-                operator.couple(patterns[:, k]) for k in range(patterns.shape[1])
-            ]
-            return torch.stack(columns, dim=1)
-
+        rows = _region_rows(grid.mask, body.mask, box.coupling.n_components)
         return BodyPerturbation(
             coil=self,
             operator=operator,
-            left=coupled(self.left),
-            right=coupled(self.right),
-            right_hand_side=coupled(self.drive),
+            left=self.region_left[rows],
+            right=self.region_right[rows],
+            right_hand_side=self.region_drive[rows],
         )
 
     def solve(
@@ -375,9 +413,9 @@ class BodyPerturbation:
         The coupled operator of this body and the coil.
     left, right
         ``Zbc L`` and ``Zbc R`` on the body's degrees of freedom, shape
-        ``(n_body, rank)`` each.
+        ``(n_body, rank)`` each, in the precision the build stored them in.
     right_hand_side
-        ``Zbc Zc^-1 F``, shape ``(n_body, n_ports)``.
+        ``Zbc Zc^-1 F``, shape ``(n_body, n_ports)``, complex128.
     """
 
     coil: CoilPerturbation
@@ -393,17 +431,31 @@ class BodyPerturbation:
         ----------
         body_current
             Shape ``(n_body,)``, complex128 or complex64; the body's own block
-            is taken in its precision, the perturbation in complex128.
+            is taken in its precision, the perturbation in the factors'.
 
         Returns
         -------
         torch.Tensor
             Same shape and precision.
         """
-        own = self.operator.body_block(body_current)
-        double = body_current.to(torch.complex128)
-        perturbation = self.left @ (self.right.transpose(0, 1) @ double)
-        return own + perturbation.to(body_current.dtype)
+        return self.operator.body_block(body_current) + self.perturb(body_current)
+
+    def perturb(self, body_current: torch.Tensor) -> torch.Tensor:
+        """Apply the compressed ``Zbc Zc^-1 Zbc^T`` to a body current.
+
+        Parameters
+        ----------
+        body_current
+            Shape ``(n_body,)``, complex128 or complex64.
+
+        Returns
+        -------
+        torch.Tensor
+            Same shape and precision; the product is taken in the factors'.
+        """
+        current = body_current.to(self.left.dtype)
+        product = self.left @ (self.right.transpose(0, 1) @ current)
+        return product.to(body_current.dtype)
 
     def solve(
         self,

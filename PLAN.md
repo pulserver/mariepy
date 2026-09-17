@@ -258,9 +258,11 @@ The port departs from MARIE 2.0 in three places:
   the grid. Here the coupling's range is found from the coil's side, by a
   randomized Nyström approximation (Tropp et al., SIAM J. Matrix Anal. Appl. 38
   (2017) 1454) of the Gram matrix `Zbc^H Zbc`, whose eigenvectors are the right
-  singular vectors of `Zbc`. What is kept per coil is a handful of coil current
-  patterns, and each body turns them into its own factors with one coupling
-  product each, taken on its own voxels.
+  singular vectors of `Zbc`. The rank that truncation keeps is what the build
+  then carries to the body: the factors are taken over the whole region once,
+  in complex64, and a body selects the rows of the voxels it occupies, so no
+  coupling product is taken per body. Their right-hand side stays in
+  complex128, where the solve starts from it.
 - The region must keep its distance from the conductors. Tissue beside a
   conductor sees the near field of each of its edges, which no low-rank
   perturbation holds: a head mask dilated into the coil kept more than 480
