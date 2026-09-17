@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import warnings
 from dataclasses import dataclass
 
 import torch
@@ -53,12 +54,20 @@ __all__ = [
     "projection_matrix",
     "restrict",
     "scatter_matrix",
+    "widest_basis",
 ]
 
 # MARIE fixes the expansion block at three cells a side in
 # ``pfft_surface_domain.m``; the code below carries it as a parameter but the
 # collocation sphere and the near distance are both sized from it.
 EXPANSION = 3
+
+# A basis function is replaced by currents on the expansion block, which reaches
+# one cell either side of its centre. Past this many cells across, the widest
+# basis function no longer sits on its block, and the coupled system takes
+# markedly more GMRES iterations: on a head at 4 mm the same coil took 58
+# iterations meshed at 2.8 cells and 132 at 5.2.
+WIDEST_BASIS = 3.0
 
 Coil = SurfaceCoil | wire_module.WireCoil | wire_module.CombinedCoil
 
@@ -109,6 +118,34 @@ def _width_in_cells(coil: Coil, resolution: float) -> int:
         reduce="amax",
     )
     return math.ceil(float((widest / resolution).mean()))
+
+
+def widest_basis(coil: Coil, resolution: float) -> float:
+    """Return the widest basis function's span, in cells of a grid.
+
+    Parameters
+    ----------
+    coil
+        The coil and its basis.
+    resolution
+        Voxel pitch in metres.
+
+    Returns
+    -------
+    float
+        The longest triangle edge of a surface coil, or the longest hat of a
+        wire one, divided by the pitch.
+    """
+    if isinstance(coil, wire_module.CombinedCoil):
+        return max(
+            widest_basis(coil.wire, resolution),
+            widest_basis(coil.surface, resolution),
+        )
+    if isinstance(coil, wire_module.WireCoil):
+        widest = float((coil.left_lengths() + coil.right_lengths()).max())
+    else:
+        widest = float(coil.mesh.edge_lengths().max())
+    return widest / resolution
 
 
 def _field(
@@ -971,6 +1008,14 @@ def assemble(
     Coupling
         Ready for the coupled matrix-vector product.
     """
+    span = widest_basis(coil, body.resolution)
+    if span > WIDEST_BASIS:
+        warnings.warn(
+            f"the coil's widest basis function spans {span:.1f} voxels, beyond "
+            f"{WIDEST_BASIS:.0f}: the coupled solve will take more GMRES "
+            "iterations. Refine the coil mesh, or coarsen the body grid.",
+            stacklevel=2,
+        )
     grid = extended_domain(body, coil, expansion=expansion)
     near = near_lists(grid, coil, expansion=expansion, distance=distance)
     symbols_n, symbols_k, cube_n, cube_k = kernels(

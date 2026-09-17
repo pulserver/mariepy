@@ -1,5 +1,7 @@
 """The precorrected FFT coupling: its grid, its projection and its corrections."""
 
+import warnings
+
 import pytest
 import torch
 
@@ -310,3 +312,36 @@ def test_a_body_reaching_outside_the_region_is_refused(device):
     )
     with pytest.raises(ValueError, match="outside the region"):
         pfft.restrict(own, torch.ones_like(body.mask))
+
+
+def _assembled(body, coil, medium, **orders):
+    impedance = sie.assemble(coil, medium).impedance
+    return pfft.assemble(
+        body,
+        coil,
+        impedance,
+        medium,
+        distance=DISTANCE,
+        far_order=2,
+        medium_order=2,
+        near_order=4,
+        **orders,
+    )
+
+
+def test_a_coil_whose_basis_spans_more_than_three_voxels_warns(device):
+    body = _body(device)
+    coil = _coil(device, n_around=8)
+    assert pfft.widest_basis(coil, body.resolution) > pfft.WIDEST_BASIS
+    with pytest.warns(UserWarning, match="voxels"):
+        _assembled(body, coil, _medium())
+
+
+def test_a_coil_whose_basis_sits_within_three_voxels_does_not_warn(device):
+    body = _body(device)
+    coil = _coil(device, n_around=24)
+    assert pfft.widest_basis(coil, body.resolution) < pfft.WIDEST_BASIS
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _assembled(body, coil, _medium())
+    assert not [entry for entry in caught if "voxels" in str(entry.message)]
