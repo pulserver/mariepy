@@ -13,6 +13,7 @@ reports is the preconditioned one.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -21,6 +22,8 @@ import torch
 __all__ = ["Solution", "gmres", "refine"]
 
 Operator = Callable[[torch.Tensor], torch.Tensor]
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,12 @@ def gmres(
             operator, apply_prec, x, residual, restart, tol * scale
         )
         history.extend(value / scale for value in cycle)
+        _log.info(
+            "GMRES cycle %d: %d iterations, relative residual %.3e",
+            restarts,
+            inner,
+            float(history[-1]),
+        )
 
     return Solution(
         x=x,
