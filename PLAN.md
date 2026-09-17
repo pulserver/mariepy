@@ -238,6 +238,40 @@ the discrete electric field under-resolves the high-order fields, which then
 look nearly noiseless. MARIE maps it over a logarithmic run of mode counts for
 that reason, and `ultimate_maps` takes the count.
 
+**Coil-implicit solve.** `implicit.py` ports MARIE 2.0's perturbation solve
+(GPL-3.0-or-later; Guryev et al., IEEE TBME 70 (2023) 1575), which eliminates
+the coil currents and leaves an equation in the body current alone,
+
+`(Zbb + Zbc Zc^-1 Zbc^T) Jb = Zbc Zc^-1 F`.
+
+The second term is the coil's perturbation of the body. It depends on the coil,
+the frequency and the grid, never on the tissue, so it is compressed once over
+the region of a grid a body may occupy and serves every body within it: a
+population on one grid pays for the coil once. The unknown is then the body's
+alone, and the coil rows, whose preconditioned single-precision rounding is what
+stops the coupled system from gaining by mixed precision, are gone from the
+iteration.
+
+The port departs from MARIE 2.0 in three places:
+
+- MARIE 2.0 samples `Zbc` by cross approximation and keeps factors the size of
+  the grid. Here the coupling's range is found from the coil's side, by a
+  randomized Nyström approximation (Tropp et al., SIAM J. Matrix Anal. Appl. 38
+  (2017) 1454) of the Gram matrix `Zbc^H Zbc`, whose eigenvectors are the right
+  singular vectors of `Zbc`. What is kept per coil is a handful of coil current
+  patterns, and each body turns them into its own factors with one coupling
+  product each, taken on its own voxels.
+- The region must keep its distance from the conductors. Tissue beside a
+  conductor sees the near field of each of its edges, which no low-rank
+  perturbation holds: a head mask dilated into the coil kept more than 480
+  singular values above the tolerance. The region defaults to the grid's own
+  mask, takes the union of a population's masks, and `tissue_region` gives a
+  clearance envelope.
+- The coil is eliminated with its own method-of-moments matrix `Zc` by default.
+  Passing the coupled operator's coil block instead makes the solve reproduce
+  `solver.solve_ports` exactly, which is how the two truncations are told apart
+  from the elimination.
+
 **Compiled kernels.** MARIE's C++ sources are bound with pybind11 into the
 package's single `_ext` module, following the package template and pypulseqpp.
 
@@ -389,6 +423,14 @@ they were measured on.
   coil and body, within the basis tolerance.
 - SNR and transmit-efficiency maps agree with their definitions evaluated
   directly from the fields.
+- The coil-implicit solve reproduces the coupled solve's body current when the
+  coil is eliminated with the coupled operator's own coil block and the
+  perturbation is truncated tightly. With the coil's method-of-moments matrix
+  and the default tolerance the two answers differ, and each case reports that
+  difference in the port matrix and in the field, separated between the two
+  causes: the elimination matrix and the truncation.
+- A body smaller than the region gets the same currents from the restricted
+  coupling as from one assembled for it alone.
 
 **Q matrices, averaging and VOPs.**
 
