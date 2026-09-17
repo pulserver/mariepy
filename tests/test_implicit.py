@@ -66,12 +66,12 @@ def _built(device, *, exact):
         medium = _medium()
         system = assemble_coil(coil, medium)
         impedance = None
+        region = torch.ones_like(body.mask) if exact else None
         if exact:
-            box = pfft.assemble(
-                implicit.whole_grid(body), coil, system.impedance, medium, **ORDERS
-            )
+            whole_grid = dataclasses.replace(body, mask=region)
+            box = pfft.assemble(whole_grid, coil, system.impedance, medium, **ORDERS)
             whole = CoupledOperator(
-                body=implicit.whole_grid(body),
+                body=whole_grid,
                 coil=coil,
                 medium=medium,
                 system=system,
@@ -83,6 +83,7 @@ def _built(device, *, exact):
             coil,
             medium,
             tol=1e-12 if exact else 1e-3,
+            region=region,
             impedance=impedance,
             system=system,
             **ORDERS,
@@ -192,3 +193,16 @@ def test_a_body_off_the_grid_is_refused(device):
     )
     with pytest.raises(ValueError, match="grid the perturbation was built on"):
         perturbation.prepare(moved)
+
+
+def test_the_default_region_keeps_its_clearance_from_the_conductors(device):
+    # A grid wide enough for the loop to cross it.
+    body = _body(device, radius=0.045)
+    coil = _coil(device, n_around=32, n_across=2)
+    region = implicit.tissue_region(body, coil, clearance=0.015)
+    assert not bool(region.all())
+    centres = body.coordinates().reshape(3, -1).transpose(0, 1)[region.reshape(-1)]
+    points = implicit._conductor_points(coil, 0.001)
+    gap = (centres[:, None, :] - points[None, :, :]).abs().amax(dim=-1).min()
+    assert float(gap) > 0.015 - RESOLUTION / 2
+    assert bool(region.any())

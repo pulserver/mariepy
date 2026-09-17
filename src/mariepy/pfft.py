@@ -1023,20 +1023,20 @@ def assemble(
 
 
 def restrict(coupling: Coupling, mask: torch.Tensor) -> Coupling:
-    """Take a coupling assembled over a whole body grid down to one body inside it.
+    """Take a coupling assembled over a region down to a body inside it.
 
     Every entry of the near corrections belongs to one basis function and one
-    cell, whatever else the grid holds, so a coupling assembled once with every
-    cell of the body grid counted as body serves any body on that grid: its
-    rows are selected and the scatter rebuilt.
+    cell, whatever else the grid holds, so a coupling assembled once with a
+    region of the body grid counted as body serves any body within that region:
+    its rows are selected and the scatter rebuilt.
 
     Parameters
     ----------
     coupling
-        Assembled by :func:`assemble` for a body whose mask covers its whole
-        grid.
+        Assembled by :func:`assemble` for a body whose mask is the region.
     mask
-        The body to keep, on that grid, shape ``(n1, n2, n3)``, boolean.
+        The body to keep, on the same body grid, shape ``(n1, n2, n3)``,
+        boolean, inside the region.
 
     Returns
     -------
@@ -1047,40 +1047,40 @@ def restrict(coupling: Coupling, mask: torch.Tensor) -> Coupling:
     Raises
     ------
     ValueError
-        If ``coupling`` was not assembled over its whole body grid, or ``mask``
-        is not that grid's shape.
+        If ``mask`` is not the body grid's shape, or reaches outside the region.
     """
     grid = coupling.grid
     start = grid.body_origin
-    box = grid.mask[
-        start[0] : start[0] + mask.shape[0],
-        start[1] : start[1] + mask.shape[1],
-        start[2] : start[2] + mask.shape[2],
-    ]
-    if tuple(box.shape) != tuple(mask.shape) or int(grid.mask.sum()) != mask.numel():
+    window = (
+        slice(start[0], start[0] + mask.shape[0]),
+        slice(start[1], start[1] + mask.shape[1]),
+        slice(start[2], start[2] + mask.shape[2]),
+    )
+    region = grid.mask[window]
+    if tuple(region.shape) != tuple(mask.shape) or int(region.sum()) != int(
+        grid.mask.sum()
+    ):
         raise ValueError(
-            "the coupling must be assembled over every cell of a body grid of "
-            f"shape {tuple(mask.shape)}"
+            f"the coupling's body grid is not of shape {tuple(mask.shape)}"
         )
+    mask = mask.to(grid.mask.device)
+    if bool((mask & ~region).any()):
+        raise ValueError("the body reaches outside the region the coupling covers")
     placed = torch.zeros_like(grid.mask)
-    placed[
-        start[0] : start[0] + mask.shape[0],
-        start[1] : start[1] + mask.shape[1],
-        start[2] : start[2] + mask.shape[2],
-    ] = mask.to(grid.mask.device)
+    placed[window] = mask
     kept = dataclasses.replace(grid, mask=placed)
 
-    n_box = mask.numel()
+    n_region = int(region.sum())
     n_components = coupling.n_components
-    numbering = torch.full((n_box,), -1, dtype=torch.int64, device=grid.device)
-    inside = mask.reshape(-1).to(grid.device)
-    numbering[inside] = torch.arange(int(inside.sum()), device=grid.device)
+    numbering = torch.full((n_region,), -1, dtype=torch.int64, device=grid.device)
+    inside = mask[region]
     n_voxels = int(inside.sum())
+    numbering[inside] = torch.arange(n_voxels, device=grid.device)
 
     def rows_of(matrix: torch.Tensor) -> torch.Tensor:
         matrix = matrix.coalesce()
         row, column = matrix.indices()
-        component, cell = row // n_box, row % n_box
+        component, cell = row // n_region, row % n_region
         new = numbering[cell]
         keep = new >= 0
         return torch.sparse_coo_tensor(

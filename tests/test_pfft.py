@@ -271,7 +271,7 @@ def _whole_grid(body):
 
 
 @pytest.mark.parametrize("linear", [False, True], ids=["constant", "linear"])
-def test_a_coupling_over_the_whole_grid_restricts_to_the_body_s_own(linear, device):
+def test_a_coupling_over_a_region_restricts_to_the_body_s_own(linear, device):
     body = _body(device)
     coil = _coil(device)
     medium = _medium()
@@ -293,7 +293,7 @@ def test_a_coupling_over_the_whole_grid_restricts_to_the_body_s_own(linear, devi
         )
 
 
-def test_restricting_a_coupling_of_one_body_is_refused(device):
+def test_a_body_reaching_outside_the_region_is_refused(device):
     body = _body(device)
     coil = _coil(device)
     medium = _medium()
@@ -308,5 +308,5 @@ def test_restricting_a_coupling_of_one_body_is_refused(device):
         medium_order=2,
         near_order=4,
     )
-    with pytest.raises(ValueError, match="every cell"):
-        pfft.restrict(own, body.mask)
+    with pytest.raises(ValueError, match="outside the region"):
+        pfft.restrict(own, torch.ones_like(body.mask))

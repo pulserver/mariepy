@@ -17,7 +17,7 @@ leaves an equation in the body current alone,
 
 whose second term is the coil's perturbation of the body. It depends on the
 coil, the frequency and the grid, never on the tissue, so it is compressed once
-over a whole grid and serves every body placed on that grid.
+over the region of a grid a body may occupy and serves every body within it.
 
 The compression departs from MARIE 2.0's, which samples ``Zbc`` by cross
 approximation and keeps factors the size of the grid. Here the coupling's range
@@ -46,36 +46,88 @@ from mariepy.solver import PortSolution, Result, assemble_coil
 from mariepy.system import CoupledOperator
 from mariepy.wire import CombinedCoil, WireCoil
 
-__all__ = ["BodyPerturbation", "CoilPerturbation", "whole_grid"]
+__all__ = ["BodyPerturbation", "CoilPerturbation", "tissue_region"]
 
 Coil = SurfaceCoil | WireCoil | CombinedCoil
 
 
-def whole_grid(body: VoxelBody) -> VoxelBody:
-    """Return a body's grid with every cell counted as tissue.
+def tissue_region(grid: VoxelBody, coil: Coil, clearance: float) -> torch.Tensor:
+    """Mark the voxels of a grid that keep a clearance from every conductor.
+
+    Tissue close to a conductor sees the near field of each of its edges, which
+    no low-rank perturbation holds, and real bodies keep their distance from a
+    coil. A voxel is excluded when a conductor passes within ``clearance`` of
+    its centre along every axis.
 
     Parameters
     ----------
-    body
-        Supplies the grid: shape, pitch and origin.
+    grid
+        The grid bodies will be given on.
+    coil
+        The conductors.
+    clearance
+        Distance in metres a voxel keeps from the conductors.
 
     Returns
     -------
-    VoxelBody
-        Free space on that grid, with a mask covering all of it.
+    torch.Tensor
+        Shape of the grid, boolean: where a body may put tissue.
     """
+    points = _conductor_points(coil, 0.5 * grid.resolution).to(grid.device)
+    origin = torch.tensor(grid.origin, dtype=torch.float64, device=grid.device)
+    index = torch.round((points - origin) / grid.resolution).to(torch.int64)
+    limits = torch.tensor(grid.shape, device=grid.device)
+    held = ((index >= 0) & (index < limits)).all(dim=1)
+    touched = torch.zeros(grid.shape, dtype=torch.float32, device=grid.device)
+    touched[tuple(index[held].T)] = 1.0
+    reach = math.ceil(clearance / grid.resolution)
+    if reach > 0:
+        touched = torch.nn.functional.max_pool3d(
+            touched[None, None], 2 * reach + 1, stride=1, padding=reach
+        )[0, 0]
+    return touched == 0
+
+
+def _conductor_points(coil: Coil, spacing: float) -> torch.Tensor:
+    """Sample every conductor at no more than ``spacing`` apart."""
+    if isinstance(coil, CombinedCoil):
+        return torch.cat(
+            [
+                _conductor_points(coil.wire, spacing),
+                _conductor_points(coil.surface, spacing),
+            ]
+        )
+    if isinstance(coil, WireCoil):
+        starts = torch.cat([coil.first, coil.centre])
+        stops = torch.cat([coil.centre, coil.last])
+    else:
+        nodes = coil.mesh.nodes
+        starts, stops = nodes[coil.edges[:, 0]], nodes[coil.edges[:, 1]]
+    longest = float(torch.linalg.vector_norm(stops - starts, dim=-1).max())
+    steps = max(1, math.ceil(longest / spacing))
+    fractions = torch.linspace(
+        0.0, 1.0, steps + 1, dtype=starts.dtype, device=starts.device
+    )
+    samples = (
+        starts[:, None, :] + fractions[None, :, None] * (stops - starts)[:, None, :]
+    )
+    return samples.reshape(-1, 3)
+
+
+def _region_body(grid: VoxelBody, region: torch.Tensor) -> VoxelBody:
+    """Free space on a grid, with a region of it counted as body."""
     return VoxelBody(
-        permittivity=torch.ones_like(body.permittivity),
-        conductivity=torch.zeros_like(body.conductivity),
-        mask=torch.ones_like(body.mask),
-        resolution=body.resolution,
-        origin=body.origin,
+        permittivity=torch.ones_like(grid.permittivity),
+        conductivity=torch.zeros_like(grid.conductivity),
+        mask=region.to(grid.mask.device),
+        resolution=grid.resolution,
+        origin=grid.origin,
     )
 
 
 @dataclass(frozen=True)
 class CoilPerturbation:
-    """One coil's effect on any body on one grid, compressed.
+    """One coil's effect on any body within a region of one grid, compressed.
 
     The perturbation is ``Zbc Zc^-1 Zbc^T ~ (Zbc L)(Zbc R)^T``, with ``L`` and
     ``R`` the columns of :attr:`left` and :attr:`right`.
@@ -83,7 +135,7 @@ class CoilPerturbation:
     Attributes
     ----------
     operator
-        The coupled operator over the whole grid, as :func:`whole_grid` gives it.
+        The coupled operator over the region a body may occupy.
     impedance
         The coil matrix ``Zc`` the coil is eliminated with.
     factors
@@ -94,7 +146,7 @@ class CoilPerturbation:
     left, right
         Coil current patterns, shape ``(n_coil, rank)`` each.
     singular_values
-        The singular values of ``Zbc`` over the whole grid that the basis kept.
+        The singular values of ``Zbc`` over the region that the basis kept.
     """
 
     operator: CoupledOperator
@@ -118,6 +170,8 @@ class CoilPerturbation:
         medium: Medium,
         *,
         tol: float = 1e-3,
+        region: torch.Tensor | None = None,
+        clearance: float = 5e-3,
         block: int = 16,
         impedance: torch.Tensor | None = None,
         system: CoilSystem | None = None,
@@ -139,6 +193,12 @@ class CoilPerturbation:
             Relative tolerance of both truncations: of the coupling's singular
             values against the largest, and of the perturbation's tail against
             its largest singular value.
+        region
+            Where on the grid bodies may put tissue, boolean. By default every
+            voxel :func:`tissue_region` keeps at ``clearance``. The rank the
+            perturbation needs grows as the region nears the conductors.
+        clearance
+            Distance kept from the conductors when ``region`` is not given.
         block
             Random coil currents drawn at a time while the coupling's range is
             sampled; each costs two products on the extended grid.
@@ -158,10 +218,12 @@ class CoilPerturbation:
         Returns
         -------
         CoilPerturbation
-            Ready to solve any body on ``grid``.
+            Ready to solve any body within the region.
         """
         system = assemble_coil(coil, medium) if system is None else system
-        box = whole_grid(grid)
+        if region is None:
+            region = tissue_region(grid, coil, clearance)
+        box = _region_body(grid, region)
         coupling = pfft.assemble(
             box,
             coil,
@@ -214,7 +276,8 @@ class CoilPerturbation:
         Raises
         ------
         ValueError
-            If ``body`` is not on the grid the perturbation was built on.
+            If ``body`` is not on the grid the perturbation was built on, or
+            puts tissue outside its region.
         """
         grid = self.operator.body
         if (
