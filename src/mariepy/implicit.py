@@ -19,13 +19,23 @@ whose second term is the coil's perturbation of the body. It depends on the
 coil, the frequency and the grid, never on the tissue, so it is compressed once
 over the region of a grid a body may occupy and serves every body within it.
 
-The compression departs from MARIE 2.0's, which samples ``Zbc`` by cross
-approximation and keeps factors the size of the grid. Here the coupling's range
-is found from the coil's side: a randomized Nyström approximation of the Gram
-matrix ``Zbc^H Zbc`` gives the right singular vectors of ``Zbc``, and the
-perturbation is truncated in that basis. What is kept per coil is therefore a
-handful of coil current patterns; each body turns them into its own factors
-with one product each, and both factors are taken on the body's own voxels.
+``Zbc`` over the region is approximated first, by MARIE 2.0's cross
+approximation: rows and columns of it are integrated directly, at one kernel
+evaluation per entry and no convolution, and the sampling follows the coupling
+rather than the region, taking each round's columns where the coil-side basis
+has the largest volume. The perturbation's core is then a small matrix between
+the coupling's two factors, ``Zbc ~ B C``, and truncating
+
+    B (C Zc^-1 C^T) B^T
+
+leaves the factors over the whole region, so a body only selects the rows of
+the voxels it occupies and no product on the extended grid is taken per body.
+
+The coupling this holds is the one the quadrature gives, where the coupled
+operator of :mod:`mariepy.system` projects its far interactions onto the
+grid. The two therefore differ by that projection, as they do already in the
+coil matrix the coil is eliminated with, and what the approximation leaves of
+the operator's own coupling is measured on every build.
 """
 
 from __future__ import annotations
@@ -45,6 +55,7 @@ from mariepy.preconditioner import body_diagonal
 from mariepy.sie import CoilSystem
 from mariepy.solver import PortSolution, Result, assemble_coil
 from mariepy.system import CoupledOperator
+from mariepy.tt import _maxvol
 from mariepy.wire import CombinedCoil, WireCoil
 
 __all__ = ["BodyPerturbation", "CoilPerturbation", "tissue_region"]
@@ -117,15 +128,39 @@ def _conductor_points(coil: Coil, spacing: float) -> torch.Tensor:
     return samples.reshape(-1, 3)
 
 
-def _coupled(operator: CoupledOperator, patterns: torch.Tensor) -> torch.Tensor:
-    """Carry coil current patterns to the body, one coupling product each.
+def _chebyshev_cells(grid: pfft.ExtendedGrid, points: int) -> torch.Tensor:
+    """Take the region's cells on a Chebyshev grid of ``points`` a side.
 
-    In double precision whatever the solve's: the patterns are scaled by the
-    inverse of the coupling's singular values, and their products cancel to
-    that extent.
+    Ported from ``sample_rows.m``. Chebyshev nodes over the region's own extent
+    crowd towards its faces, which is where the coupling varies fastest, and
+    the tensor grid of them is intersected with the region.
     """
-    columns = [operator.couple(patterns[:, k]) for k in range(patterns.shape[1])]
-    return torch.stack(columns, dim=1)
+    region = grid.mask
+    held = torch.nonzero(region)
+    axes = []
+    for axis in range(3):
+        first = int(held[:, axis].min())
+        last = int(held[:, axis].max())
+        nodes = torch.cos(torch.linspace(0.0, math.pi, points + 1, dtype=torch.float64))
+        index = torch.round(first + 0.5 * (last - first) * (1.0 + nodes))
+        axes.append(torch.unique(index.to(torch.int64)))
+    block = torch.cartesian_prod(*axes).to(region.device)
+    inside = region[block[:, 0], block[:, 1], block[:, 2]]
+    return grid.flatten(block[inside])
+
+
+def _row_numbers(
+    grid: pfft.ExtendedGrid, cells: torch.Tensor, n_components: int
+) -> torch.Tensor:
+    """Give named cells their unknowns' numbers, as the body numbers its own.
+
+    Ported from the row numbering ``sample_rows.m`` builds: each component runs
+    over every cell of the region, one component after the next.
+    """
+    within = pfft.body_numbering(grid)[cells]
+    n_region = int(grid.mask.sum())
+    offsets = n_region * torch.arange(n_components, device=cells.device)
+    return (offsets[:, None] + within[None, :]).reshape(-1)
 
 
 def _region_rows(
@@ -158,8 +193,8 @@ def _region_body(grid: VoxelBody, region: torch.Tensor) -> VoxelBody:
 class CoilPerturbation:
     """One coil's effect on any body within a region of one grid, compressed.
 
-    The perturbation is ``Zbc Zc^-1 Zbc^T ~ (Zbc L)(Zbc R)^T``, with ``L`` and
-    ``R`` the columns of :attr:`left` and :attr:`right`.
+    The perturbation is ``Zbc Zc^-1 Zbc^T``, kept as the product of
+    :attr:`region_left` and the transpose of :attr:`region_right`.
 
     Attributes
     ----------
@@ -172,8 +207,10 @@ class CoilPerturbation:
     drive
         ``Zc^-1 F``, shape ``(n_coil, n_ports)``: the coil current each port
         drives in free space.
-    left, right
-        Coil current patterns, shape ``(n_coil, rank)`` each.
+    coil_side
+        The coupling's coil-side factor, shape ``(rank, n_coil)``: with
+        :attr:`region_left` and :attr:`region_right` it is what the cross
+        approximation of ``Zbc`` gave.
     region_left, region_right
         ``Zbc L`` and ``Zbc R`` over the whole region, shape
         ``(n_region, rank)`` each, in the precision :meth:`build` stored them
@@ -189,8 +226,7 @@ class CoilPerturbation:
     impedance: torch.Tensor
     factors: tuple[torch.Tensor, torch.Tensor]
     drive: torch.Tensor
-    left: torch.Tensor
-    right: torch.Tensor
+    coil_side: torch.Tensor
     region_left: torch.Tensor
     region_right: torch.Tensor
     region_drive: torch.Tensor
@@ -199,7 +235,7 @@ class CoilPerturbation:
     @property
     def rank(self) -> int:
         """Rank the perturbation was kept at."""
-        return self.left.shape[1]
+        return self.region_left.shape[1]
 
     @classmethod
     def build(
@@ -210,7 +246,10 @@ class CoilPerturbation:
         *,
         tol: float = 1e-3,
         region: torch.Tensor | None = None,
-        block: int = 16,
+        block: int = 100,
+        iterations: int = 30,
+        stalls: int = 10,
+        checks: int = 2,
         impedance: torch.Tensor | None = None,
         system: CoilSystem | None = None,
         linear: bool = False,
@@ -241,8 +280,15 @@ class CoilPerturbation:
             perturbation needs both grow with the region, and fastest near the
             conductors.
         block
-            Random coil currents drawn at a time while the coupling's range is
-            sampled; each costs two products on the extended grid.
+            Coil unknowns the cross approximation starts from, MARIE 2.0's
+            first rank guess, which also sets the first Chebyshev grid.
+        iterations
+            Rounds of sampling at most.
+        stalls
+            Rounds whose rank barely moves before the sampling gives up.
+        checks
+            Random coil currents the approximation is measured against once it
+            is found, each costing two products on the extended grid.
         impedance
             The coil matrix to eliminate the coil with. By default the coil's own
             method-of-moments matrix; the coupled operator's coil block makes
@@ -284,28 +330,34 @@ class CoilPerturbation:
         factors = torch.linalg.lu_factor(impedance)
         drive = torch.linalg.lu_solve(*factors, system.excitation.transpose(0, 1))
 
-        basis, singular = _coupling_range(operator, tol=tol, block=block)
-        # Zbc V = Q S, so the perturbation is Q (S V^H Zc^-1 conj(V) S) Q^T.
-        inverse = torch.linalg.lu_solve(*factors, basis.conj())
-        core = singular[:, None] * (basis.conj().transpose(0, 1) @ inverse)
-        core = core * singular[None, :]
+        body, coil_side, singular = _cross_coupling(
+            operator,
+            tol=tol,
+            rank=block,
+            iterations=iterations,
+            stalls=stalls,
+            checks=checks,
+            orders={
+                name: value
+                for name, value in orders.items()
+                if name in ("triangle_order", "cell_order")
+            },
+        )
+        # Zbc ~ body coil_side, so the perturbation is body C body^T with
+        # C = coil_side Zc^-1 coil_side^T, which is small and truncates there.
+        core = coil_side @ torch.linalg.lu_solve(*factors, coil_side.transpose(0, 1))
         u, s, vh = torch.linalg.svd(core)
         rank = _tail_rank(s, tol)
-        scaled = basis / singular[None, :]
-        left = scaled @ (u[:, :rank] * s[None, :rank])
-        right = scaled @ vh[:rank].transpose(0, 1)
-
-        _log.info("perturbation rank %d of %d sampled", rank, basis.shape[1])
+        _log.info("perturbation rank %d of the coupling's %d", rank, core.shape[0])
         return cls(
             operator=operator,
             impedance=impedance,
             factors=factors,
             drive=drive,
-            left=left,
-            right=right,
-            region_left=_coupled(operator, left).to(store),
-            region_right=_coupled(operator, right).to(store),
-            region_drive=_coupled(operator, drive),
+            coil_side=coil_side,
+            region_left=(body @ (u[:, :rank] * s[None, :rank])).to(store),
+            region_right=(body @ vh[:rank].transpose(0, 1)).to(store),
+            region_drive=body @ (coil_side @ drive),
             singular_values=singular,
         )
 
@@ -533,79 +585,228 @@ class BodyPerturbation:
         )
 
 
-def _coupling_range(
-    operator: CoupledOperator, *, tol: float, block: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Find the coupling's right singular vectors above a relative tolerance.
+def _cross_coupling(
+    operator: CoupledOperator,
+    *,
+    tol: float,
+    rank: int,
+    iterations: int,
+    stalls: int,
+    checks: int,
+    orders: dict,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Approximate the coupling over the region from rows and columns of it.
 
-    A randomized Nyström approximation of ``G = Zbc^H Zbc`` (Tropp et al., SIAM
-    J. Matrix Anal. Appl. 38 (2017) 1454) grows by ``block`` columns until its
-    smallest kept eigenvalue falls below ``tol**2`` times its largest.
+    Ported from MARIE 2.0's ``cross_cheb_2d.m`` with ``sample_rows.m``,
+    ``sample_cols.m`` and ``maxvol.m``, and the Frobenius termination criterion
+    of ``Sampling_approx_Base.m``. The coupling is never applied: its rows and
+    columns are integrated directly, one kernel evaluation per entry and no
+    convolution.
+
+    Sampled columns span a body-side basis and sampled rows a coil-side basis,
+    both orthonormalised, and the coupling's core is fitted on the sampled
+    submatrix through their pseudo-inverses over those rows and columns. Each
+    round adds the columns where the coil-side basis has the largest volume,
+    which is what makes the sampling follow the coupling rather than the
+    region, and the rows of a Chebyshev grid one step finer. It stops once the
+    core's singular values settle to ``tol``.
+
+    Where MARIE 2.0 subsamples the rows of the chosen cells at random to bound
+    their number, every component of a chosen cell is kept here: the rows only
+    have to span the row space, and keeping them whole leaves the submatrix in
+    the order the body numbers its own unknowns.
 
     Returns
     -------
-    basis : torch.Tensor
-        Shape ``(n_coil, q)``, orthonormal columns.
+    body : torch.Tensor
+        Shape ``(n_region, rank)``: the coupling's body-side factor.
+    coil : torch.Tensor
+        Shape ``(rank, n_coil)``: its coil-side factor, so that their product
+        is the coupling.
     singular : torch.Tensor
-        Shape ``(q,)``, float64 as complex128: the singular values of ``Zbc``.
+        The core's singular values, which are the coupling's own.
     """
+    grid = operator.coupling.grid
+    region_cells = grid.body_cells()
+    n_components = operator.coupling.n_components
     n_coil = operator.n_coil
-    device = operator.system.impedance.device
     generator = torch.Generator().manual_seed(0)
 
-    def gram(column: torch.Tensor) -> torch.Tensor:
-        field = operator.couple(column)
-        return operator.couple_transpose(field.conj()).conj()
-
-    test = torch.zeros((n_coil, 0), dtype=torch.complex128, device=device)
-    sketch = torch.zeros_like(test)
-    while True:
-        width = min(block, n_coil - test.shape[1])
-        fresh = torch.complex(
-            torch.randn((n_coil, width), generator=generator, dtype=torch.float64),
-            torch.randn((n_coil, width), generator=generator, dtype=torch.float64),
-        ).to(device)
-        for _ in range(2):
-            fresh = fresh - test @ (test.conj().transpose(0, 1) @ fresh)
-        fresh, _ = torch.linalg.qr(fresh)
-        test = torch.cat([test, fresh], dim=1)
-        sketch = torch.cat(
-            [sketch, torch.stack([gram(fresh[:, k]) for k in range(width)], dim=1)],
-            dim=1,
+    def sample(cells: torch.Tensor, dofs: torch.Tensor | None) -> torch.Tensor:
+        return pfft.coupling_rows(
+            grid,
+            operator.coil,
+            operator.medium,
+            cells,
+            dofs=dofs,
+            linear=operator.coupling.linear,
+            **orders,
         )
-        vectors, values = _nystrom(test, sketch)
-        kept = values > (tol**2) * values[0]
+
+    points = 2 * math.ceil(rank ** (1.0 / 3.0))
+    cells = _chebyshev_cells(grid, points)
+    dofs = torch.sort(
+        torch.randperm(n_coil, generator=generator)[:rank].to(grid.device)
+    ).values
+    body_basis, _, _ = torch.linalg.svd(sample(region_cells, dofs), full_matrices=False)
+    coil_basis, _, _ = torch.linalg.svd(
+        sample(cells, None).conj().transpose(0, 1), full_matrices=False
+    )
+
+    def fit() -> tuple:
+        rows = _row_numbers(grid, cells, n_components)
+        core, body_map, coil_map = _fitted_core(
+            body_basis[rows], coil_basis[dofs], sample(cells, dofs)
+        )
+        u, values, vh = torch.linalg.svd(core, full_matrices=False)
+        held = _tail_rank(values, tol)
         _log.info(
-            "coupling range: %d coil currents sampled, %d singular values above %g",
-            test.shape[1],
-            int(kept.sum()),
-            tol,
+            "cross approximation: %d rows, %d columns, rank %d",
+            int(rows.numel()),
+            int(dofs.numel()),
+            held,
         )
-        if int(kept.sum()) <= test.shape[1] - block // 2 or test.shape[1] >= n_coil:
+        return u, values, vh, body_map, coil_map, held
+
+    kept = fit()
+    before, before_rank = kept[1], kept[5]
+    stalled = 0
+    for step in range(2, iterations + 1):
+        fresh_dofs = _outside(
+            torch.tensor(_maxvol(coil_basis), device=grid.device), dofs
+        )
+        fresh_cells = _outside(_chebyshev_cells(grid, points + 2 * (step - 1)), cells)
+        if fresh_dofs.numel() == 0 and fresh_cells.numel() == 0:
             break
-    singular = torch.sqrt(values[kept]).to(torch.complex128)
-    return vectors[:, kept], singular
+        if fresh_dofs.numel():
+            body_basis, _, _ = torch.linalg.svd(
+                torch.cat([body_basis, sample(region_cells, fresh_dofs)], dim=1),
+                full_matrices=False,
+            )
+            dofs = torch.sort(torch.cat([dofs, fresh_dofs])).values
+        if fresh_cells.numel():
+            coil_basis, _, _ = torch.linalg.svd(
+                torch.cat(
+                    [
+                        coil_basis,
+                        sample(fresh_cells, None).conj().transpose(0, 1),
+                    ],
+                    dim=1,
+                ),
+                full_matrices=False,
+            )
+            cells = torch.sort(torch.cat([cells, fresh_cells])).values
+
+        kept = fit()
+        singular, rank = kept[1], kept[5]
+        if _settled(before, singular, before_rank, rank, tol) or stalled >= stalls:
+            break
+        stalled = stalled + 1 if abs(rank - before_rank) < 2 else 0
+        before, before_rank = singular, rank
+
+    u, singular, vh, body_map, coil_map, rank = kept
+    body = body_basis @ (body_map @ (u[:, :rank] * singular[None, :rank]))
+    coil = (vh[:rank] @ coil_map.conj().transpose(0, 1)) @ coil_basis.conj().transpose(
+        0, 1
+    )
+    _log.info(
+        "cross approximation: rank %d from %d cells and %d coil unknowns, "
+        "leaving %.2e of the coupling's action",
+        rank,
+        int(cells.numel()),
+        int(dofs.numel()),
+        _missed(operator, body, coil, checks),
+    )
+    return body, coil, singular[:rank]
 
 
-def _nystrom(
-    test: torch.Tensor, sketch: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Give the eigenpairs of a PSD matrix from its action on orthonormal columns."""
-    shift = (
-        math.sqrt(test.shape[0])
-        * torch.finfo(torch.float64).eps
-        * float(torch.linalg.matrix_norm(sketch, ord=2))
+def _fitted_core(
+    body_rows: torch.Tensor, coil_rows: torch.Tensor, submatrix: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fit the coupling's core on a sampled submatrix, through pseudo-inverses.
+
+    Ported from the ``M`` of ``cross_cheb_2d.m``: the submatrix is taken into
+    the two bases' coordinates, each through the pseudo-inverse of its own rows
+    over the sample.
+
+    Returns
+    -------
+    core : torch.Tensor
+        The submatrix in the two bases' coordinates.
+    body_map, coil_map : torch.Tensor
+        What carries the core's factors back onto the bases.
+    """
+    exact = 1e-15
+    qu, su, vu = torch.linalg.svd(body_rows, full_matrices=False)
+    qv, sv, vv = torch.linalg.svd(coil_rows.conj().transpose(0, 1), full_matrices=False)
+    keep_u, keep_v = _tail_rank(su, exact), _tail_rank(sv, exact)
+    left = qu[:, :keep_u].conj().transpose(0, 1) / su[:keep_u, None].to(qu.dtype)
+    right = vv[:keep_v].conj().transpose(0, 1) / sv[None, :keep_v].to(qv.dtype)
+    return left @ submatrix @ right, vu[:keep_u].conj().transpose(0, 1), qv[:, :keep_v]
+
+
+def _settled(
+    before: torch.Tensor,
+    now: torch.Tensor,
+    before_rank: int,
+    rank: int,
+    tol: float,
+) -> bool:
+    """Whether the core's singular values have stopped moving.
+
+    Ported from ``Frobenius_termination_criteria``: what the spectrum moved
+    between rounds, together with what the new rank added to it, against ``tol``
+    of its norm.
+    """
+    if before.numel() == 0:
+        return False
+    common = min(rank, before_rank, int(before.numel()), int(now.numel()))
+    moved = torch.linalg.vector_norm(before[:common] - now[:common])
+    fresh = (
+        torch.linalg.vector_norm(now[common:rank])
+        if before_rank < rank
+        else torch.zeros((), dtype=moved.dtype, device=moved.device)
     )
-    shifted = sketch + shift * test
-    core = test.conj().transpose(0, 1) @ shifted
-    core = 0.5 * (core + core.conj().transpose(0, 1))
-    lower = torch.linalg.cholesky(core)
-    factor = torch.linalg.solve_triangular(
-        lower.conj().transpose(0, 1), shifted, upper=True, left=False
-    )
-    vectors, singular, _ = torch.linalg.svd(factor, full_matrices=False)
-    values = torch.clamp(singular**2 - shift, min=0.0)
-    return vectors, values
+    reached = torch.sqrt(moved**2 + fresh**2)
+    return bool(tol * torch.linalg.vector_norm(now[:rank]) > reached)
+
+
+def _outside(candidate: torch.Tensor, held: torch.Tensor) -> torch.Tensor:
+    """Those of ``candidate`` that ``held`` does not already carry."""
+    fresh = torch.unique(candidate)
+    if held.numel() == 0:
+        return fresh
+    return fresh[~torch.isin(fresh, held)]
+
+
+def _missed(
+    operator: CoupledOperator,
+    body: torch.Tensor,
+    coil: torch.Tensor,
+    checks: int,
+) -> float:
+    """Give what the approximated coupling leaves of the operator's own, at worst.
+
+    The coupling through the operator is what the approximation has to hold, so
+    that is what it is measured against, on random coil currents.
+    """
+    generator = torch.Generator().manual_seed(1)
+    shape = (operator.n_coil,)
+    worst = 0.0
+    for _ in range(checks):
+        current = torch.complex(
+            torch.randn(shape, generator=generator, dtype=torch.float64),
+            torch.randn(shape, generator=generator, dtype=torch.float64),
+        ).to(body.device)
+        whole = operator.couple(current)
+        held = body @ (coil @ current)
+        worst = max(
+            worst,
+            float(
+                torch.linalg.vector_norm(whole - held) / torch.linalg.vector_norm(whole)
+            ),
+        )
+    return worst
 
 
 def _tail_rank(singular: torch.Tensor, tol: float) -> int:

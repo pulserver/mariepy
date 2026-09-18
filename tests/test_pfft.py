@@ -345,3 +345,28 @@ def test_a_coil_whose_basis_sits_within_three_voxels_does_not_warn(device):
         warnings.simplefilter("always")
         _assembled(body, coil, _medium())
     assert not [entry for entry in caught if "voxels" in str(entry.message)]
+
+
+@pytest.mark.parametrize("linear", [False, True], ids=["constant", "linear"])
+def test_directly_integrated_coupling_rows_are_the_operator_s_own(linear, device):
+    from mariepy.system import CoupledOperator
+
+    body = _body(device)
+    coil = _coil(device, n_around=24)
+    medium = _medium()
+    system = sie.assemble(coil, medium)
+    coupling = _assembled(body, coil, medium, linear=linear)
+    operator = CoupledOperator(
+        body=body, coil=coil, medium=medium, system=system, coupling=coupling
+    )
+    grid = coupling.grid
+    cells = torch.nonzero(grid.mask.reshape(-1), as_tuple=True)[0]
+    order = torch.argsort(pfft.body_numbering(grid)[cells])
+    rows = pfft.coupling_rows(grid, coil, medium, cells[order], linear=linear)
+
+    for dof in (0, coil.n_dof // 3, coil.n_dof - 1):
+        unit = torch.zeros(coil.n_dof, dtype=torch.complex128, device=grid.device)
+        unit[dof] = 1.0
+        through = operator.couple(unit)
+        error = (through - rows[:, dof]).abs().max() / through.abs().max()
+        assert float(error) <= PROJECTION_ERROR

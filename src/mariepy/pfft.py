@@ -45,6 +45,7 @@ __all__ = [
     "NearLists",
     "assemble",
     "coil_precorrection",
+    "coupling_rows",
     "direct_coupling",
     "expansion_response",
     "extended_domain",
@@ -675,6 +676,83 @@ def direct_coupling(
             index, torch.cat(magnetic_values), shape, check_invariants=False
         ).coalesce(),
     )
+
+
+def coupling_rows(
+    grid: ExtendedGrid,
+    coil: Coil,
+    medium: Medium,
+    cells: torch.Tensor,
+    *,
+    dofs: torch.Tensor | None = None,
+    triangle_order: int = 4,
+    cell_order: int = 2,
+    linear: bool = False,
+    chunk: int = 1 << 20,
+) -> torch.Tensor:
+    """Integrate the coupling to named cells of a grid, densely, for every basis function.
+
+    These are rows of ``Zbc``, taken as :func:`direct_coupling` takes its near
+    entries and by the same quadrature, at whatever distance the cells lie: no
+    projection and no convolution enter, so a row costs one kernel evaluation
+    per basis function.
+
+    Parameters
+    ----------
+    grid
+        The extended grid.
+    coil
+        The coil and its basis.
+    medium
+        Supplies the wavenumber.
+    cells
+        Flat indices of the cells to take, as :func:`body_numbering` numbers
+        the grid.
+    dofs
+        Which basis functions to take, or None for every one.
+    triangle_order, cell_order
+        Quadrature orders, as :func:`direct_coupling` takes them.
+    linear
+        Couple to the cells' piecewise-linear basis.
+    chunk
+        Basis-function-and-cell pairs taken at a time.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(c * len(cells), len(dofs))`` with ``c`` 3 or 12, complex, the
+        rows running component-major over ``cells`` as the body's unknowns run
+        over its own.
+    """
+    volume = grid.resolution**3
+    terms = range(4) if linear else range(1)
+    n_components = 3 * len(terms)
+    points = grid.centres(unflatten(grid, cells))
+    n_cells = points.shape[0]
+    taken = torch.arange(coil.n_dof, device=grid.device) if dofs is None else dofs
+    n_taken = int(taken.numel())
+    out = torch.zeros(
+        (3, len(terms), n_cells, n_taken),
+        dtype=torch.complex128,
+        device=grid.device,
+    )
+    arguments = {
+        "order": triangle_order,
+        "cell_size": grid.resolution,
+        "cell_order": cell_order,
+    }
+    stride = max(1, chunk // max(1, n_cells))
+    for start in range(0, n_taken, stride):
+        width = min(stride, n_taken - start)
+        paired = taken[start : start + width].repeat_interleave(n_cells)
+        seen = points.repeat(width, 1)
+        for index, term in enumerate(terms):
+            field = _field(
+                coil, paired, seen, medium, magnetic=False, basis_term=term, **arguments
+            )
+            field = field.reshape(width, n_cells, 3).permute(2, 1, 0)
+            out[:, index, :, start : start + width] = volume * field
+    return out.reshape(n_components * n_cells, n_taken)
 
 
 def projected_coupling(
