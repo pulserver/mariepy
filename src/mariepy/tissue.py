@@ -16,6 +16,10 @@ conductivity, ``sigma = -w eps_0 Im eps*``. The parameters of that model are
 measured numbers, so they are read from a file rather than written here: a table
 is the head-model pipeline's output alongside the labels it names, and
 :func:`read_table` states the columns it must carry.
+
+A segmentation that gives each voxel the fraction every tissue fills, as
+BrainWeb's fuzzy models do, is averaged onto a coarser grid by :func:`coarsen`
+and made a body by :func:`mix`.
 """
 
 from __future__ import annotations
@@ -34,7 +38,9 @@ __all__ = [
     "LabelledBody",
     "Tissue",
     "build",
+    "coarsen",
     "dielectric",
+    "mix",
     "read_table",
 ]
 
@@ -273,4 +279,154 @@ def build(
         ),
         density=density,
         tissues=labels,
+    )
+
+
+def coarsen(
+    fractions: torch.Tensor, factor: int, *, background: int = 0
+) -> torch.Tensor:
+    """Average a volume of tissue fractions over cubes ``factor`` voxels a side.
+
+    The volume is padded with ``background`` to a whole number of cubes along
+    each axis, so no tissue at its far faces is dropped. Coarse voxel
+    ``(i, j, k)`` is the cube whose first fine voxel is ``factor * (i, j, k)``,
+    so its centre lies ``(factor - 1) / 2`` fine voxels past that voxel's
+    centre along each axis.
+
+    Parameters
+    ----------
+    fractions
+        The fraction of each voxel every label fills, shape
+        ``(n1, n2, n3, n_labels)``, label ``k`` in column ``k``.
+    factor
+        Fine voxels along each side of a cube.
+    background
+        The label that fills the padding.
+
+    Returns
+    -------
+    torch.Tensor
+        Shape ``(ceil(n1 / factor), ceil(n2 / factor), ceil(n3 / factor),
+        n_labels)``.
+
+    Raises
+    ------
+    ValueError
+        ``factor`` is not positive, or ``background`` is not a column.
+    """
+    if factor < 1:
+        raise ValueError(f"a cube is at least one voxel a side, got {factor}")
+    n_labels = fractions.shape[-1]
+    if not 0 <= background < n_labels:
+        raise ValueError(f"label {background} is not one of the {n_labels} columns")
+    shape = fractions.shape[:3]
+    padded_shape = tuple(-(-n // factor) * factor for n in shape)
+    padded = fractions.new_zeros((*padded_shape, n_labels))
+    padded[..., background] = 1.0
+    padded[: shape[0], : shape[1], : shape[2]] = fractions
+    coarse = tuple(n // factor for n in padded_shape)
+    blocks = padded.reshape(
+        coarse[0], factor, coarse[1], factor, coarse[2], factor, n_labels
+    )
+    return blocks.mean(dim=(1, 3, 5))
+
+
+def mix(
+    fractions: torch.Tensor,
+    table: dict[int, Tissue],
+    medium: Medium,
+    resolution: float,
+    *,
+    origin: tuple[float, float, float] | None = None,
+    background=(0,),
+    threshold: float = 0.5,
+) -> LabelledBody:
+    """Turn a volume of tissue fractions into a body at one frequency.
+
+    A voxel is body when the labels the table names fill at least
+    ``threshold`` of it. Its relative permittivity, conductivity and density
+    are the means of those labels' own, weighted by the fraction each fills;
+    the background's share is left out of the means, so a voxel at the surface
+    is tissue or free space, not a blend of the two. Every label that fills
+    any voxel must be one the table or ``background`` names, as :func:`build`
+    requires of a label volume.
+
+    Parameters
+    ----------
+    fractions
+        The fraction of each voxel every label fills, shape
+        ``(n1, n2, n3, n_labels)``, label ``k`` in column ``k``.
+    table
+        From :func:`read_table`.
+    medium
+        Supplies the frequency the properties are evaluated at.
+    resolution
+        Voxel pitch in metres.
+    origin
+        Coordinates of voxel ``(0, 0, 0)``; the grid is centred by default.
+    background
+        The labels that mean free space.
+    threshold
+        The share of a voxel the named labels must fill for it to be body.
+
+    Returns
+    -------
+    LabelledBody
+        The body, its densities, and the label filling the largest share of
+        each body voxel, ``background[0]`` elsewhere.
+
+    Raises
+    ------
+    ValueError
+        A label that fills some voxel is neither in the table nor background,
+        or no voxel reaches the threshold.
+    """
+    shape = tuple(fractions.shape[:3])
+    n_labels = fractions.shape[-1]
+    filling = fractions.reshape(-1, n_labels).amax(dim=0) > 0
+    present = {int(label) for label in torch.nonzero(filling).flatten()}
+    unnamed = sorted(present - set(table) - set(background))
+    if unnamed:
+        raise ValueError(
+            f"the volume carries labels the table does not name: "
+            f"{', '.join(str(label) for label in unnamed)}"
+        )
+    named = sorted(label for label in table if label < n_labels)
+    device = fractions.device
+    weights = fractions[..., named].to(torch.float64)
+    filled = weights.sum(dim=-1)
+    mask = filled >= threshold
+    if not bool(mask.any()):
+        raise ValueError(
+            f"no voxel is filled to {threshold} by the labels the table names"
+        )
+    properties = torch.tensor(
+        [
+            [
+                *(
+                    float(value)
+                    for value in dielectric(table[label].dispersion, medium.frequency)
+                ),
+                table[label].density,
+            ]
+            for label in named
+        ],
+        dtype=torch.float64,
+        device=device,
+    )
+    share = weights / filled.clamp_min(torch.finfo(torch.float64).tiny)[..., None]
+    permittivity, conductivity, density = torch.unbind(share @ properties, dim=-1)
+    labels = torch.tensor(named, device=device)[weights.argmax(dim=-1)]
+    if origin is None:
+        origin = tuple(-0.5 * (size - 1) * resolution for size in shape)
+    return LabelledBody(
+        body=VoxelBody(
+            permittivity=torch.where(mask, permittivity, 1.0),
+            conductivity=torch.where(mask, conductivity, 0.0),
+            mask=mask,
+            resolution=resolution,
+            origin=origin,
+        ),
+        density=torch.where(mask, density, 0.0),
+        tissues=torch.where(mask, labels, int(background[0])),
     )

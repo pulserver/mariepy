@@ -62,6 +62,40 @@ def test_two_loops_in_one_file_are_two_loops(tmp_path):
     assert coil.ports[0].dofs.tolist() == [11, 6]
 
 
+def test_each_loop_of_an_array_is_a_closed_wire_with_a_port_of_its_own():
+    centres = [[0.0, 0.0, 0.1], [0.1, 0.0, 0.0], [0.0, -0.1, 0.0]]
+    normals = [[0.0, 0.0, 2.0], [1.0, 0.0, 0.0], [0.0, -1.0, 0.0]]
+
+    coil = WireCoil.loops(centres, normals, 0.03, 10)
+
+    assert coil.loops == ((0, 10), (10, 20), (20, 30))
+    assert coil.closed == (True, True, True)
+    assert coil.n_driven == 3
+    assert [port.dofs.tolist() for port in coil.ports] == [[0, 1], [10, 11], [20, 21]]
+    for loop, (centre, normal) in enumerate(zip(centres, normals, strict=True)):
+        nodes = coil.centre[10 * loop : 10 * (loop + 1)]
+        offset = nodes - torch.tensor(centre, dtype=torch.float64)
+        axis = torch.tensor(normal, dtype=torch.float64)
+        axis = axis / torch.linalg.vector_norm(axis)
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(offset, dim=1),
+            torch.full((10,), 0.03, dtype=torch.float64),
+        )
+        torch.testing.assert_close(
+            offset @ axis, torch.zeros(10, dtype=torch.float64), rtol=0, atol=1e-15
+        )
+        # Counterclockwise about the axis: each node's offset turns into the next's.
+        turning = torch.linalg.cross(offset, offset.roll(-1, dims=0)) @ axis
+        assert bool((turning > 0).all())
+
+
+def test_loops_need_one_nonzero_normal_each():
+    with pytest.raises(ValueError, match="alike"):
+        WireCoil.loops([[0.0, 0.0, 0.0]], [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0]], 0.03, 8)
+    with pytest.raises(ValueError, match="nonzero"):
+        WireCoil.loops([[0.0, 0.0, 0.0]], [[0.0, 0.0, 0.0]], 0.03, 8)
+
+
 def test_an_open_wire_carries_a_basis_function_at_each_interior_node():
     nodes = torch.rand(5, 3, dtype=torch.float64)
     segments = [(0, 1), (1, 2), (2, 3), (3, 4)]

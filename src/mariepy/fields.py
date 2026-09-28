@@ -21,6 +21,7 @@ from dataclasses import dataclass
 import torch
 
 from mariepy import vie
+from mariepy.constants import Medium
 from mariepy.system import CoupledOperator, ShieldedOperator
 
 __all__ = [
@@ -28,6 +29,7 @@ __all__ = [
     "absorbed_power",
     "at_centres",
     "circular_components",
+    "combine",
     "compute",
     "delivered_power",
     "power_balance",
@@ -127,6 +129,40 @@ def compute(
     )
 
 
+def combine(fields: Fields, weights: torch.Tensor) -> Fields:
+    """Give the fields of drives that each combine the ports' own.
+
+    Drive ``k`` excites port ``j`` with ``weights[j, k]`` times the unit drive
+    its own field was computed for, so its field is
+    ``sum_j weights[j, k] * field_j``. Port ``j``'s field from a solve is the
+    one a unit voltage across it drives with every other port shorted, so the
+    port impedance matrix as ``weights`` gives the fields of a unit current
+    into each port with the others open.
+
+    Parameters
+    ----------
+    fields
+        One entry per port, shape ``(n_ports, ...)`` throughout.
+    weights
+        Shape ``(n_ports, n_drives)``.
+
+    Returns
+    -------
+    Fields
+        One entry per drive.
+    """
+
+    def mixed(field: torch.Tensor) -> torch.Tensor:
+        return torch.einsum("jk,j...->k...", weights.to(field), field)
+
+    return Fields(
+        electric=mixed(fields.electric),
+        magnetic=mixed(fields.magnetic),
+        incident=mixed(fields.incident),
+        scattered=mixed(fields.scattered),
+    )
+
+
 def absorbed_power(operator: CoupledOperator, fields: Fields) -> torch.Tensor:
     """Integrate the ohmic loss of the electric field over the body.
 
@@ -213,14 +249,15 @@ def power_balance(
 
 
 def circular_components(
-    operator: CoupledOperator, fields: Fields
+    operator: CoupledOperator | Medium, fields: Fields
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Give the transmit and receive circular components of the magnetic field.
 
     Parameters
     ----------
     operator
-        Supplies the permeability of free space.
+        The operator the fields were solved with, or the medium itself;
+        supplies the permeability of free space.
     fields
         The fields the ports drive.
 
@@ -232,7 +269,7 @@ def circular_components(
     minus : torch.Tensor
         ``B1-``, same shape.
     """
-    permeability = operator.medium.permeability
+    permeability = getattr(operator, "medium", operator).permeability
     centres = at_centres(fields.magnetic)
     transverse = centres[..., 0, :, :, :], centres[..., 1, :, :, :]
     return (

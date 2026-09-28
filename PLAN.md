@@ -65,9 +65,30 @@ The unit must be the same for every channel. Channel order is the coil model's.
 | `mariepy_version` | Version that wrote the file |
 | `data_licence` | Licence of the file, set by its body models |
 
-Today `read_vops` reads a single (Nc, Nc) global matrix and no metadata. The
-stacked global matrices and the metadata need a pypulseqpp release that reads
-them.
+pypulseqpp's `read_vops` reads the file of one body model, whose
+`global_matrix` is (1, Nc, Nc), and leaves the metadata unread. A file of
+several body models needs a pypulseqpp that checks each body's head-average
+SAR.
+
+## Field maps
+
+A map file (`maps.write`, `maps.read`) is a NumPy `.npz` archive holding, for
+every channel of one coil, the two circular components of its magnetic flux
+density over the body's grid, for a simulator that needs transmit and receive
+fields rather than SAR.
+
+| Entry | Shape and type | Meaning |
+|---|---|---|
+| `plus`, `minus` | (Nc, n1, n2, n3), complex64 | μ0(Hx + jHy) and μ0(Hx − jHy) at the voxel centres, in tesla per unit drive, zero outside the body |
+| `mask` | (n1, n2, n3), bool | The voxels that carry tissue |
+| `metadata` | JSON string | Coil, channels, frequency, drive unit, `origin`, `resolution`, `frame`, bodies, version, licence |
+
+With the time dependence exp(+jωt), `plus` is twice the complex amplitude of
+the part of the field rotating counterclockwise about +z, and `minus` twice
+that of the clockwise part. The file does not name either one transmit or
+receive: which rotation excites a nucleus depends on the sign of its
+gyromagnetic ratio and on the sense of the static field along z, which belong
+to the reader. Voxel (i, j, k) is centred at `origin + resolution · (i, j, k)`.
 
 ## MARIE port
 
@@ -613,6 +634,16 @@ section says. It is described here so the solver's interfaces serve it.
 
 **Head models.**
 
+- **BrainWeb.** The normal brain of BrainWeb's fuzzy models gives each 1 mm
+  voxel the fraction every one of its ten classes fills. `tissue.coarsen`
+  averages the fractions onto the solver's grid and `tissue.mix` makes the
+  body: a voxel the named classes fill to one half is tissue, with the
+  fraction-weighted mean properties of its classes. `examples/brainweb.py`
+  solves it at 5 mm in a body coil and three head arrays for pulserver's
+  virtual scanner, and `examples/brainweb_tissues.csv` names its classes:
+  Gabriel's parameters as the IFAC implementation of the 1996 model tabulates
+  them, checked against the values published at 900 MHz, glial matter as grey
+  matter and connective tissue as dura.
 - **Source.** IXI T1 and T2 volumes, downloaded with torchio's `ixi()`, which
   fetches the raw tarballs without preprocessing.
 - **Bone.** From a pseudo-CT predicted by mr-to-pct (Apache-2.0 code, CC BY 4.0
@@ -676,3 +707,23 @@ section says. It is described here so the solver's interfaces serve it.
 
 **Head-average matrices.** One per body model, integrated over that model's head
 mass, in the stacked layout of the output contract.
+
+**Coils for a head in a scanner.**
+
+- **Body coil.** Its conductors are far enough from a head that their field
+  there is the coil's own, so it enters as the two linear modes of an
+  infinitely long birdcage, `incident.birdcage`: the transverse-magnetic
+  cylindrical wave whose electric field is J1(k0ρ) along z, a free-space
+  solution, solved against the body by `solver.solve_incident`. A head model
+  leaves out the torso that loads a real body coil.
+- **Arrays.** `WireCoil.loops` builds circular loops with a port each.
+  `fields.combine` with the port impedance matrix turns the solve's fields,
+  each a unit voltage across one port with the others shorted, into a unit
+  current into each port with the others open: the preamplifier-decoupled
+  idealisation of a receive array, and the drive a transmit array's VOPs are
+  written for.
+- **Basis.** A transmit coil is solved in the piecewise-linear basis, because
+  on Hugo the constant basis gives 30 to 35% less absorbed power at 4 to 6 mm
+  while the linear one has settled (issue #25). A receive array needs only its
+  magnetic field, where the two bases agree within 4%, so it takes the
+  constant basis.

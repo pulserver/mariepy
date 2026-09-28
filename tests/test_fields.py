@@ -289,3 +289,29 @@ def test_refining_a_constant_field_repeats_each_cell(device):
 def test_a_refinement_needs_at_least_one_sub_cell(device):
     with pytest.raises(ValueError, match="at least one sub-cell"):
         fields.refine(_coefficients(device), 0)
+
+
+def test_combined_drives_weigh_each_port_s_field_by_their_own_column(device):
+    generator = torch.Generator(device="cpu").manual_seed(3)
+
+    def draw(*shape):
+        real, imaginary = torch.randn(
+            (2, *shape), generator=generator, dtype=torch.float64
+        )
+        return torch.complex(real, imaginary).to(device)
+
+    ports = fields.Fields(
+        electric=draw(3, 12, 2, 2, 2),
+        magnetic=draw(3, 12, 2, 2, 2),
+        incident=draw(3, 12, 2, 2, 2),
+        scattered=draw(3, 12, 2, 2, 2),
+    )
+    weights = draw(3, 2)
+
+    drives = fields.combine(ports, weights)
+
+    for name in ("electric", "magnetic", "incident", "scattered"):
+        given = getattr(ports, name)
+        for drive in range(2):
+            want = sum(weights[port, drive] * given[port] for port in range(3))
+            torch.testing.assert_close(getattr(drives, name)[drive], want)

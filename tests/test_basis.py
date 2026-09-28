@@ -11,7 +11,7 @@ from mariepy.body import VoxelBody
 from mariepy.coil import Port, SurfaceCoil
 from mariepy.constants import Medium
 from mariepy.mesh import SurfaceMesh
-from mariepy.solver import BodyOperator, solve_body
+from mariepy.solver import BodyOperator, solve_body, solve_incident
 
 ORDERS = {"far_order": 2, "medium_order": 2, "near_order": 4}
 TOLERANCE = 1e-9
@@ -653,3 +653,26 @@ def test_a_basis_without_a_support_surface_has_no_ideal_pattern():
     )
     with pytest.raises(ValueError, match="support surface"):
         basis_module.ideal_currents(basis, body, Medium(3.0), torch.zeros(3))
+
+
+def test_the_body_solved_for_the_basis_incident_fields_gives_the_basis_fields(solved):
+    """The incident-field solve against the basis solve, which the coil solve checks."""
+    medium, body, _, field_basis, linear = solved
+    total = solve_incident(
+        body,
+        medium,
+        body.from_dof(field_basis.incident_electric[:2]),
+        body.from_dof(field_basis.incident_magnetic[:2]),
+        tol=TOLERANCE,
+        linear=linear,
+        **ORDERS,
+    )
+    torch.testing.assert_close(
+        body.to_dof(total.electric), field_basis.electric[:2], rtol=1e-7, atol=1e-12
+    )
+    torch.testing.assert_close(
+        body.to_dof(total.magnetic), field_basis.magnetic[:2], rtol=1e-7, atol=1e-12
+    )
+    torch.testing.assert_close(
+        total.incident + total.scattered, total.electric, rtol=0, atol=1e-15
+    )
