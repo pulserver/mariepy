@@ -246,6 +246,7 @@ def _cycle(
 
     for k in range(1, restart + 1):
         w = apply_prec(operator(basis[k - 1]))
+        product = torch.linalg.vector_norm(w)
         projection = (basis[:k] @ w.conj()).conj()
         hessenberg[:k, k - 1] = projection
         w = w - basis[:k].transpose(0, 1) @ projection
@@ -256,9 +257,12 @@ def _cycle(
         y, defect = _least_squares(hessenberg[: k + 1, :k], beta)
         history.append(torch.linalg.vector_norm(defect))
 
-        # A vanishing subdiagonal means the Krylov space is invariant and the
-        # iterate this step gives is exact; dividing by it would give NaN.
-        if subdiagonal <= torch.finfo(residual.real.dtype).eps * beta:
+        # A subdiagonal at the rounding of the product it was orthogonalised
+        # from means the Krylov space is invariant, and the iterate this step
+        # gives is the best it holds. The residual the next cycle starts from
+        # still has its part along w, which has no direction when w is zero.
+        if subdiagonal <= torch.finfo(residual.real.dtype).eps * product:
+            basis[k] = w / subdiagonal if subdiagonal > 0 else 0.0
             break
         basis[k] = w / subdiagonal
 

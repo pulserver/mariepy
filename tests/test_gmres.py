@@ -98,6 +98,44 @@ def test_gmres_exits_on_a_breakdown_rather_than_dividing_by_zero(device):
     assert torch.allclose(solution.x, b / diagonal, atol=1e-13)
 
 
+def test_scaling_the_right_hand_side_scales_the_iterate_and_nothing_else(device):
+    """A power of two scales every product exactly, so the iterations are the same."""
+    matrix, exact = _system(40, device, conditioning=3.0)
+    b = matrix @ exact
+    scale = 2.0**50
+
+    unit = gmres(lambda v: matrix @ v, b, tol=1e-10, restart=40)
+    scaled = gmres(lambda v: matrix @ v, scale * b, tol=1e-10, restart=40)
+
+    assert (scaled.inner, scaled.restarts) == (unit.inner, unit.restarts)
+    assert torch.equal(scaled.x, scale * unit.x)
+    assert torch.equal(scaled.residuals, unit.residuals)
+
+
+def test_a_breakdown_short_of_the_tolerance_restarts_from_the_residual_it_left(
+    device, monkeypatch
+):
+    """The Krylov space of a singular operator closes before the residual is small.
+
+    Storage the solver allocates reads as NaN here, so no step may read a
+    Krylov vector it did not write.
+    """
+    empty = torch.empty
+    monkeypatch.setattr(
+        torch, "empty", lambda *a, **k: empty(*a, **k).fill_(float("nan"))
+    )
+    diagonal = torch.tensor([1.0, 2.0, 0.0], dtype=torch.complex128, device=device)
+    b = torch.tensor([1.0, 0.0, 1.0], dtype=torch.complex128, device=device)
+
+    solution = gmres(lambda v: diagonal * v, b, tol=1e-12, restart=3, maxit=3)
+
+    assert not solution.converged
+    torch.testing.assert_close(
+        solution.x, torch.tensor([1.0, 0.0, 0.0], dtype=b.dtype, device=device)
+    )
+    assert float(solution.residuals[-1]) == pytest.approx(2**-0.5)
+
+
 def test_gmres_returns_immediately_for_a_zero_right_hand_side(device):
     n = 8
     diagonal = torch.arange(1, n + 1, dtype=torch.float64, device=device).to(
