@@ -31,8 +31,11 @@ __all__ = [
     "PortSolution",
     "Result",
     "assemble_coil",
+    "magnetic_kernel",
+    "scattered_magnetic",
     "solve",
     "solve_body",
+    "solve_incident",
     "solve_ports",
 ]
 
@@ -226,6 +229,140 @@ def solve_body(
         tol=tol,
         restart=restart,
         maxit=maxit,
+    )
+
+
+def magnetic_kernel(
+    body: VoxelBody,
+    medium: Medium,
+    *,
+    tol: float = 1e-7,
+    far_order: int = 4,
+    medium_order: int = 8,
+    near_order: int = 15,
+    linear: bool = False,
+) -> tuple:
+    """Assemble and compress the K kernel that gives a current's magnetic field.
+
+    Parameters
+    ----------
+    body
+        The grid to build the kernel on.
+    medium
+        Supplies the wavenumber.
+    tol
+        Relative tolerance of the Tucker compression.
+    far_order, medium_order, near_order
+        Quadrature orders for the three regimes.
+    linear
+        Assemble the kernel of the piecewise-linear basis.
+
+    Returns
+    -------
+    tuple
+        The compressed kernel, as :func:`scattered_magnetic` takes it.
+    """
+    kernel = vie.kernel_k(
+        body.shape,
+        body.resolution,
+        medium.wavenumber,
+        far_order=far_order,
+        medium_order=medium_order,
+        near_order=near_order,
+        linear=linear,
+    )
+    return circulant_tucker(kernel.to(body.device), tol)
+
+
+def scattered_magnetic(
+    kernel: tuple, body: VoxelBody, current: torch.Tensor
+) -> torch.Tensor:
+    """Return the magnetic field a solved polarisation current puts in the body.
+
+    Parameters
+    ----------
+    kernel
+        From :func:`magnetic_kernel`.
+    body
+        The body the current was solved in.
+    current
+        The solution vector, shape ``(c * n_voxels,)`` with ``c`` 3 or 12.
+
+    Returns
+    -------
+    torch.Tensor
+        The field in A/m over the grid, shape ``(c, n1, n2, n3)``, zero outside
+        the mask.
+    """
+    polarisation = body.from_dof(current)
+    field = vie.apply_inverse_g(vie.apply_k(kernel, polarisation), body.resolution)
+    return body.mask * field
+
+
+def solve_incident(
+    body: VoxelBody,
+    medium: Medium,
+    electric: torch.Tensor,
+    magnetic: torch.Tensor,
+    *,
+    tol: float = 1e-5,
+    kernel_tol: float = 1e-7,
+    far_order: int = 4,
+    medium_order: int = 8,
+    near_order: int = 15,
+    linear: bool = False,
+    precision: str = "double",
+) -> Fields:
+    """Solve the body under each of several incident fields, and give the total fields.
+
+    Parameters
+    ----------
+    body
+        The body and its grid.
+    medium
+        The frequency to solve at.
+    electric, magnetic
+        The incident electric field in V/m and magnetic field in A/m, shape
+        ``(n_fields, 3, n1, n2, n3)``, or ``(n_fields, 12, n1, n2, n3)`` in the
+        linear basis, as :func:`mariepy.incident.birdcage` gives one of each.
+    tol
+        Target for the relative residual of each solve.
+    kernel_tol
+        Relative tolerance of the kernels' Tucker compression.
+    far_order, medium_order, near_order
+        Quadrature orders of the body kernels.
+    linear
+        Give the body the piecewise-linear basis.
+    precision
+        ``"double"`` or ``"mixed"``, as :func:`solve_body` takes it.
+
+    Returns
+    -------
+    Fields
+        One entry per incident field, zero outside the body: the total fields,
+        the incident electric field, and the part of it the body scatters.
+    """
+    orders = {
+        "far_order": far_order,
+        "medium_order": medium_order,
+        "near_order": near_order,
+    }
+    operator = BodyOperator.build(body, medium, tol=kernel_tol, linear=linear, **orders)
+    kernel = magnetic_kernel(body, medium, tol=kernel_tol, linear=linear, **orders)
+    total_electric, total_magnetic = [], []
+    for driving, driving_magnetic in zip(electric, magnetic, strict=True):
+        current = solve_body(operator, driving, tol=tol, precision=precision).x
+        total_electric.append(operator.total_field(current, driving))
+        total_magnetic.append(
+            body.mask * driving_magnetic + scattered_magnetic(kernel, body, current)
+        )
+    total = torch.stack(total_electric)
+    incident = body.mask * electric
+    return Fields(
+        electric=total,
+        magnetic=torch.stack(total_magnetic),
+        incident=incident,
+        scattered=total - incident,
     )
 
 

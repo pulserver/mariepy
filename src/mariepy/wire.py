@@ -351,6 +351,97 @@ class WireCoil:
             )
         return cls.build(nodes, segments, list(at), elements, radius=radius)
 
+    @classmethod
+    def loops(
+        cls,
+        centres,
+        normals,
+        loop_radius: float,
+        n_segments: int,
+        *,
+        radius: float = WIRE_RADIUS,
+        device: torch.device | str = "cpu",
+    ) -> WireCoil:
+        """Build circular loops, each with a driven port of its own.
+
+        Loop ``i`` lies in the plane through ``centres[i]`` normal to
+        ``normals[i]``, and its port, the ``i``-th, sits on its first segment.
+        Its nodes run counterclockwise seen from the tip of its normal, the
+        sense its basis takes a positive current in.
+
+        Parameters
+        ----------
+        centres
+            Loop centres in metres, shape ``(n_loops, 3)``.
+        normals
+            Loop axes, shape ``(n_loops, 3)``; normalised here.
+        loop_radius
+            Radius of every loop in metres.
+        n_segments
+            Segments around each loop.
+        radius
+            Wire radius in metres.
+        device
+            Device the geometry is built on.
+
+        Returns
+        -------
+        WireCoil
+            The loops, as many ports as loops, in their order.
+
+        Raises
+        ------
+        ValueError
+            The two arrays differ in shape, or a normal is zero.
+        """
+        centres = torch.as_tensor(centres, dtype=torch.float64)
+        normals = torch.as_tensor(normals, dtype=torch.float64)
+        if centres.shape != normals.shape or centres.ndim != 2 or centres.shape[1] != 3:
+            raise ValueError(
+                f"centres and normals are (n_loops, 3) alike, got "
+                f"{tuple(centres.shape)} and {tuple(normals.shape)}"
+            )
+        length = torch.linalg.vector_norm(normals, dim=1, keepdim=True)
+        if bool((length == 0).any()):
+            raise ValueError("a loop needs a normal of nonzero length")
+        axis = normals / length
+        # Any direction not along the axis gives the loop's first in-plane unit.
+        guide = torch.eye(3, dtype=torch.float64)[axis.abs().argmin(dim=1)]
+        first = torch.linalg.cross(axis, guide)
+        first = first / torch.linalg.vector_norm(first, dim=1, keepdim=True)
+        second = torch.linalg.cross(axis, first)
+        angle = torch.arange(n_segments, dtype=torch.float64) * (
+            2 * math.pi / n_segments
+        )
+        nodes = centres[:, None, :] + loop_radius * (
+            torch.cos(angle)[None, :, None] * first[:, None, :]
+            + torch.sin(angle)[None, :, None] * second[:, None, :]
+        )
+        n_loops = centres.shape[0]
+        segments = [
+            (loop * n_segments + k, loop * n_segments + (k + 1) % n_segments)
+            for loop in range(n_loops)
+            for k in range(n_segments)
+        ]
+        elements = tuple(
+            Port(
+                tag=loop + 1,
+                kind="port",
+                load="none",
+                value=0.0,
+                quality=1.0,
+                voltage=1.0,
+            )
+            for loop in range(n_loops)
+        )
+        return cls.build(
+            nodes.reshape(-1, 3).to(device),
+            segments,
+            [loop * n_segments for loop in range(n_loops)],
+            elements,
+            radius=radius,
+        )
+
 
 # --------------------------------------------------------------------------
 # The wire's own system

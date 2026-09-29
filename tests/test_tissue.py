@@ -1,6 +1,7 @@
 """Tissue properties, and the body a labelled volume makes."""
 
 import cmath
+from pathlib import Path
 
 import pytest
 import torch
@@ -285,3 +286,105 @@ def test_the_dispersion_gives_the_properties_a_head_model_carries(name):
     )
     assert float(permittivity) == pytest.approx(want_permittivity, rel=5e-3)
     assert float(conductivity) == pytest.approx(want_conductivity, rel=1e-2)
+
+
+# -- tissue fractions ---------------------------------------------------------
+
+
+def _fractions(device):
+    """A 4 x 4 x 4 volume of background (0), muscle (1) and fat (2)."""
+    fractions = torch.zeros((4, 4, 4, 3), dtype=torch.float64, device=device)
+    fractions[..., 0] = 1.0
+    fractions[1:3, 1:3, 1:3] = torch.tensor([0.0, 0.75, 0.25], device=device)
+    fractions[0, 0, 0] = torch.tensor([0.6, 0.0, 0.4], device=device)
+    return fractions
+
+
+def test_coarsening_averages_each_cube_and_pads_the_volume_with_background(device):
+    fractions = torch.rand((5, 4, 3, 3), dtype=torch.float64, device=device)
+    fractions /= fractions.sum(dim=-1, keepdim=True)
+
+    coarse = tissue.coarsen(fractions, 2)
+
+    padded = torch.zeros((6, 4, 4, 3), dtype=torch.float64, device=device)
+    padded[..., 0] = 1.0
+    padded[:5, :4, :3] = fractions
+    assert coarse.shape == (3, 2, 2, 3)
+    torch.testing.assert_close(
+        coarse[0, 1, 0], fractions[:2, 2:4, :2].mean(dim=(0, 1, 2))
+    )
+    torch.testing.assert_close(
+        coarse[2, 1, 1], padded[4:6, 2:4, 2:4].mean(dim=(0, 1, 2))
+    )
+    torch.testing.assert_close(coarse.sum(dim=-1), torch.ones_like(coarse[..., 0]))
+
+
+def test_a_mixed_voxel_takes_the_mean_properties_of_its_tissues(tmp_path, device):
+    path = _write(
+        tmp_path / "t.csv",
+        [_row(1, "muscle", density=1050.0), _row(2, "fat", density=950.0, sig=0.05)],
+    )
+    table = tissue.read_table(path)
+    medium = Medium(3.0)
+
+    mixed = tissue.mix(_fractions(device), table, medium, 0.002)
+
+    muscle = tissue.dielectric(table[1].dispersion, medium.frequency)
+    fat = tissue.dielectric(table[2].dispersion, medium.frequency)
+    for mine, theirs, quantity in zip(
+        muscle, fat, ("permittivity", "conductivity"), strict=True
+    ):
+        got = getattr(mixed.body, quantity)[1, 1, 1]
+        assert float(got) == pytest.approx(0.75 * float(mine) + 0.25 * float(theirs))
+    assert float(mixed.density[1, 1, 1]) == pytest.approx(0.75 * 1050.0 + 0.25 * 950.0)
+    assert int(mixed.tissues[1, 1, 1]) == 1
+    assert int(mixed.body.mask.sum()) == 8
+
+
+def test_a_voxel_its_tissues_fill_below_the_threshold_is_free_space(tmp_path, device):
+    path = _write(tmp_path / "t.csv", [_row(1, "muscle"), _row(2, "fat")])
+    table = tissue.read_table(path)
+
+    kept = tissue.mix(_fractions(device), table, Medium(3.0), 0.002, threshold=0.4)
+    dropped = tissue.mix(_fractions(device), table, Medium(3.0), 0.002)
+
+    assert bool(kept.body.mask[0, 0, 0])
+    fat = tissue.dielectric(table[2].dispersion, Medium(3.0).frequency)
+    assert float(kept.body.permittivity[0, 0, 0]) == pytest.approx(float(fat[0]))
+    assert not bool(dropped.body.mask[0, 0, 0])
+    assert float(dropped.body.permittivity[0, 0, 0]) == 1.0
+    assert float(dropped.density[0, 0, 0]) == 0.0
+    assert int(dropped.tissues[0, 0, 0]) == 0
+
+
+def test_a_label_filling_a_voxel_the_table_leaves_out_is_refused(tmp_path, device):
+    path = _write(tmp_path / "t.csv", [_row(1, "muscle")])
+    table = tissue.read_table(path)
+    with pytest.raises(ValueError, match="does not name: 2"):
+        tissue.mix(_fractions(device), table, Medium(3.0), 0.002)
+
+
+# Conductivity in S/m and relative permittivity at 900 MHz of the head tissues
+# the BrainWeb table names, as Rashed et al. (Phys. Med. Biol. 65 065001, 2020,
+# arXiv:1911.01220, table 1) print them from Gabriel's model.
+PUBLISHED_900_MHZ = {
+    1: (2.41, 68.64),
+    2: (0.94, 52.73),
+    3: (0.59, 38.89),
+    4: (0.05, 5.46),
+    5: (0.94, 55.03),
+    6: (0.87, 41.41),
+    7: (0.14, 12.45),
+    9: (0.96, 44.43),
+}
+
+
+@pytest.mark.parametrize("label", sorted(PUBLISHED_900_MHZ))
+def test_the_brainweb_table_gives_the_published_properties_at_900_mhz(label):
+    table = tissue.read_table(
+        Path(__file__).parents[1] / "examples" / "brainweb_tissues.csv"
+    )
+    permittivity, conductivity = tissue.dielectric(table[label].dispersion, 900e6)
+    want_conductivity, want_permittivity = PUBLISHED_900_MHZ[label]
+    assert float(conductivity) == pytest.approx(want_conductivity, abs=0.005)
+    assert float(permittivity) == pytest.approx(want_permittivity, abs=0.005)

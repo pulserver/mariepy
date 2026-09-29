@@ -117,6 +117,36 @@ ultimate_snr, ultimate_efficiency = basis.ultimate_maps(solved, case.body, case.
 `plot.coil_currents`, `plot.scattering`, `plot.sweep` and `plot.slices` draw
 the model and the maps (`pip install "mariepy[plot]"`).
 
+### Head models, body coils, arrays and field maps
+
+A segmentation that gives each voxel the fraction every tissue fills is
+averaged onto the solver's grid and mixed into a body; a body coil enters as
+the modes of an infinitely long birdcage; an array is a set of loops, one port
+each; and each coil's circular field components are written for a simulator:
+
+```python
+import math
+from mariepy import fields, incident, maps, tissue
+from mariepy.solver import solve, solve_incident
+from mariepy.wire import WireCoil
+
+head = tissue.mix(tissue.coarsen(fractions, 5), table, medium, 5e-3)
+modes = [incident.birdcage(head.body, medium, angle=a) for a in (0.0, math.pi / 2)]
+body_coil = solve_incident(
+    head.body,
+    medium,
+    torch.stack([e for e, _ in modes]),
+    torch.stack([h for _, h in modes]),
+)
+array = solve(head.body, WireCoil.loops(centres, normals, 0.04, 36), medium)
+open_ports = fields.combine(array.fields, array.impedance)  # 1 A each, the rest open
+plus, minus = fields.circular_components(medium, open_ports)
+```
+
+`examples/brainweb.py` does this for BrainWeb's normal brain in a body coil and
+three head arrays, and writes each coil's maps with `maps.write` and the
+transmit coils' VOPs with `vop.write`.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).

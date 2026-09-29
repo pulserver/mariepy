@@ -35,7 +35,12 @@ from mariepy import vie
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 from mariepy.constants import Medium
-from mariepy.solver import BodyOperator, solve_body
+from mariepy.solver import (
+    BodyOperator,
+    magnetic_kernel,
+    scattered_magnetic,
+    solve_body,
+)
 from mariepy.tucker import circulant_tucker
 
 __all__ = [
@@ -705,15 +710,8 @@ def solve(
     operator = BodyOperator.build(
         body, medium, tol=kernel_tol, linear=basis.linear, **orders
     )
-    kernel_k = circulant_tucker(
-        vie.kernel_k(
-            body.shape,
-            body.resolution,
-            medium.wavenumber,
-            linear=basis.linear,
-            **orders,
-        ).to(body.device),
-        kernel_tol,
+    kernel_k = magnetic_kernel(
+        body, medium, tol=kernel_tol, linear=basis.linear, **orders
     )
     currents, electric, magnetic = [], [], []
     for incident in basis.incident_electric:
@@ -721,11 +719,7 @@ def solve(
         current = solve_body(operator, field, tol=tol).x
         currents.append(current)
         electric.append(body.to_dof(operator.total_field(current, field)))
-        polarisation = body.from_dof(current)
-        scattered = vie.apply_inverse_g(
-            vie.apply_k(kernel_k, polarisation), body.resolution
-        )
-        magnetic.append(body.to_dof(body.mask * scattered))
+        magnetic.append(body.to_dof(scattered_magnetic(kernel_k, body, current)))
     current = torch.stack(currents)
     electric = torch.stack(electric)
     magnetic = basis.incident_magnetic + torch.stack(magnetic)
