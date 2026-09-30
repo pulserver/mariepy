@@ -12,18 +12,25 @@ figure. matplotlib is an optional dependency: ``pip install "mariepy[plot]"``.
 from __future__ import annotations
 
 import cmath
+import math
 
 import torch
 
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 
+# Quantile of the magnitudes `complex_slices` paints at full brightness.
+BRIGHTEST = 0.99
+
 __all__ = [
     "coil_currents",
+    "complex_slices",
     "current_density",
     "geometry",
     "ideal_current_patterns",
     "impedance",
+    "phase_colours",
+    "phase_wheel",
     "scattering",
     "slices",
     "sweep",
@@ -408,6 +415,148 @@ def sweep(result):
     top.legend(fontsize=7)
     bottom.set_ylabel("Z (ohm): Re, then Im faded")
     bottom.set_xlabel("frequency (MHz)")
+    return figure
+
+
+def phase_colours(values: torch.Tensor, *, ceiling: float | None = None):
+    """Paint a complex field so that its phase is the hue and its magnitude the brightness.
+
+    The hue runs blue, green, yellow, magenta and back to blue as the phase
+    goes from -pi to pi, the wheel BART draws receive sensitivities with, and
+    the magnitude scales the brightness from black at zero.
+
+    Parameters
+    ----------
+    values
+        Any shape, complex.
+    ceiling
+        Magnitude painted at full brightness. The largest magnitude by
+        default; give the same one to every panel of a figure to keep them
+        comparable.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(*values.shape, 3)``, float in ``[0, 1]``: red, green and blue.
+    """
+    import matplotlib.colors as colours
+
+    field = values.detach().resolve_conj().cpu()
+    magnitude = field.abs().to(torch.float64)
+    top = float(magnitude.max()) if ceiling is None else float(ceiling)
+    brightness = (magnitude / top).clamp(0.0, 1.0) if top > 0 else magnitude
+    # Blue at -pi through green and yellow to magenta, decreasing hue.
+    hue = ((2.0 / 3.0 - 0.5 * (torch.angle(field) / torch.pi + 1.0)) % 1.0).to(
+        torch.float64
+    )
+    stacked = torch.stack(
+        [hue, torch.ones_like(brightness), brightness], dim=-1
+    ).numpy()
+    return colours.hsv_to_rgb(stacked)
+
+
+def phase_wheel(ax=None, *, size: int = 256):
+    """Draw the wheel :func:`phase_colours` paints with, as a colour bar.
+
+    Parameters
+    ----------
+    ax
+        Axes to draw on; a new figure otherwise.
+    size
+        Samples along the bar.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        The bar, phase upwards from -pi to pi.
+    """
+    _, ax = _axes(ax)
+    phase = torch.linspace(-torch.pi, torch.pi, size, dtype=torch.float64)
+    bar = phase_colours(torch.polar(torch.ones_like(phase), phase))
+    ax.imshow(bar[:, None, :], origin="lower", extent=(0.0, 1.0, -math.pi, math.pi))
+    ax.set_xticks([])
+    ax.set_yticks([-math.pi, 0.0, math.pi])
+    ax.set_yticklabels([r"$-\pi$", "0", r"$\pi$"])
+    ax.yaxis.tick_right()
+    ax.set_aspect("auto")
+    return ax
+
+
+def complex_slices(
+    volume: torch.Tensor,
+    index=None,
+    *,
+    mask=None,
+    title: str = "",
+    ceiling: float | None = None,
+    flip=(False, False, False),
+    names=("x", "y", "z"),
+):
+    """Show three orthogonal slices of a complex map, phase in the hue.
+
+    Parameters
+    ----------
+    volume
+        Shape ``(n1, n2, n3)``, complex.
+    index
+        The slice along each axis; the middle by default.
+    mask
+        Where to show values; elsewhere is black.
+    title
+        Figure title.
+    ceiling
+        Magnitude painted at full brightness, as :func:`phase_colours` takes
+        it. The default is the :data:`BRIGHTEST` quantile of the magnitudes
+        shown, which keeps one hot voxel from darkening the rest.
+    flip
+        Which axes run backwards on the panels that show them, so that a
+        frame whose axis points the other way is drawn the way it is read.
+    names
+        What to call each axis in the panel titles.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The three panels and the phase wheel.
+    """
+    pyplot = _pyplot()
+    field = volume.detach().cpu()
+    if mask is not None:
+        field = torch.where(mask.cpu(), field, torch.zeros_like(field))
+    if index is None:
+        index = tuple(n // 2 for n in field.shape)
+    cuts = (field[index[0]], field[:, index[1]], field[:, :, index[2]])
+    if ceiling is None:
+        # The brightest voxel of a field beside a conductor runs orders of
+        # magnitude above the body's own, and scaling to it paints everything
+        # else black.
+        shown = torch.cat([cut.reshape(-1).abs() for cut in cuts])
+        shown = shown[shown > 0]
+        ceiling = (
+            float(torch.quantile(shown.to(torch.float64), BRIGHTEST))
+            if shown.numel()
+            else 1.0
+        )
+
+    figure, axes = pyplot.subplots(
+        1, 4, figsize=(12, 4), width_ratios=(1.0, 1.0, 1.0, 0.08)
+    )
+    # Panel `axis` holds the other two axes, the lower one across and the
+    # higher one up.
+    shown = ((1, 2), (0, 2), (0, 1))
+    for axis, (ax, cut, position) in enumerate(zip(axes[:3], cuts, index, strict=True)):
+        painted = phase_colours(cut, ceiling=ceiling).transpose(1, 0, 2)
+        across, up = shown[axis]
+        if flip[across]:
+            painted = painted[:, ::-1]
+        if flip[up]:
+            painted = painted[::-1]
+        ax.imshow(painted, origin="lower")
+        ax.set_title(f"{names[axis]} = {position}")
+        ax.set_axis_off()
+    phase_wheel(axes[3])
+    if title:
+        figure.suptitle(title)
     return figure
 
 

@@ -370,3 +370,24 @@ def test_directly_integrated_coupling_rows_are_the_operator_s_own(linear, device
         through = operator.couple(unit)
         error = (through - rows[:, dof]).abs().max() / through.abs().max()
         assert float(error) <= PROJECTION_ERROR
+
+
+def test_a_coil_no_cell_comes_near_corrects_nothing(device):
+    """A coil far outside the body has no near pairs, and its corrections are empty."""
+    body = _body(device)
+    coil = _coil(device, radius=0.30)
+    medium = _medium()
+    impedance = sie.assemble(coil, medium).impedance
+    coupling = pfft.assemble(
+        body,
+        coil,
+        impedance,
+        medium,
+        distance=DISTANCE,
+        far_order=2,
+        medium_order=2,
+        near_order=4,
+    )
+    assert coupling.electric._nnz() == 0
+    assert coupling.magnetic._nnz() == 0
+    assert coupling.project._nnz() > 0

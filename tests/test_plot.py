@@ -113,3 +113,64 @@ def test_the_ideal_pattern_figure_draws_one_panel_per_phase():
     for ax, phase in zip(figure.axes, phases, strict=True):
         assert f"{phase:.2f}" in ax.get_title()
         assert ax.collections
+
+
+def test_the_phase_wheel_runs_blue_green_yellow_magenta():
+    """The hue follows the wheel BART draws receive sensitivities with."""
+    phases = torch.tensor(
+        [-torch.pi, -torch.pi / 2, 0.0, torch.pi / 2], dtype=torch.float64
+    )
+    colours = plot.phase_colours(torch.polar(torch.ones_like(phases), phases))
+    red, green, blue = colours[:, 0], colours[:, 1], colours[:, 2]
+    assert blue[0] > 0.9 and red[0] < 0.1  # -pi is blue
+    assert green[1] > 0.9 and red[1] < 0.6  # -pi/2 is green
+    assert red[2] > 0.9 and green[2] > 0.9 and blue[2] < 0.1  # 0 is yellow
+    assert red[3] > 0.9 and blue[3] > 0.4 and green[3] < 0.3  # +pi/2 is magenta
+
+
+def test_phase_colours_take_their_brightness_from_the_magnitude():
+    values = torch.tensor([0.0, 0.5, 1.0], dtype=torch.float64) * torch.exp(
+        1j * torch.tensor(0.3)
+    )
+    colours = plot.phase_colours(values)
+    brightness = colours.max(axis=-1)
+    assert brightness[0] == pytest.approx(0.0)
+    assert brightness[1] == pytest.approx(0.5, abs=1e-6)
+    assert brightness[2] == pytest.approx(1.0, abs=1e-6)
+    given = plot.phase_colours(values, ceiling=2.0).max(axis=-1)
+    assert given[2] == pytest.approx(0.5, abs=1e-6)
+
+
+def test_complex_slices_draw_three_cuts_and_a_wheel():
+    generator = torch.Generator().manual_seed(0)
+    volume = torch.complex(
+        torch.randn((5, 6, 7), generator=generator, dtype=torch.float64),
+        torch.randn((5, 6, 7), generator=generator, dtype=torch.float64),
+    )
+    mask = torch.zeros((5, 6, 7), dtype=torch.bool)
+    mask[1:4, 1:5, 1:6] = True
+    figure = plot.complex_slices(volume, mask=mask, title="B1+")
+    assert len(figure.axes) == 4
+    assert figure.axes[0].images[0].get_array().shape == (7, 6, 3)
+
+
+def test_complex_slices_scale_to_the_bulk_not_the_brightest_voxel():
+    """One hot voxel must not darken a map."""
+    volume = torch.full((21, 21, 21), 0.1, dtype=torch.complex128)
+    volume[10, 10, 10] = 1000.0
+    figure = plot.complex_slices(volume)
+    painted = figure.axes[0].images[0].get_array()
+    assert painted.max() == pytest.approx(1.0, abs=1e-6)
+    # The bulk keeps its brightness rather than falling to 1e-4 of the peak.
+    assert float(np.median(painted.max(axis=-1))) > 0.5
+
+
+def test_complex_slices_draw_an_axis_backwards_when_asked():
+    """A frame whose axis points the other way is drawn the way it is read."""
+    volume = torch.zeros((5, 6, 7), dtype=torch.complex128)
+    volume[:, 0, :] = 1.0  # the low end of the second axis
+    plain = plot.complex_slices(volume)
+    turned = plot.complex_slices(volume, flip=(False, True, False))
+    # The axial panel, the third, shows the second axis up its own vertical.
+    assert plain.axes[2].images[0].get_array()[0].max() == pytest.approx(1.0)
+    assert turned.axes[2].images[0].get_array()[-1].max() == pytest.approx(1.0)

@@ -586,6 +586,16 @@ def scatter_matrix(grid: ExtendedGrid, n_components: int = 3) -> torch.Tensor:
     ).coalesce()
 
 
+def _empty_pair(shape, device):
+    """Two all-zero sparse matrices, for a coil no cell of the body comes near."""
+    index = torch.zeros((2, 0), dtype=torch.int64, device=device)
+    values = torch.zeros(0, dtype=torch.complex128, device=device)
+    return tuple(
+        torch.sparse_coo_tensor(index, values, shape, check_invariants=False).coalesce()
+        for _ in range(2)
+    )
+
+
 def direct_coupling(
     grid: ExtendedGrid,
     coil: Coil,
@@ -667,6 +677,8 @@ def direct_coupling(
         columns.append(dof.repeat_interleave(n_components))
 
     shape = (n_components * n_voxels, coil.n_dof)
+    if not rows:
+        return _empty_pair(shape, grid.device)
     index = torch.stack([torch.cat(rows), torch.cat(columns)])
     return (
         torch.sparse_coo_tensor(
@@ -823,6 +835,8 @@ def projected_coupling(
         columns.append(dof.repeat_interleave(n_components))
 
     shape = (n_components * n_voxels, coil.n_dof)
+    if not rows:
+        return _empty_pair(shape, grid.device)
     index = torch.stack([torch.cat(rows), torch.cat(columns)])
     return (
         torch.sparse_coo_tensor(
