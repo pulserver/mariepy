@@ -352,3 +352,30 @@ def test_an_unknown_lumped_load_is_refused():
     )
     with pytest.raises(ValueError, match="unknown lumped load"):
         port.impedance(1.0)
+
+
+def test_a_mesh_wound_against_itself_is_refused():
+    """Two triangles wound the same way share an edge no basis function spans."""
+    nodes = torch.tensor(
+        [[0.0, 0.0, 0.0], [0.01, 0.0, 0.0], [0.0, 0.01, 0.0], [0.01, 0.01, 0.0]],
+        dtype=torch.float64,
+    )
+    turned = SurfaceMesh(
+        nodes=nodes,
+        triangles=torch.tensor([[0, 1, 3], [0, 3, 2]], dtype=torch.int64),
+        triangle_tags=torch.ones(2, dtype=torch.int64),
+        lines=torch.tensor([[0, 3]], dtype=torch.int64),
+        line_tags=torch.tensor([1], dtype=torch.int64),
+    )
+    port = Port(tag=1, kind="port", load="none", value=0.0, quality=1.0, voltage=1.0)
+    SurfaceCoil.build(turned, (port,))
+
+    against = SurfaceMesh(
+        nodes=nodes,
+        triangles=torch.tensor([[0, 1, 3], [0, 2, 3]], dtype=torch.int64),
+        triangle_tags=torch.ones(2, dtype=torch.int64),
+        lines=torch.tensor([[0, 3]], dtype=torch.int64),
+        line_tags=torch.tensor([1], dtype=torch.int64),
+    )
+    with pytest.raises(ValueError, match="wound against each other"):
+        SurfaceCoil.build(against, (port,))

@@ -265,6 +265,7 @@ class SurfaceCoil:
         edges, edge_of_triangle, signs = _build_edges(mesh)
         n_edges = int(edges.shape[0])
         occurrences = torch.bincount(edge_of_triangle.reshape(-1), minlength=n_edges)
+        _check_orientation(edge_of_triangle, signs, occurrences)
         if int(occurrences.max()) > 2:
             raise ValueError("an edge is shared by more than two triangles")
         interior = occurrences == 2
@@ -463,6 +464,40 @@ def _cross_talk(element: dict) -> tuple[int | None, float | None]:
         f"mutual inductor {element['number']} names no partner: "
         f"cross_talk is {cross_talk!r}"
     )
+
+
+def _check_orientation(
+    edge_of_triangle: torch.Tensor, signs: torch.Tensor, occurrences: torch.Tensor
+) -> None:
+    """Refuse a mesh whose neighbouring triangles are wound against each other.
+
+    The basis function on an edge is positive on the triangle that traverses it
+    forwards and negative on the one that traverses it backwards, so two
+    neighbours wound the same way leave it without a negative triangle.
+
+    Raises
+    ------
+    ValueError
+        If two triangles sharing an interior edge traverse it the same way.
+    """
+    n_edges = occurrences.shape[0]
+    forward = torch.zeros(n_edges, dtype=torch.int64, device=signs.device)
+    forward.scatter_add_(
+        0,
+        edge_of_triangle.reshape(-1),
+        (signs.reshape(-1) > 0).to(torch.int64),
+    )
+    interior = occurrences == 2
+    wrong = interior & (forward != 1)
+    if bool(wrong.any()):
+        first = int(torch.nonzero(wrong)[0])
+        triangles = torch.nonzero(edge_of_triangle == first)[:, 0].tolist()
+        raise ValueError(
+            f"triangles {triangles} are wound against each other on the edge "
+            f"they share, so no basis function spans them; {int(wrong.sum())} "
+            "edges of the mesh are like this. Wind every triangle the same way "
+            "about the surface."
+        )
 
 
 def _build_edges(mesh: SurfaceMesh) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
