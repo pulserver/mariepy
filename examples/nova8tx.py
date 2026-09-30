@@ -39,6 +39,7 @@ from pathlib import Path
 
 import torch
 
+from mariepy.body import VoxelBody
 from mariepy.coil import Port, SurfaceCoil
 from mariepy.constants import Medium
 from mariepy.mesh import SurfaceMesh
@@ -375,8 +376,8 @@ def solve_body(
     *,
     system,
     coupling=None,
-    tol: float = 1e-5,
-    precision: str = "mixed",
+    tol: float = 1e-4,
+    precision: str = "single",
     linear: bool = False,
     **orders,
 ):
@@ -404,7 +405,10 @@ def solve_body(
     tol
         Target for the relative residual of each channel's solve.
     precision
-        ``"mixed"`` takes the body's products in complex64.
+        ``"single"`` solves in complex64, which costs about a thousandth of
+        the field and runs two to three times faster; ``"mixed"`` keeps the
+        Krylov basis in complex128 and takes the products in complex64;
+        ``"double"`` stays in complex128.
     linear
         Give the body the piecewise-linear basis.
     **orders
@@ -434,15 +438,16 @@ def solve_body(
     )
     diagonal = body_diagonal(body, medium, linear=coupling.linear)
     krylov = refine if precision == "mixed" else gmres
+    working = torch.complex64 if precision == "single" else torch.complex128
     solved = []
     for channel in range(currents.shape[0]):
         solution = krylov(
             operator.body_block,
-            operator.couple(currents[channel]),
+            operator.couple(currents[channel].to(working)),
             preconditioner=lambda vector: diagonal.to(vector.dtype) * vector,
             tol=tol,
         )
-        solved.append(solution.x)
+        solved.append(solution.x.to(torch.complex128))
     return field_module.compute(operator, currents, torch.stack(solved)), operator
 
 
@@ -473,7 +478,28 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--weights", help="a .pt file of fitted source currents")
     parser.add_argument("--subjects", type=int, nargs="*", default=[4, 5, 6])
-    parser.add_argument("--margin", type=float, default=0.05, help="VOP overestimation")
+    parser.add_argument(
+        "--margin",
+        type=float,
+        default=0.25,
+        help="VOP overestimation, as a fraction of the worst case",
+    )
+    parser.add_argument(
+        "--positions",
+        type=float,
+        nargs="*",
+        default=[-10.0, 0.0, 10.0],
+        help="where the head sits along z, in millimetres",
+    )
+    parser.add_argument(
+        "--images", action="store_true", help="write a PNG per channel and data set"
+    )
+    parser.add_argument(
+        "--precision", default="single", choices=("single", "mixed", "double")
+    )
+    parser.add_argument(
+        "--tol", type=float, default=1e-4, help="relative residual of each solve"
+    )
     arguments = parser.parse_args()
 
     out = Path(arguments.out)
@@ -561,97 +587,6 @@ def brainweb_head(subject: int, resolution: float, medium, device):
     return dataclasses.replace(built, body=dataclasses.replace(body, origin=origin))
 
 
-def run_bodies(coil, medium, currents, system, arguments, out: Path) -> None:
-    """Solve each subject, write its maps and images, and compress the population's VOPs."""
-    import time
-
-    from mariepy import averaging, maps, sar, vop
-    from mariepy import fields as field_module
-
-    resolution = arguments.resolution * 1e-3
-    channels = [f"ch{index + 1}" for index in range(CHANNELS)]
-    averaged_all, whole_all, names = [], [], []
-    for subject in arguments.subjects:
-        start = time.time()
-        built = brainweb_head(subject, resolution, medium, arguments.device)
-        body = built.body
-        print(
-            f"subject {subject}: {body.n_voxels} voxels of {arguments.resolution:.0f} mm, "
-            f"grid {tuple(body.shape)}",
-            flush=True,
-        )
-        solved, operator = solve_body(
-            body, coil, medium, currents, system=system, precision="mixed"
-        )
-        plus, minus = field_module.circular_components(operator, solved)
-        maps.write(
-            out / f"subject{subject:02d}.npz",
-            plus,
-            minus,
-            body.mask,
-            coil=COIL_NAME,
-            channels=channels,
-            frequency_hz=medium.frequency,
-            drive_unit=DRIVE_UNIT,
-            origin=body.origin,
-            resolution=body.resolution,
-            frame=FRAME,
-            bodies=[f"BrainWeb subject {subject:02d}"],
-            data_licence=LICENCE,
-        )
-        draw_channels(
-            plus * 1e6,
-            body.mask,
-            out / f"subject{subject:02d}_b1",
-            title=f"subject {subject:02d} B1+ [uT per unit drive], channel",
-        )
-        electric = field_module.at_centres(solved.electric)
-        draw_channels(
-            torch.linalg.vector_norm(electric, dim=1).to(torch.complex128),
-            body.mask,
-            out / f"subject{subject:02d}_e",
-            title=f"subject {subject:02d} |E| [V/m per unit drive], channel",
-        )
-
-        mass = torch.where(body.mask, built.density * body.resolution**3, 0.0)
-        local = sar.local_matrices(
-            solved.electric, body.conductivity, built.density, body.mask
-        )
-        pool = averaging.cube_pool(mass, body.mask, 10e-3)
-        averaged_all.append(averaging.averaged_matrices(pool, local, mass, body.mask))
-        whole_all.append(
-            sar.average(
-                local, sar.voxel_mass(built.density, body.resolution, body.mask)
-            )
-        )
-        names.append(f"BrainWeb subject {subject:02d}")
-        print(
-            f"  {len(pool)} averaging cubes, peak 10 g eigenvalue "
-            f"{float(torch.linalg.eigvalsh(averaged_all[-1]).amax()):.4g} W/kg, "
-            f"{time.time() - start:.0f}s",
-            flush=True,
-        )
-
-    points, _ = vop.compress(torch.cat(averaged_all), arguments.margin)
-    vop.write(
-        out / "nova8tx_vops.npz",
-        points,
-        torch.stack(whole_all),
-        coil=COIL_NAME,
-        frequency_hz=medium.frequency,
-        drive_unit=DRIVE_UNIT,
-        channels=channels,
-        averaging="10 g, IEC/IEEE 62704-1",
-        bodies=names,
-        compression_margin=arguments.margin,
-        data_licence=LICENCE,
-    )
-    print(
-        f"wrote {out / 'nova8tx_vops.npz'}: {points.shape[0]} points from "
-        f"{sum(a.shape[0] for a in averaged_all)} cubes over {len(names)} subjects"
-    )
-
-
 def run_phantom(coil, medium, currents, system, arguments, out: Path) -> None:
     """Solve the sphere the model was fitted in, and draw each channel's B1+."""
     import time
@@ -675,7 +610,7 @@ def run_phantom(coil, medium, currents, system, arguments, out: Path) -> None:
     )
     start = time.time()
     solved, operator = solve_body(
-        body, coil, medium, currents, system=system, precision="mixed"
+        body, coil, medium, currents, system=system, precision=arguments.precision
     )
     print(f"solved eight channels in {time.time() - start:.0f}s", flush=True)
     plus, minus = field_module.circular_components(operator, solved)
@@ -712,6 +647,192 @@ def draw_channels(volumes, mask, stem: Path, *, title: str) -> None:
         figure.savefig(path, dpi=110, facecolor="white")
         pyplot.close(figure)
     print(f"wrote {stem.parent}/{stem.name}_ch*.png")
+
+
+def place(built, shape, origin, shift):
+    """Put a head on a common grid, moved by ``shift`` metres along the axes."""
+    body = built.body
+    permittivity = torch.ones(shape, dtype=body.permittivity.dtype, device=body.device)
+    conductivity = torch.zeros_like(permittivity)
+    density = torch.zeros_like(permittivity)
+    mask = torch.zeros(shape, dtype=torch.bool, device=body.device)
+    corner = [
+        round((body.origin[axis] + shift[axis] - origin[axis]) / body.resolution)
+        for axis in range(3)
+    ]
+    window = tuple(
+        slice(corner[axis], corner[axis] + body.shape[axis]) for axis in range(3)
+    )
+    for target, source in (
+        (permittivity, body.permittivity),
+        (conductivity, body.conductivity),
+        (density, built.density),
+        (mask, body.mask),
+    ):
+        target[window] = source
+    return (
+        VoxelBody(
+            permittivity=permittivity,
+            conductivity=conductivity,
+            mask=mask,
+            resolution=body.resolution,
+            origin=origin,
+        ),
+        density,
+    )
+
+
+def common_grid(heads, shifts, resolution: float, margin: int = 2):
+    """Give the grid that holds every head at every position, centred on the coil."""
+    reach = [0.0, 0.0, 0.0]
+    for built in heads:
+        body = built.body
+        points = body.coordinates()[:, body.mask]
+        for axis in range(3):
+            half = 0.5 * float(points[axis].max() - points[axis].min())
+            moved = max(abs(shift[axis]) for shift in shifts)
+            reach[axis] = max(reach[axis], half + moved)
+    shape = tuple(
+        2 * (math.ceil(reach[axis] / resolution) + margin) + 1 for axis in range(3)
+    )
+    origin = tuple(-0.5 * (shape[axis] - 1) * resolution for axis in range(3))
+    return shape, origin
+
+
+def run_bodies(coil, medium, currents, system, arguments, out: Path) -> None:
+    """Solve every head at every position, and compress the population's VOPs.
+
+    The coil never changes, so the coupling is assembled once over the region
+    every head reaches and restricted to each one, and a head enters the
+    population once per position: a body model sits where it happens to sit,
+    and the points have to cover that.
+    """
+    import time
+
+    from mariepy import averaging, maps, pfft, sar, vop
+    from mariepy import fields as field_module
+
+    resolution = arguments.resolution * 1e-3
+    channels = [f"ch{index + 1}" for index in range(CHANNELS)]
+    shifts = [(0.0, 0.0, 1e-3 * offset) for offset in arguments.positions]
+
+    start = time.time()
+    heads = [
+        brainweb_head(subject, resolution, medium, arguments.device)
+        for subject in arguments.subjects
+    ]
+    shape, origin = common_grid(heads, shifts, resolution)
+    print(
+        f"{len(heads)} heads at {len(shifts)} positions on a {shape} grid of "
+        f"{arguments.resolution:.0f} mm, built in {time.time() - start:.0f}s",
+        flush=True,
+    )
+
+    placed = [place(built, shape, origin, shift) for built in heads for shift in shifts]
+    names = [
+        f"BrainWeb subject {subject:02d} at z {offset:+.0f} mm"
+        for subject in arguments.subjects
+        for offset in arguments.positions
+    ]
+    region = placed[0][0].mask.clone()
+    for body, _ in placed[1:]:
+        region |= body.mask
+    print(
+        f"region: {int(region.sum())} voxels of the {region.numel()} the grid holds",
+        flush=True,
+    )
+
+    start = time.time()
+    whole_region = dataclasses.replace(placed[0][0], mask=region)
+    coupling = pfft.assemble(whole_region, coil, system.impedance, medium, linear=False)
+    print(f"coupling assembled once in {time.time() - start:.0f}s", flush=True)
+
+    averaged_all, whole_all = [], []
+    for (body, density), name in zip(placed, names, strict=True):
+        start = time.time()
+        solved, operator = solve_body(
+            body,
+            coil,
+            medium,
+            currents,
+            system=system,
+            coupling=coupling,
+            precision=arguments.precision,
+            tol=arguments.tol,
+        )
+        solved_at = time.time()
+        plus, minus = field_module.circular_components(operator, solved)
+        stem = name.replace("BrainWeb subject ", "subject").replace(" at z ", "_z")
+        stem = stem.replace(" mm", "").replace("+", "p").replace("-", "m")
+        maps.write(
+            out / f"{stem}.npz",
+            plus,
+            minus,
+            body.mask,
+            coil=COIL_NAME,
+            channels=channels,
+            frequency_hz=medium.frequency,
+            drive_unit=DRIVE_UNIT,
+            origin=body.origin,
+            resolution=body.resolution,
+            frame=FRAME,
+            bodies=[name],
+            data_licence=LICENCE,
+        )
+        if arguments.images:
+            draw_channels(
+                plus * 1e6,
+                body.mask,
+                out / f"{stem}_b1",
+                title=f"{name}: B1+ [uT per unit drive], channel",
+            )
+            electric = field_module.at_centres(solved.electric)
+            draw_channels(
+                torch.linalg.vector_norm(electric, dim=1).to(torch.complex128),
+                body.mask,
+                out / f"{stem}_e",
+                title=f"{name}: |E| [V/m per unit drive], channel",
+            )
+        drawn_at = time.time()
+
+        mass = torch.where(body.mask, density * body.resolution**3, 0.0)
+        local = sar.local_matrices(
+            solved.electric, body.conductivity, density, body.mask
+        )
+        pool = averaging.cube_pool(mass, body.mask, 10e-3)
+        averaged_all.append(averaging.averaged_matrices(pool, local, mass, body.mask))
+        whole_all.append(
+            sar.average(local, sar.voxel_mass(density, body.resolution, body.mask))
+        )
+        print(
+            f"{name}: {body.n_voxels} voxels, peak 10 g eigenvalue "
+            f"{float(torch.linalg.eigvalsh(averaged_all[-1]).amax()):.4g} W/kg; "
+            f"eight channels {solved_at - start:.0f}s "
+            f"({(solved_at - start) / CHANNELS:.0f}s a channel), maps "
+            f"{drawn_at - solved_at:.0f}s, SAR {time.time() - drawn_at:.0f}s",
+            flush=True,
+        )
+
+    start = time.time()
+    points, _ = vop.compress(torch.cat(averaged_all), arguments.margin)
+    vop.write(
+        out / "nova8tx_vops.npz",
+        points,
+        torch.stack(whole_all),
+        coil=COIL_NAME,
+        frequency_hz=medium.frequency,
+        drive_unit=DRIVE_UNIT,
+        channels=channels,
+        averaging="10 g, IEC/IEEE 62704-1",
+        bodies=names,
+        compression_margin=arguments.margin,
+        data_licence=LICENCE,
+    )
+    print(
+        f"wrote {out / 'nova8tx_vops.npz'}: {points.shape[0]} points at a margin of "
+        f"{arguments.margin:.0%} from {sum(a.shape[0] for a in averaged_all)} cubes "
+        f"over {len(names)} data sets, in {time.time() - start:.0f}s"
+    )
 
 
 if __name__ == "__main__":
