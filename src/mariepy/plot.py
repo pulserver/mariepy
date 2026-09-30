@@ -489,6 +489,8 @@ def complex_slices(
     mask=None,
     title: str = "",
     ceiling: float | None = None,
+    flip=(False, False, False),
+    names=("x", "y", "z"),
 ):
     """Show three orthogonal slices of a complex map, phase in the hue.
 
@@ -506,6 +508,11 @@ def complex_slices(
         Magnitude painted at full brightness, as :func:`phase_colours` takes
         it. The default is the :data:`BRIGHTEST` quantile of the magnitudes
         shown, which keeps one hot voxel from darkening the rest.
+    flip
+        Which axes run backwards on the panels that show them, so that a
+        frame whose axis points the other way is drawn the way it is read.
+    names
+        What to call each axis in the panel titles.
 
     Returns
     -------
@@ -534,11 +541,18 @@ def complex_slices(
     figure, axes = pyplot.subplots(
         1, 4, figsize=(12, 4), width_ratios=(1.0, 1.0, 1.0, 0.08)
     )
-    for ax, cut, name, position in zip(axes[:3], cuts, "xyz", index, strict=True):
-        ax.imshow(
-            phase_colours(cut, ceiling=ceiling).transpose(1, 0, 2), origin="lower"
-        )
-        ax.set_title(f"{name} = {position}")
+    # Panel `axis` holds the other two axes, the lower one across and the
+    # higher one up.
+    shown = ((1, 2), (0, 2), (0, 1))
+    for axis, (ax, cut, position) in enumerate(zip(axes[:3], cuts, index, strict=True)):
+        painted = phase_colours(cut, ceiling=ceiling).transpose(1, 0, 2)
+        across, up = shown[axis]
+        if flip[across]:
+            painted = painted[:, ::-1]
+        if flip[up]:
+            painted = painted[::-1]
+        ax.imshow(painted, origin="lower")
+        ax.set_title(f"{names[axis]} = {position}")
         ax.set_axis_off()
     phase_wheel(axes[3])
     if title:

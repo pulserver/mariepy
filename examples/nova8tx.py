@@ -468,7 +468,7 @@ def _report(coil: SurfaceCoil, mesh: SurfaceMesh, impedance: torch.Tensor) -> No
 def main() -> None:
     """Run one of the three subcommands."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("what", choices=("geometry", "phantom", "bodies"))
+    parser.add_argument("what", choices=("geometry", "phantom", "bodies", "compress"))
     parser.add_argument("--out", default="nova", help="folder for the outputs")
     parser.add_argument(
         "--resolution", type=float, default=4.0, help="voxel size in mm"
@@ -505,6 +505,9 @@ def main() -> None:
     out = Path(arguments.out)
     out.mkdir(parents=True, exist_ok=True)
     medium = Medium(FIELD_STRENGTH)
+    if arguments.what == "compress":
+        write_points(out, medium, arguments.margin)
+        return
     mesh = build_mesh(
         along=arguments.along, across=arguments.across, device=arguments.device
     )
@@ -512,7 +515,7 @@ def main() -> None:
     coil = build_coil(mesh, sources=CHANNELS * layout["per_channel"])
     weights = (
         torch.load(arguments.weights) if arguments.weights else default_weights()
-    ).to(torch.complex128)
+    ).to(device=mesh.device, dtype=torch.complex128)
 
     print(f"{medium.frequency * 1e-6:.2f} MHz")
     currents, system, impedance = channel_currents(coil, medium, weights)
@@ -699,6 +702,54 @@ def common_grid(heads, shifts, resolution: float, margin: int = 2):
     return shape, origin
 
 
+def _peak_eigenvalue(matrices: torch.Tensor, chunk: int = 1 << 14) -> float:
+    """Largest eigenvalue over a stack, taken in chunks it can hold."""
+    return max(
+        float(torch.linalg.eigvalsh(matrices[start : start + chunk]).amax())
+        for start in range(0, matrices.shape[0], chunk)
+    )
+
+
+def write_points(out: Path, medium, margin: float) -> None:
+    """Compress every data set's matrices in a folder into one file of points.
+
+    The solves write a body's matrices beside its maps, so the points can be
+    taken again at another margin without solving anything.
+    """
+    import time
+
+    from mariepy import vop
+
+    saved = sorted(out.glob("*_sar.pt"))
+    if not saved:
+        raise SystemExit(f"no data sets in {out}: run `bodies` first")
+    held = [torch.load(path) for path in saved]
+    names = [entry["body"] for entry in held]
+    averaged = torch.cat([entry["averaged"] for entry in held])
+    whole = torch.stack([entry["whole"] for entry in held])
+
+    start = time.time()
+    points, _ = vop.compress(averaged, margin)
+    vop.write(
+        out / "nova8tx_vops.npz",
+        points,
+        whole,
+        coil=COIL_NAME,
+        frequency_hz=medium.frequency,
+        drive_unit=DRIVE_UNIT,
+        channels=[f"ch{index + 1}" for index in range(CHANNELS)],
+        averaging="10 g, IEC/IEEE 62704-1",
+        bodies=names,
+        compression_margin=margin,
+        data_licence=LICENCE,
+    )
+    print(
+        f"wrote {out / 'nova8tx_vops.npz'}: {points.shape[0]} points at a margin of "
+        f"{margin:.0%} from {averaged.shape[0]} cubes over {len(names)} data sets, "
+        f"in {time.time() - start:.0f}s"
+    )
+
+
 def run_bodies(coil, medium, currents, system, arguments, out: Path) -> None:
     """Solve every head at every position, and compress the population's VOPs.
 
@@ -709,7 +760,7 @@ def run_bodies(coil, medium, currents, system, arguments, out: Path) -> None:
     """
     import time
 
-    from mariepy import averaging, maps, pfft, sar, vop
+    from mariepy import averaging, maps, pfft, sar
     from mariepy import fields as field_module
 
     resolution = arguments.resolution * 1e-3
@@ -800,39 +851,32 @@ def run_bodies(coil, medium, currents, system, arguments, out: Path) -> None:
             solved.electric, body.conductivity, density, body.mask
         )
         pool = averaging.cube_pool(mass, body.mask, 10e-3)
-        averaged_all.append(averaging.averaged_matrices(pool, local, mass, body.mask))
+        # The matrices leave the accelerator: a body carries hundreds of
+        # thousands of them, and every eigenvalue the compression takes is of
+        # an eight by eight. They go to disk as well, so that the points can be
+        # compressed again, at another margin, without solving anything.
+        averaged_all.append(
+            averaging.averaged_matrices(pool, local, mass, body.mask).cpu()
+        )
         whole_all.append(
-            sar.average(local, sar.voxel_mass(density, body.resolution, body.mask))
+            sar.average(
+                local, sar.voxel_mass(density, body.resolution, body.mask)
+            ).cpu()
+        )
+        torch.save(
+            {"averaged": averaged_all[-1], "whole": whole_all[-1], "body": name},
+            out / f"{stem}_sar.pt",
         )
         print(
             f"{name}: {body.n_voxels} voxels, peak 10 g eigenvalue "
-            f"{float(torch.linalg.eigvalsh(averaged_all[-1]).amax()):.4g} W/kg; "
+            f"{float(_peak_eigenvalue(averaged_all[-1])):.4g} W/kg; "
             f"eight channels {solved_at - start:.0f}s "
             f"({(solved_at - start) / CHANNELS:.0f}s a channel), maps "
             f"{drawn_at - solved_at:.0f}s, SAR {time.time() - drawn_at:.0f}s",
             flush=True,
         )
 
-    start = time.time()
-    points, _ = vop.compress(torch.cat(averaged_all), arguments.margin)
-    vop.write(
-        out / "nova8tx_vops.npz",
-        points,
-        torch.stack(whole_all),
-        coil=COIL_NAME,
-        frequency_hz=medium.frequency,
-        drive_unit=DRIVE_UNIT,
-        channels=channels,
-        averaging="10 g, IEC/IEEE 62704-1",
-        bodies=names,
-        compression_margin=arguments.margin,
-        data_licence=LICENCE,
-    )
-    print(
-        f"wrote {out / 'nova8tx_vops.npz'}: {points.shape[0]} points at a margin of "
-        f"{arguments.margin:.0%} from {sum(a.shape[0] for a in averaged_all)} cubes "
-        f"over {len(names)} data sets, in {time.time() - start:.0f}s"
-    )
+    write_points(out, medium, arguments.margin)
 
 
 if __name__ == "__main__":

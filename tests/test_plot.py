@@ -163,3 +163,14 @@ def test_complex_slices_scale_to_the_bulk_not_the_brightest_voxel():
     assert painted.max() == pytest.approx(1.0, abs=1e-6)
     # The bulk keeps its brightness rather than falling to 1e-4 of the peak.
     assert float(np.median(painted.max(axis=-1))) > 0.5
+
+
+def test_complex_slices_draw_an_axis_backwards_when_asked():
+    """A frame whose axis points the other way is drawn the way it is read."""
+    volume = torch.zeros((5, 6, 7), dtype=torch.complex128)
+    volume[:, 0, :] = 1.0  # the low end of the second axis
+    plain = plot.complex_slices(volume)
+    turned = plot.complex_slices(volume, flip=(False, True, False))
+    # The axial panel, the third, shows the second axis up its own vertical.
+    assert plain.axes[2].images[0].get_array()[0].max() == pytest.approx(1.0)
+    assert turned.axes[2].images[0].get_array()[-1].max() == pytest.approx(1.0)
