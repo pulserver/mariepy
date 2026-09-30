@@ -236,3 +236,44 @@ def test_a_body_carries_from_its_fields_to_a_file_that_still_bounds_it(tmp_path)
     assert bool(
         (sar.peak(over_cubes, drives) >= sar.sar(whole[None], drives)[:, 0]).all()
     )
+
+
+def test_the_compression_takes_its_eigenvalues_in_chunks(monkeypatch, device):
+    """Chunking is how a population's stack fits; it changes no answer."""
+    generator = torch.Generator().manual_seed(4)
+    factors = torch.complex(
+        torch.randn((60, 4, 4), generator=generator, dtype=torch.float64),
+        torch.randn((60, 4, 4), generator=generator, dtype=torch.float64),
+    ).to(device)
+    matrices = factors @ factors.conj().transpose(-2, -1)
+
+    whole, clustered = vop.compress(matrices, 0.1)
+    monkeypatch.setattr(vop, "EIGENVALUE_CHUNK", 7)
+    chunked, again = vop.compress(matrices, 0.1)
+    torch.testing.assert_close(chunked, whole, rtol=1e-12, atol=0.0)
+    assert bool((again == clustered).all())
+
+
+def test_the_compression_reaches_the_same_points_whatever_the_order(device):
+    """The largest eigenvalues are taken once, so the stack's order must not matter."""
+    generator = torch.Generator().manual_seed(6)
+    factors = torch.complex(
+        torch.randn((40, 3, 3), generator=generator, dtype=torch.float64),
+        torch.randn((40, 3, 3), generator=generator, dtype=torch.float64),
+    ).to(device)
+    matrices = factors @ factors.conj().transpose(-2, -1)
+    points, _ = vop.compress(matrices, 0.2)
+
+    shuffled = torch.randperm(
+        matrices.shape[0], generator=torch.Generator().manual_seed(7)
+    )
+    again, _ = vop.compress(matrices[shuffled.to(device)], 0.2)
+    assert points.shape == again.shape
+    drives = torch.complex(
+        torch.randn((200, 3), generator=generator, dtype=torch.float64),
+        torch.randn((200, 3), generator=generator, dtype=torch.float64),
+    ).to(device)
+    worst = torch.einsum("di,nij,dj->dn", drives.conj(), matrices, drives).real.amax(1)
+    for stack in (points, again):
+        bound = torch.einsum("di,nij,dj->dn", drives.conj(), stack, drives).real.amax(1)
+        assert bool((bound >= worst - 1e-9).all())

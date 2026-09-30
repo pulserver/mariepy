@@ -20,6 +20,7 @@ matrices are written in.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 
 import numpy as np
@@ -32,6 +33,35 @@ def _deficiency(matrix: torch.Tensor) -> torch.Tensor:
     """Give the smallest positive semi-definite ``D`` with ``matrix + D`` still so."""
     values, vectors = torch.linalg.eigh(matrix)
     return (vectors * (-values).clamp(min=0)) @ vectors.conj().transpose(-2, -1)
+
+
+# Matrices whose eigenvalues are taken in one call. A stack of a population's
+# cubes is hundreds of thousands, and the workspace of a batched decomposition
+# grows with the batch.
+_log = logging.getLogger(__name__)
+
+# Matrices whose eigenvalues are taken in one call, again.
+EIGENVALUE_CHUNK = 1 << 15
+
+
+def _eigenvalues(matrices: torch.Tensor, which: int) -> torch.Tensor:
+    """Take one eigenvalue of every matrix of a stack, a chunk at a time."""
+    return torch.cat(
+        [
+            torch.linalg.eigvalsh(matrices[start : start + EIGENVALUE_CHUNK])[:, which]
+            for start in range(0, matrices.shape[0], EIGENVALUE_CHUNK)
+        ]
+    )
+
+
+def _largest(matrices: torch.Tensor) -> torch.Tensor:
+    """Largest eigenvalue of every matrix of a stack."""
+    return _eigenvalues(matrices, -1)
+
+
+def _smallest(matrices: torch.Tensor) -> torch.Tensor:
+    """Smallest eigenvalue of every matrix of a stack."""
+    return _eigenvalues(matrices, 0)
 
 
 def compress(
@@ -73,17 +103,22 @@ def compress(
             f"the margin is a fraction of the largest eigenvalue, got {margin}"
         )
 
-    allowed = margin * float(torch.linalg.eigvalsh(matrices)[:, -1].max())
+    # Every matrix keeps the largest eigenvalue it started with: the loop only
+    # takes matrices out of the stack, so it is taken once rather than once per
+    # point.
+    largest = _largest(matrices)
+    allowed = margin * float(largest.max())
     remaining = matrices
     origin = torch.arange(matrices.shape[0], device=matrices.device)
     cluster = torch.empty(matrices.shape[0], dtype=torch.long, device=matrices.device)
     vops = []
 
     while remaining.shape[0]:
-        worst = remaining[int(torch.linalg.eigvalsh(remaining)[:, -1].argmax())]
-        gaps = torch.linalg.eigvalsh(worst[None] - remaining)[:, 0]
+        worst = remaining[int(largest.argmax())]
+        gaps = _smallest(worst[None] - remaining)
         order = torch.argsort(gaps, descending=True, stable=True)
         remaining, origin = remaining[order], origin[order]
+        largest = largest[order]
 
         added = torch.zeros_like(worst)
         taken = 0
@@ -100,6 +135,13 @@ def compress(
         cluster[origin[:taken]] = len(vops)
         vops.append(worst + added)
         remaining, origin = remaining[taken:], origin[taken:]
+        largest = largest[taken:]
+        _log.info(
+            "point %d covers %d matrices, %d left",
+            len(vops),
+            taken,
+            remaining.shape[0],
+        )
 
     return torch.stack(vops), cluster
 
