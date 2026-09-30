@@ -19,6 +19,9 @@ import torch
 from mariepy.body import VoxelBody
 from mariepy.coil import SurfaceCoil
 
+# Quantile of the magnitudes `complex_slices` paints at full brightness.
+BRIGHTEST = 0.99
+
 __all__ = [
     "coil_currents",
     "complex_slices",
@@ -501,7 +504,8 @@ def complex_slices(
         Figure title.
     ceiling
         Magnitude painted at full brightness, as :func:`phase_colours` takes
-        it; here the largest over the three slices by default.
+        it. The default is the :data:`BRIGHTEST` quantile of the magnitudes
+        shown, which keeps one hot voxel from darkening the rest.
 
     Returns
     -------
@@ -516,7 +520,16 @@ def complex_slices(
         index = tuple(n // 2 for n in field.shape)
     cuts = (field[index[0]], field[:, index[1]], field[:, :, index[2]])
     if ceiling is None:
-        ceiling = max(float(cut.abs().max()) for cut in cuts)
+        # The brightest voxel of a field beside a conductor runs orders of
+        # magnitude above the body's own, and scaling to it paints everything
+        # else black.
+        shown = torch.cat([cut.reshape(-1).abs() for cut in cuts])
+        shown = shown[shown > 0]
+        ceiling = (
+            float(torch.quantile(shown.to(torch.float64), BRIGHTEST))
+            if shown.numel()
+            else 1.0
+        )
 
     figure, axes = pyplot.subplots(
         1, 4, figsize=(12, 4), width_ratios=(1.0, 1.0, 1.0, 0.08)

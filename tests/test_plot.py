@@ -152,3 +152,14 @@ def test_complex_slices_draw_three_cuts_and_a_wheel():
     figure = plot.complex_slices(volume, mask=mask, title="B1+")
     assert len(figure.axes) == 4
     assert figure.axes[0].images[0].get_array().shape == (7, 6, 3)
+
+
+def test_complex_slices_scale_to_the_bulk_not_the_brightest_voxel():
+    """One hot voxel must not darken a map."""
+    volume = torch.full((21, 21, 21), 0.1, dtype=torch.complex128)
+    volume[10, 10, 10] = 1000.0
+    figure = plot.complex_slices(volume)
+    painted = figure.axes[0].images[0].get_array()
+    assert painted.max() == pytest.approx(1.0, abs=1e-6)
+    # The bulk keeps its brightness rather than falling to 1e-4 of the peak.
+    assert float(np.median(painted.max(axis=-1))) > 0.5

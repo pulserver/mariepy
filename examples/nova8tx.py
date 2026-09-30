@@ -33,6 +33,7 @@ The three subcommands are:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import math
 from pathlib import Path
 
@@ -52,6 +53,18 @@ CHANNELS = 8
 
 # 7 T, the field the coil is built for.
 FIELD_STRENGTH = 6.98
+
+# BrainWeb's models all cover 181 mm across the head, the classic phantom in
+# 181 voxels and each subject in 362.
+FIELD_OF_VIEW_MM = 181.0
+
+COIL_NAME = "nova8tx"
+DRIVE_UNIT = "one ampere in each source of the channel, as --weights sets them"
+FRAME = (
+    "scanner frame of a head-first supine subject: x to the subject's left, "
+    "y posterior, z superior, the coil's centre at the origin"
+)
+LICENCE = "BrainWeb models, for research use; see brainweb.bic.mni.mcgill.ca"
 
 # The sphere Ozkara et al. fit the source currents in.
 PHANTOM_RADIUS = 0.082
@@ -460,6 +473,7 @@ def main() -> None:
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--weights", help="a .pt file of fitted source currents")
     parser.add_argument("--subjects", type=int, nargs="*", default=[4, 5, 6])
+    parser.add_argument("--margin", type=float, default=0.05, help="VOP overestimation")
     arguments = parser.parse_args()
 
     out = Path(arguments.out)
@@ -487,7 +501,155 @@ def main() -> None:
     if arguments.what == "phantom":
         run_phantom(coil, medium, currents, system, arguments, out)
         return
-    raise SystemExit(f"{arguments.what} is not built yet")
+    run_bodies(coil, medium, currents, system, arguments, out)
+
+
+def brainweb_head(subject: int, resolution: float, medium, device):
+    """Build one BrainWeb subject's head, centred where the coil holds it.
+
+    The head is placed with the centre of its box at the coil's own centre,
+    which is what a subject in a head coil sits at. The subjects carry the
+    twelve classes of BrainWeb's anatomical models, which
+    ``brainweb_subject_tissues.csv`` names; the classic phantom's ten are a
+    different set, and ``brainweb_tissues.csv`` names those.
+    """
+    import sys
+    from pathlib import Path as _Path
+
+    sys.path.insert(0, str(_Path(__file__).parent))
+    import brainweb_dl
+    import numpy as np
+    from scipy import ndimage
+
+    from mariepy import tissue
+
+    # A subject's fractions fill 5 GB in double precision, and a fraction
+    # carries far fewer digits than that.
+    fine = np.asarray(brainweb_dl.get_mri(subject, "fuzzy"), dtype=np.float32)
+    labelled, _ = ndimage.label(fine[..., 0] < 0.5)
+    sizes = np.bincount(labelled.ravel())
+    sizes[0] = 0
+    stray = (labelled != 0) & (labelled != sizes.argmax())
+    del labelled, sizes
+    fine[stray] = 0.0
+    fine[stray, 0] = 1.0
+    del stray
+    shape = fine.shape
+    scanner = np.ascontiguousarray(fine.transpose(2, 1, 0, 3)[::-1, ::-1])
+    del fine
+    # Every model covers the same field of view, and the files carry no
+    # spacing: the classic phantom samples it at 1 mm and the subjects at
+    # 0.5 mm, so the shape gives the voxel.
+    native = FIELD_OF_VIEW_MM / shape[2]
+    step = round(resolution * 1e3 / native)
+    if not math.isclose(step * native, resolution * 1e3, rel_tol=1e-9):
+        raise ValueError(
+            f"a {resolution * 1e3:.1f} mm voxel is not a whole number of the "
+            f"model's own {native:.2f} mm"
+        )
+    coarse = tissue.coarsen(torch.from_numpy(scanner).to(torch.float64), step)
+    del scanner
+    table = tissue.read_table(_Path(__file__).with_name("brainweb_subject_tissues.csv"))
+    built = tissue.mix(
+        coarse.to(device), table, medium, resolution, origin=(0.0, 0.0, 0.0)
+    )
+
+    body = built.body
+    points = body.coordinates()[:, body.mask]
+    middle = 0.5 * (points.amax(dim=1) + points.amin(dim=1))
+    origin = tuple(float(o - c) for o, c in zip(body.origin, middle, strict=True))
+    return dataclasses.replace(built, body=dataclasses.replace(body, origin=origin))
+
+
+def run_bodies(coil, medium, currents, system, arguments, out: Path) -> None:
+    """Solve each subject, write its maps and images, and compress the population's VOPs."""
+    import time
+
+    from mariepy import averaging, maps, sar, vop
+    from mariepy import fields as field_module
+
+    resolution = arguments.resolution * 1e-3
+    channels = [f"ch{index + 1}" for index in range(CHANNELS)]
+    averaged_all, whole_all, names = [], [], []
+    for subject in arguments.subjects:
+        start = time.time()
+        built = brainweb_head(subject, resolution, medium, arguments.device)
+        body = built.body
+        print(
+            f"subject {subject}: {body.n_voxels} voxels of {arguments.resolution:.0f} mm, "
+            f"grid {tuple(body.shape)}",
+            flush=True,
+        )
+        solved, operator = solve_body(
+            body, coil, medium, currents, system=system, precision="mixed"
+        )
+        plus, minus = field_module.circular_components(operator, solved)
+        maps.write(
+            out / f"subject{subject:02d}.npz",
+            plus,
+            minus,
+            body.mask,
+            coil=COIL_NAME,
+            channels=channels,
+            frequency_hz=medium.frequency,
+            drive_unit=DRIVE_UNIT,
+            origin=body.origin,
+            resolution=body.resolution,
+            frame=FRAME,
+            bodies=[f"BrainWeb subject {subject:02d}"],
+            data_licence=LICENCE,
+        )
+        draw_channels(
+            plus * 1e6,
+            body.mask,
+            out / f"subject{subject:02d}_b1",
+            title=f"subject {subject:02d} B1+ [uT per unit drive], channel",
+        )
+        electric = field_module.at_centres(solved.electric)
+        draw_channels(
+            torch.linalg.vector_norm(electric, dim=1).to(torch.complex128),
+            body.mask,
+            out / f"subject{subject:02d}_e",
+            title=f"subject {subject:02d} |E| [V/m per unit drive], channel",
+        )
+
+        mass = torch.where(body.mask, built.density * body.resolution**3, 0.0)
+        local = sar.local_matrices(
+            solved.electric, body.conductivity, built.density, body.mask
+        )
+        pool = averaging.cube_pool(mass, body.mask, 10e-3)
+        averaged_all.append(averaging.averaged_matrices(pool, local, mass, body.mask))
+        whole_all.append(
+            sar.average(
+                local, sar.voxel_mass(built.density, body.resolution, body.mask)
+            )
+        )
+        names.append(f"BrainWeb subject {subject:02d}")
+        print(
+            f"  {len(pool)} averaging cubes, peak 10 g eigenvalue "
+            f"{float(torch.linalg.eigvalsh(averaged_all[-1]).amax()):.4g} W/kg, "
+            f"{time.time() - start:.0f}s",
+            flush=True,
+        )
+
+    points, _ = vop.compress(torch.cat(averaged_all), arguments.margin)
+    vop.write(
+        out / "nova8tx_vops.npz",
+        points,
+        torch.stack(whole_all),
+        coil=COIL_NAME,
+        frequency_hz=medium.frequency,
+        drive_unit=DRIVE_UNIT,
+        channels=channels,
+        averaging="10 g, IEC/IEEE 62704-1",
+        bodies=names,
+        compression_margin=arguments.margin,
+        data_licence=LICENCE,
+    )
+    print(
+        f"wrote {out / 'nova8tx_vops.npz'}: {points.shape[0]} points from "
+        f"{sum(a.shape[0] for a in averaged_all)} cubes over {len(names)} subjects"
+    )
 
 
 def run_phantom(coil, medium, currents, system, arguments, out: Path) -> None:
