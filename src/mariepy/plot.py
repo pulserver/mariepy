@@ -12,6 +12,7 @@ figure. matplotlib is an optional dependency: ``pip install "mariepy[plot]"``.
 from __future__ import annotations
 
 import cmath
+import math
 
 import torch
 
@@ -20,10 +21,13 @@ from mariepy.coil import SurfaceCoil
 
 __all__ = [
     "coil_currents",
+    "complex_slices",
     "current_density",
     "geometry",
     "ideal_current_patterns",
     "impedance",
+    "phase_colours",
+    "phase_wheel",
     "scattering",
     "slices",
     "sweep",
@@ -408,6 +412,124 @@ def sweep(result):
     top.legend(fontsize=7)
     bottom.set_ylabel("Z (ohm): Re, then Im faded")
     bottom.set_xlabel("frequency (MHz)")
+    return figure
+
+
+def phase_colours(values: torch.Tensor, *, ceiling: float | None = None):
+    """Paint a complex field so that its phase is the hue and its magnitude the brightness.
+
+    The hue runs blue, green, yellow, magenta and back to blue as the phase
+    goes from -pi to pi, the wheel BART draws receive sensitivities with, and
+    the magnitude scales the brightness from black at zero.
+
+    Parameters
+    ----------
+    values
+        Any shape, complex.
+    ceiling
+        Magnitude painted at full brightness. The largest magnitude by
+        default; give the same one to every panel of a figure to keep them
+        comparable.
+
+    Returns
+    -------
+    numpy.ndarray
+        Shape ``(*values.shape, 3)``, float in ``[0, 1]``: red, green and blue.
+    """
+    import matplotlib.colors as colours
+
+    field = values.detach().resolve_conj().cpu()
+    magnitude = field.abs().to(torch.float64)
+    top = float(magnitude.max()) if ceiling is None else float(ceiling)
+    brightness = (magnitude / top).clamp(0.0, 1.0) if top > 0 else magnitude
+    # Blue at -pi through green and yellow to magenta, decreasing hue.
+    hue = ((2.0 / 3.0 - 0.5 * (torch.angle(field) / torch.pi + 1.0)) % 1.0).to(
+        torch.float64
+    )
+    stacked = torch.stack(
+        [hue, torch.ones_like(brightness), brightness], dim=-1
+    ).numpy()
+    return colours.hsv_to_rgb(stacked)
+
+
+def phase_wheel(ax=None, *, size: int = 256):
+    """Draw the wheel :func:`phase_colours` paints with, as a colour bar.
+
+    Parameters
+    ----------
+    ax
+        Axes to draw on; a new figure otherwise.
+    size
+        Samples along the bar.
+
+    Returns
+    -------
+    matplotlib.axes.Axes
+        The bar, phase upwards from -pi to pi.
+    """
+    _, ax = _axes(ax)
+    phase = torch.linspace(-torch.pi, torch.pi, size, dtype=torch.float64)
+    bar = phase_colours(torch.polar(torch.ones_like(phase), phase))
+    ax.imshow(bar[:, None, :], origin="lower", extent=(0.0, 1.0, -math.pi, math.pi))
+    ax.set_xticks([])
+    ax.set_yticks([-math.pi, 0.0, math.pi])
+    ax.set_yticklabels([r"$-\pi$", "0", r"$\pi$"])
+    ax.yaxis.tick_right()
+    ax.set_aspect("auto")
+    return ax
+
+
+def complex_slices(
+    volume: torch.Tensor,
+    index=None,
+    *,
+    mask=None,
+    title: str = "",
+    ceiling: float | None = None,
+):
+    """Show three orthogonal slices of a complex map, phase in the hue.
+
+    Parameters
+    ----------
+    volume
+        Shape ``(n1, n2, n3)``, complex.
+    index
+        The slice along each axis; the middle by default.
+    mask
+        Where to show values; elsewhere is black.
+    title
+        Figure title.
+    ceiling
+        Magnitude painted at full brightness, as :func:`phase_colours` takes
+        it; here the largest over the three slices by default.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The three panels and the phase wheel.
+    """
+    pyplot = _pyplot()
+    field = volume.detach().cpu()
+    if mask is not None:
+        field = torch.where(mask.cpu(), field, torch.zeros_like(field))
+    if index is None:
+        index = tuple(n // 2 for n in field.shape)
+    cuts = (field[index[0]], field[:, index[1]], field[:, :, index[2]])
+    if ceiling is None:
+        ceiling = max(float(cut.abs().max()) for cut in cuts)
+
+    figure, axes = pyplot.subplots(
+        1, 4, figsize=(12, 4), width_ratios=(1.0, 1.0, 1.0, 0.08)
+    )
+    for ax, cut, name, position in zip(axes[:3], cuts, "xyz", index, strict=True):
+        ax.imshow(
+            phase_colours(cut, ceiling=ceiling).transpose(1, 0, 2), origin="lower"
+        )
+        ax.set_title(f"{name} = {position}")
+        ax.set_axis_off()
+    phase_wheel(axes[3])
+    if title:
+        figure.suptitle(title)
     return figure
 
 
