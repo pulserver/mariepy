@@ -147,6 +147,21 @@ plus, minus = fields.circular_components(medium, open_ports)
 three head arrays, and writes each coil's maps with `maps.write` and the
 transmit coils' VOPs with `vop.write`.
 
+### Command line
+
+```bash
+mariepy solve my_case.json --data marie-tools/data --out ports.npz
+mariepy vops my_case.json --data marie-tools/data --labels labels.npy \
+    --table tissue.csv --out vops.npz
+mariepy vops --sphere --out vops.npz   # a loop coil around a ball
+```
+
+`solve` prints the port solve, reciprocity, power balance, co-simulation and
+B1+ and SNR summaries, and `--out` keeps the admittance and scattering
+matrices. `vops` writes the file `vop.read` reads; without `--labels` and
+`--table` the case's own tissue properties are used with `--density`.
+`examples/tissue_gabriel.csv` shows the table's columns.
+
 ## Development
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
