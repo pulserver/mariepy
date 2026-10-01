@@ -24,6 +24,9 @@ classifiers = [
 
 dependencies = ["numpy>=1.24", "torch>=2.4"]
 
+[project.scripts]
+mariepy = "mariepy.cli:main"
+
 [project.optional-dependencies]
 # Co-simulation's searches run on scipy's differential evolution.
 cosim = ["scipy>=1.12"]
