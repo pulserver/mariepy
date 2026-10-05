@@ -152,14 +152,17 @@ transmit coils' VOPs with `vop.write`.
 ```bash
 mariepy solve my_case.json --data marie-tools/data --out ports.npz
 mariepy vops my_case.json --data marie-tools/data --labels labels.npy \
-    --table tissue.csv --out vops.npz
-mariepy vops --sphere --out vops.npz   # a loop coil around a ball
+    --table tissue.csv --out vops.npz --safety-factor 1.5 --safety-basis "..."
+mariepy vops --sphere --out vops.npz --safety-factor 1 --safety-basis "demo"
 ```
 
 `solve` prints the port solve, reciprocity, power balance, co-simulation and
 B1+ and SNR summaries, and `--out` keeps the admittance and scattering
 matrices. `vops` writes the file `vop.read` reads; without `--labels` and
-`--table` the case's own tissue properties are used with `--density`.
+`--table` the case's own tissue properties are used with `--density`. The
+file carries `--safety-factor`, which every local SAR read from it is
+multiplied by, with `--safety-basis` stating what it covers, and optionally
+`--transmit`, the transmit configuration it is valid for.
 `examples/tissue_gabriel.csv` shows the table's columns.
 
 ## Development

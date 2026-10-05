@@ -116,6 +116,8 @@ def _file_arguments():
         "averaging": "10 g, IEC/IEEE 62704-1",
         "bodies": ["duke", "ella"],
         "compression_margin": MARGIN,
+        "safety_factor": 1.5,
+        "safety_basis": "B1+ fit error and population spread of the test",
         "data_licence": "CC BY 4.0",
     }
 
@@ -163,6 +165,24 @@ def test_a_channel_count_the_names_do_not_match_is_refused(tmp_path, device):
 def test_a_body_count_the_names_do_not_match_is_refused(tmp_path, device):
     with pytest.raises(ValueError, match="body names"):
         _written(tmp_path, device, bodies=["duke"])
+
+
+def test_the_transmit_identity_reads_back_and_is_absent_unless_given(tmp_path, device):
+    path, _, _, _ = _written(tmp_path, device)
+    assert "transmit" not in vop.read(path).metadata
+    path, _, _, _ = _written(tmp_path, device, transmit="Head8Tx/8/0x1a2b3c4d")
+    assert vop.read(path).metadata["transmit"] == "Head8Tx/8/0x1a2b3c4d"
+
+
+@pytest.mark.parametrize("factor", [0.9, float("nan")])
+def test_a_safety_factor_below_one_is_refused(tmp_path, device, factor):
+    with pytest.raises(ValueError, match="at least 1"):
+        _written(tmp_path, device, safety_factor=factor)
+
+
+def test_a_safety_factor_without_a_basis_is_refused(tmp_path, device):
+    with pytest.raises(ValueError, match="basis"):
+        _written(tmp_path, device, safety_basis=" ")
 
 
 def test_a_stack_that_is_not_hermitian_is_refused(tmp_path):

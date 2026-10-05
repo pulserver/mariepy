@@ -251,7 +251,10 @@ def _vops(args) -> None:
         averaging=f"{args.target:g} g, IEC/IEEE 62704-1",
         bodies=[name],
         compression_margin=args.margin,
+        safety_factor=args.safety_factor,
+        safety_basis=args.safety_basis,
         data_licence=licence,
+        transmit=args.transmit,
     )
     print(f"wrote {args.out} with mariepy {__version__} in {time.time() - t0:.0f}s")
 
@@ -301,6 +304,15 @@ def main(argv: list[str] | None = None) -> None:
     vops.add_argument("--target", type=float, default=10.0, help="averaging mass in g")
     vops.add_argument("--margin", type=float, default=0.05, help="VOP overestimation")
     vops.add_argument("--out", required=True, help="the VOP file to write")
+    vops.add_argument(
+        "--safety-factor", type=float, required=True, help="on every local SAR read"
+    )
+    vops.add_argument(
+        "--safety-basis", required=True, help="what the safety factor covers, one line"
+    )
+    vops.add_argument(
+        "--transmit", help="the transmit configuration the scanner reports"
+    )
     vops.set_defaults(run=_vops)
 
     args = parser.parse_args(argv)

@@ -1,8 +1,9 @@
 """Solve BrainWeb's normal brain in a body coil and three head arrays, and write their maps and VOPs.
 
 usage, from the repository root:
-    python examples/brainweb.py --out fields
-    python examples/brainweb.py --out fields --resolution 10 --loops 8 12 16
+    python examples/brainweb.py --out fields --safety-factor 1.5 --safety-basis "..."
+    python examples/brainweb.py --out fields --resolution 10 --loops 8 12 16 \
+        --coils head32 head48
 
 The head is BrainWeb's normal brain (Collins et al., IEEE Trans Med Imaging
 17:463, 1998), whose fuzzy model gives every 1 mm voxel the fraction each of
@@ -78,9 +79,15 @@ parser.add_argument(
 parser.add_argument("--coils", nargs="*", help="coils to solve; all by default")
 parser.add_argument("--tol", type=float, default=1e-5, help="solver residual")
 parser.add_argument("--margin", type=float, default=0.05, help="VOP overestimation")
+parser.add_argument("--safety-factor", type=float, help="on every local SAR read")
+parser.add_argument("--safety-basis", help="what the safety factor covers, one line")
 parser.add_argument("--brainweb-dir", help="brainweb-dl's cache")
 parser.add_argument("--device", default="cpu")
 args = parser.parse_args()
+if (args.coils is None or {"body", "head8"} & set(args.coils)) and (
+    args.safety_factor is None or not args.safety_basis
+):
+    parser.error("the transmit coils' VOP files need --safety-factor and --safety-basis")
 
 
 def say(text):
@@ -234,6 +241,8 @@ def write_vops(name, drives, built, channels, drive_unit):
         averaging="10 g, IEC/IEEE 62704-1",
         bodies=[BODY],
         compression_margin=args.margin,
+        safety_factor=args.safety_factor,
+        safety_basis=args.safety_basis,
         data_licence=LICENCE,
     )
     say(f"{name}: {points.shape[0]} VOPs from {len(pool)} cubes")

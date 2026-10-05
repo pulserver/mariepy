@@ -62,13 +62,16 @@ The unit must be the same for every channel. Channel order is the coil model's.
 | `averaging` | Target mass and method |
 | `bodies` | Identifiers of the body models, in the order of `global_matrix` |
 | `compression_margin` | Overestimation allowed in VOP compression |
+| `safety_factor` | Factor, at least 1, on every local SAR read from the file |
+| `safety_basis` | What the safety factor covers and where it comes from |
+| `transmit` | Optional: the transmit configuration the file is valid for, as the scanner reports it |
 | `mariepy_version` | Version that wrote the file |
 | `data_licence` | Licence of the file, set by its body models |
 
-pypulseqpp's `read_vops` reads the file of one body model, whose
-`global_matrix` is (1, Nc, Nc), and leaves the metadata unread. A file of
-several body models needs a pypulseqpp that checks each body's head-average
-SAR.
+pypulseqpp's `read_vops` reads the points, the head-average matrix of every
+body model and the metadata; its `check_sar` multiplies every local SAR by the
+file's `safety_factor`. A factor on the matrices themselves would cancel in a
+ratio of two drives' SAR, which is why it travels as metadata.
 
 ## Field maps
 
