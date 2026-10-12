@@ -309,15 +309,10 @@ class VoxelBody:
 
         Raises
         ------
-        ImportError
-            If scipy, which reads the file, is not installed.
         ValueError
             If the file holds no ``RHBM``, or its grid is not uniform.
         """
-        try:
-            from scipy.io import loadmat
-        except ImportError as error:  # pragma: no cover - scipy is a dev dependency
-            raise ImportError("reading a MARIE body model needs scipy") from error
+        from scipy.io import loadmat
 
         held = loadmat(Path(path), squeeze_me=True, struct_as_record=False)
         if "RHBM" not in held:

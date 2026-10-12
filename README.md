@@ -91,8 +91,7 @@ With `"TMD": 0` the file's values are placed as they are. `closed.transmit`
 has a column per transmitting port and `closed.receive` one per receiving
 port, as the element file assigns `Tx`, `Rx` and `TxRx`; `closed.scattering`
 is the transmitting ports' reflection and coupling; `cosim.sweep` gives the
-matched ports across a band. The searches need scipy:
-`pip install "mariepy[cosim]"`.
+matched ports across a band.
 
 ### Field bases, SNR and figures
 
@@ -115,7 +114,7 @@ ultimate_snr, ultimate_efficiency = basis.ultimate_maps(solved, case.body, case.
 `metrics.noise_covariance`, `metrics.snr`, `metrics.transmit_efficiency` and
 `metrics.g_factor` map a coil's performance from its fields; `plot.geometry`,
 `plot.coil_currents`, `plot.scattering`, `plot.sweep` and `plot.slices` draw
-the model and the maps (`pip install "mariepy[plot]"`).
+the model and the maps.
 
 ### Head models, body coils, arrays and field maps
 

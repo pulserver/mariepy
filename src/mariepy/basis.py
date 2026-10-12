@@ -1125,18 +1125,11 @@ def read_marie(path, body: VoxelBody, *, device=None) -> FieldBasis:
 
     Raises
     ------
-    ImportError
-        Without h5py.
     ValueError
         If the file's fields do not fit the body, or a sampled voxel is not
         one of its tissue voxels.
     """
-    try:
-        import h5py
-    except ImportError as error:  # pragma: no cover - depends on the install
-        raise ImportError(
-            "reading MARIE's basis files needs h5py: pip install 'mariepy[marie]'"
-        ) from error
+    import h5py
     import numpy as np
 
     device = body.device if device is None else device

@@ -6,7 +6,7 @@ Ported in intent from MARIE 3.0's ``src_visualizer``: ``visualize_geometry.m``,
 ``visualize_ideal_current_patterns.m``, with
 ``slices`` for any voxel map (SNR, transmit efficiency, ``B1``, SAR). Each
 function draws on an axes it is given, or on a new figure, and returns the
-figure. matplotlib is an optional dependency: ``pip install "mariepy[plot]"``.
+figure.
 """
 
 from __future__ import annotations
@@ -38,12 +38,8 @@ __all__ = [
 
 
 def _pyplot():
-    try:
-        import matplotlib.pyplot as pyplot
-    except ImportError as error:  # pragma: no cover - depends on the install
-        raise ImportError(
-            "figures need matplotlib: pip install 'mariepy[plot]'"
-        ) from error
+    import matplotlib.pyplot as pyplot
+
     return pyplot
 
 

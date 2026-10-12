@@ -1,17 +1,17 @@
 """Figures draw what they are given."""
 
+import matplotlib
 import numpy as np
 import pytest
 import torch
 
-matplotlib = pytest.importorskip("matplotlib")
 matplotlib.use("Agg")
 
-from mariepy import cosim, plot  # noqa: E402
-from mariepy.body import VoxelBody  # noqa: E402
-from mariepy.coil import Port, SurfaceCoil  # noqa: E402
-from mariepy.mesh import SurfaceMesh  # noqa: E402
-from mariepy.wire import CombinedCoil, WireCoil  # noqa: E402
+from mariepy import cosim, plot
+from mariepy.body import VoxelBody
+from mariepy.coil import Port, SurfaceCoil
+from mariepy.mesh import SurfaceMesh
+from mariepy.wire import CombinedCoil, WireCoil
 
 
 def _port(tag):

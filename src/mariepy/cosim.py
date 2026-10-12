@@ -875,12 +875,7 @@ def _minimise(
     population holds the best vector so far, so the search ends no worse than
     the values it was handed; MARIE's swarms start at random.
     """
-    try:
-        from scipy.optimize import differential_evolution
-    except ImportError as error:  # pragma: no cover - depends on the install
-        raise ImportError(
-            "co-simulation searches need scipy: pip install 'mariepy[cosim]'"
-        ) from error
+    from scipy.optimize import differential_evolution
 
     lower = np.array(lower, dtype=np.float64)
     upper = np.array(upper, dtype=np.float64)
