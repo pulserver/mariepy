@@ -413,7 +413,6 @@ def _dense_fields(coil, body, medium):
 
 def test_a_basis_saved_as_marie_saves_it_solves_a_coil_as_ours_does(solved, tmp_path):
     """MARIE's file layout, its voxel order and its tested form, read back."""
-    pytest.importorskip("h5py")
     from tests.marie_files import write_marie_basis
 
     medium, body, coil, field_basis, linear = solved
@@ -455,7 +454,6 @@ def test_a_basis_saved_as_marie_saves_it_solves_a_coil_as_ours_does(solved, tmp_
 
 
 def test_a_basis_for_another_body_is_refused(solved, tmp_path):
-    pytest.importorskip("h5py")
     from tests.marie_files import write_marie_basis
 
     _, body, _, _, _ = solved
