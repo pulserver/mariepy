@@ -326,3 +326,29 @@ def test_the_cross_approximation_follows_the_tolerance_it_is_given(device):
         left[tol] = implicit._missed(operator, coupling, coil_side, 2)
         assert left[tol] <= 10 * tol
     assert left[1e-4] < left[1e-2]
+
+
+def test_left_singular_vectors_of_an_extended_basis_match_the_direct_decomposition(
+    device,
+):
+    generator = torch.Generator().manual_seed(0)
+    tall = torch.randn(400, 12, dtype=torch.complex128, generator=generator)
+    basis = torch.linalg.qr(tall).Q.to(device)
+    extended = torch.cat(
+        [
+            basis,
+            basis[:, :5]
+            @ torch.randn(5, 6, dtype=torch.complex128, generator=generator).to(device),
+        ],
+        dim=1,
+    )
+    vectors = implicit._left_singular_vectors(extended)
+    direct, _, _ = torch.linalg.svd(extended, full_matrices=False)
+    assert vectors.shape == direct.shape
+    assert torch.allclose(
+        vectors.conj().transpose(0, 1) @ vectors,
+        torch.eye(vectors.shape[1], dtype=vectors.dtype, device=device),
+        atol=1e-10,
+    )
+    span = vectors[:, :12] @ vectors[:, :12].conj().transpose(0, 1)
+    assert torch.allclose(span @ basis, basis, atol=1e-10)
