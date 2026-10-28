@@ -326,3 +326,36 @@ def test_the_cross_approximation_follows_the_tolerance_it_is_given(device):
         left[tol] = implicit._missed(operator, coupling, coil_side, 2)
         assert left[tol] <= 10 * tol
     assert left[1e-4] < left[1e-2]
+
+
+def _extended_basis(device):
+    generator = torch.Generator().manual_seed(0)
+    tall = torch.randn(400, 12, dtype=torch.complex128, generator=generator)
+    basis = torch.linalg.qr(tall).Q
+    spanned = basis[:, :5] @ torch.randn(
+        5, 6, dtype=torch.complex128, generator=generator
+    )
+    return basis.to(device), torch.cat([basis, spanned], dim=1).to(device)
+
+
+def _assert_strongest_vectors_span(vectors, basis):
+    assert vectors.shape == (basis.shape[0], 18)
+    gram = vectors.conj().transpose(0, 1) @ vectors
+    assert torch.allclose(gram, torch.eye(18, dtype=gram.dtype, device=gram.device))
+    strongest = vectors[:, :12]
+    projected = strongest @ (strongest.conj().transpose(0, 1) @ basis)
+    assert torch.allclose(projected, basis, atol=1e-10)
+
+
+def test_an_extended_basis_keeps_its_span_in_its_strongest_singular_vectors(device):
+    basis, extended = _extended_basis(device)
+    _assert_strongest_vectors_span(implicit._left_singular_vectors(extended), basis)
+
+
+def test_a_failed_svd_still_gives_the_strongest_singular_vectors(device, monkeypatch):
+    def unconverged(*args, **kwargs):
+        raise torch.linalg.LinAlgError("linalg.svd: The algorithm failed to converge")
+
+    basis, extended = _extended_basis(device)
+    monkeypatch.setattr(torch.linalg, "svd", unconverged)
+    _assert_strongest_vectors_span(implicit._left_singular_vectors(extended), basis)
