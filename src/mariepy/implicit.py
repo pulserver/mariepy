@@ -648,10 +648,8 @@ def _cross_coupling(
     dofs = torch.sort(
         torch.randperm(n_coil, generator=generator)[:rank].to(grid.device)
     ).values
-    body_basis, _, _ = torch.linalg.svd(sample(region_cells, dofs), full_matrices=False)
-    coil_basis, _, _ = torch.linalg.svd(
-        sample(cells, None).conj().transpose(0, 1), full_matrices=False
-    )
+    body_basis = _left_singular_vectors(sample(region_cells, dofs))
+    coil_basis = _left_singular_vectors(sample(cells, None).conj().transpose(0, 1))
 
     def fit() -> tuple:
         rows = _row_numbers(grid, cells, n_components)
@@ -679,21 +677,16 @@ def _cross_coupling(
         if fresh_dofs.numel() == 0 and fresh_cells.numel() == 0:
             break
         if fresh_dofs.numel():
-            body_basis, _, _ = torch.linalg.svd(
-                torch.cat([body_basis, sample(region_cells, fresh_dofs)], dim=1),
-                full_matrices=False,
+            body_basis = _left_singular_vectors(
+                torch.cat([body_basis, sample(region_cells, fresh_dofs)], dim=1)
             )
             dofs = torch.sort(torch.cat([dofs, fresh_dofs])).values
         if fresh_cells.numel():
-            coil_basis, _, _ = torch.linalg.svd(
+            coil_basis = _left_singular_vectors(
                 torch.cat(
-                    [
-                        coil_basis,
-                        sample(fresh_cells, None).conj().transpose(0, 1),
-                    ],
+                    [coil_basis, sample(fresh_cells, None).conj().transpose(0, 1)],
                     dim=1,
-                ),
-                full_matrices=False,
+                )
             )
             cells = torch.sort(torch.cat([cells, fresh_cells])).values
 
@@ -769,6 +762,26 @@ def _settled(
     )
     reached = torch.sqrt(moved**2 + fresh**2)
     return bool(tol * torch.linalg.vector_norm(now[:rank]) > reached)
+
+
+def _left_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
+    """Give the left singular vectors of ``matrix``, strongest first.
+
+    A basis extended by columns it already spans has many singular values at one
+    and many near zero, which LAPACK's divide and conquer SVD can fail to
+    converge on, depending on the CPU. The matrix is reduced by QR first, and if
+    the SVD of its triangular factor still fails, the vectors come from the
+    eigendecomposition of that factor's Gram matrix instead. The two agree on
+    every vector whose singular value stands above the square root of machine
+    precision, which is all the cross approximation keeps.
+    """
+    q, r = torch.linalg.qr(matrix)
+    try:
+        u, _, _ = torch.linalg.svd(r, full_matrices=False)
+    except torch.linalg.LinAlgError:
+        _, u = torch.linalg.eigh(r @ r.conj().transpose(0, 1))
+        u = u.flip(-1)
+    return q @ u
 
 
 def _outside(candidate: torch.Tensor, held: torch.Tensor) -> torch.Tensor:
