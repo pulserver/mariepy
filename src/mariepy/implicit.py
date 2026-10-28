@@ -767,13 +767,20 @@ def _settled(
 def _left_singular_vectors(matrix: torch.Tensor) -> torch.Tensor:
     """Give the left singular vectors of ``matrix``, strongest first.
 
-    The matrix is reduced by QR first, so the singular value decomposition runs
-    on its small triangular factor. A basis extended by columns it already
-    spans has many singular values at one and many near zero, which the divide
-    and conquer driver can fail to converge on when given the tall matrix whole.
+    A basis extended by columns it already spans has many singular values at one
+    and many near zero, which LAPACK's divide and conquer SVD can fail to
+    converge on, depending on the CPU. The matrix is reduced by QR first, and if
+    the SVD of its triangular factor still fails, the vectors come from the
+    eigendecomposition of that factor's Gram matrix instead. The two agree on
+    every vector whose singular value stands above the square root of machine
+    precision, which is all the cross approximation keeps.
     """
     q, r = torch.linalg.qr(matrix)
-    u, _, _ = torch.linalg.svd(r, full_matrices=False)
+    try:
+        u, _, _ = torch.linalg.svd(r, full_matrices=False)
+    except torch.linalg.LinAlgError:
+        _, u = torch.linalg.eigh(r @ r.conj().transpose(0, 1))
+        u = u.flip(-1)
     return q @ u
 
 
