@@ -487,8 +487,8 @@ they were measured on.
   random drives.
 - For random drives, the largest VOP SAR is at least the largest averaged voxel
   SAR and at most that plus the compression margin.
-- On fields of rank three or less, the compression reproduces CoSimPy's
-  `compVOP` output, conjugated.
+- On fields of rank three or less, the compression needs no more points than
+  CoSimPy's `compVOP`.
 - Each body's global matrix reproduces the head-average SAR integrated directly
   from the fields.
 
@@ -537,8 +537,8 @@ never imports mariepy.
   wheel or links into `_ext`. The 24 coupling sources in `tests/marie/` are the
   first of them.
 - **CoSimPy** (MIT, <https://github.com/umbertozanovello/CoSimPy>) enters with
-  the VOP compression stage, as the source of the compression core and as a
-  test dependency, and is listed in `THIRD_PARTY.md` then.
+  the VOP compression stage, as the reference the compression is checked
+  against and as a test dependency, and is listed in `THIRD_PARTY.md` then.
 - **MARIE's LGPL files** keep their own notice:
   - the DIRECTFN singular integrals, built as a separate extension module that
     carries it;
@@ -695,17 +695,12 @@ section says. It is described here so the solver's interfaces serve it.
 
 - **Pool.** The averaged matrices of all body models, compressed together, so the
   VOPs bound local SAR across the population.
-- **Algorithm.** Eichfelder and Gebhardt (MRM 2011, doi 10.1002/mrm.22927),
-  ported from CoSimPy's `EM_Field.compVOP` (MIT). `compVOP` builds each point's
-  matrix from one field, so it holds rank three at most and cannot take the
-  pooled averaged matrices, and its compression steps are nested inside it. The
-  port is a function of a stack of Hermitian matrices.
-- **Convention.** `compVOP` returns the complex conjugates of the matrices that
-  bound `vᴴQv` in the convention of the output contract, which CoSimPy's own
-  `compQMatrix` follows. The port writes that convention, and the check against
-  `compVOP` conjugates its output; conjugating the output and conjugating the
-  input field give the same matrices, since the algorithm uses only eigenvalues
-  and their order.
+- **Algorithm.** After Eichfelder and Gebhardt (MRM 2011, doi
+  10.1002/mrm.22927): each point is the strongest matrix left plus the margin's
+  share of the identity, and its cluster is every matrix left that it
+  dominates. Dominance is tested by a Cholesky factorisation in double
+  precision, batched on the stack's device; the eigenvalues are taken once, on
+  the processor.
 - **Margin.** The compression margin is a parameter recorded in the VOP file.
 
 **Head-average matrices.** One per body model, integrated over that model's head
