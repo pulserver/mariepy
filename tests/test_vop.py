@@ -55,7 +55,9 @@ def test_the_overestimate_stays_inside_the_margin_it_was_given(device):
     allowed = MARGIN * float(torch.linalg.eigvalsh(matrices)[:, -1].max())
     drives = _drives(16, 4).to(device)
     slack = allowed * torch.linalg.vector_norm(drives, dim=-1) ** 2
-    assert bool((sar.peak(points, drives) <= sar.peak(matrices, drives) + slack).all())
+    # A drive whose worst matrix leads a cluster reaches the margin exactly.
+    bound = (sar.peak(matrices, drives) + slack) * (1 + 1e-12)
+    assert bool((sar.peak(points, drives) <= bound).all())
 
 
 def test_every_point_is_hermitian(device):
@@ -88,8 +90,27 @@ def test_a_negative_margin_is_refused():
         vop.compress(torch.zeros(3, 2, 2, dtype=torch.complex128), -0.1)
 
 
-def test_the_compression_is_cosimpy_s_own(device):
-    """The reference implementation, with the conjugation the two conventions differ by."""
+def test_every_matrix_the_first_point_dominates_joins_its_cluster(device):
+    """A cluster is every matrix its point dominates, not those it has room for."""
+    matrices, _, _ = _matrices(device, points=200, seed=5)
+    points, cluster = vop.compress(matrices, 0.2)
+    gaps = torch.linalg.eigvalsh(points[0] - matrices.to(points.dtype))[:, 0]
+    scale = float(torch.linalg.eigvalsh(matrices)[:, -1].max())
+    assert bool((cluster[gaps > 1e-12 * scale] == 0).all())
+
+
+def test_single_precision_matrices_are_bounded_in_double(device):
+    matrices, _, _ = _matrices(device)
+    points, cluster = vop.compress(matrices.to(torch.complex64), MARGIN)
+    assert points.dtype == torch.complex128
+    gaps = torch.linalg.eigvalsh(
+        points[cluster] - matrices.to(torch.complex64).to(torch.complex128)
+    )[:, 0]
+    assert float(gaps.min()) >= 0.0
+
+
+def test_no_more_points_than_cosimpy_s_compression(device):
+    """CoSimPy's ``compVOP`` on the same stack."""
     cosimpy = pytest.importorskip("cosimpy")
     points_count = 24
     matrices, field, conductivity = _matrices(device, points=points_count, seed=2)
@@ -101,10 +122,7 @@ def test_the_compression_is_cosimpy_s_own(device):
     )
     reference, _ = em.compVOP(128e6, MARGIN, z0_ports=1, elCond_key="sigma")
     points, _ = vop.compress(matrices, MARGIN)
-    assert points.shape == reference.shape
-    torch.testing.assert_close(
-        points.cpu(), torch.from_numpy(np.conj(reference)), atol=1e-10, rtol=1e-8
-    )
+    assert points.shape[0] <= reference.shape[0]
 
 
 def _file_arguments():
@@ -258,7 +276,7 @@ def test_a_body_carries_from_its_fields_to_a_file_that_still_bounds_it(tmp_path)
     )
 
 
-def test_the_compression_takes_its_eigenvalues_in_chunks(monkeypatch, device):
+def test_the_compression_works_in_chunks(monkeypatch, device):
     """Chunking is how a population's stack fits; it changes no answer."""
     generator = torch.Generator().manual_seed(4)
     factors = torch.complex(
@@ -268,7 +286,7 @@ def test_the_compression_takes_its_eigenvalues_in_chunks(monkeypatch, device):
     matrices = factors @ factors.conj().transpose(-2, -1)
 
     whole, clustered = vop.compress(matrices, 0.1)
-    monkeypatch.setattr(vop, "EIGENVALUE_CHUNK", 7)
+    monkeypatch.setattr(vop, "CHUNK", 7)
     chunked, again = vop.compress(matrices, 0.1)
     torch.testing.assert_close(chunked, whole, rtol=1e-12, atol=0.0)
     assert bool((again == clustered).all())

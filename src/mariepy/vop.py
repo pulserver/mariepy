@@ -7,9 +7,10 @@ replaces the set by a few matrices, each dominating a cluster of the originals,
 so that the largest ``v^H A v`` over the virtual observation points is never
 below the true peak and overestimates it by a bounded amount.
 
-The bound is set by ``margin``, a fraction of the largest eigenvalue in the set:
-that is how much spectral norm a cluster's matrix is allowed to add over the
-cluster's own worst member.
+The bound is set by ``margin``, a fraction of the largest eigenvalue in the set.
+Each point is its cluster's strongest matrix plus that much of the identity, so
+it overestimates every drive's SAR by at most the margin, and its cluster is
+every matrix left that it dominates.
 
 :func:`write` and :func:`read` carry the points to a pulse designer in the file
 ``PLAN.md`` calls the output contract: a NumPy archive of the points, one
@@ -30,39 +31,41 @@ import torch
 __all__ = ["VopFile", "compress", "dominates", "read", "write"]
 
 
-def _deficiency(matrix: torch.Tensor) -> torch.Tensor:
-    """Give the smallest positive semi-definite ``D`` with ``matrix + D`` still so."""
-    values, vectors = torch.linalg.eigh(matrix)
-    return (vectors * (-values).clamp(min=0)) @ vectors.conj().transpose(-2, -1)
-
-
-# Matrices whose eigenvalues are taken in one call. A stack of a population's
-# cubes is hundreds of thousands, and the workspace of a batched decomposition
-# grows with the batch.
 _log = logging.getLogger(__name__)
 
-# Matrices whose eigenvalues are taken in one call, again.
-EIGENVALUE_CHUNK = 1 << 15
+# Matrices taken in one call. A stack of a population's cubes is hundreds of
+# thousands, and a batched Hermitian decomposition on the accelerator asks for
+# workspace per matrix that such a stack cannot be given: the eigenvalues are
+# taken on the processor, and the accelerator only factors.
+CHUNK = 1 << 17
 
 
-def _eigenvalues(matrices: torch.Tensor, which: int) -> torch.Tensor:
-    """Take one eigenvalue of every matrix of a stack, a chunk at a time."""
+def _largest(matrices: torch.Tensor) -> torch.Tensor:
+    """Largest eigenvalue of every matrix of a stack, on the processor."""
     return torch.cat(
         [
-            torch.linalg.eigvalsh(matrices[start : start + EIGENVALUE_CHUNK])[:, which]
-            for start in range(0, matrices.shape[0], EIGENVALUE_CHUNK)
+            torch.linalg.eigvalsh(matrices[start : start + CHUNK].cpu())[:, -1]
+            for start in range(0, matrices.shape[0], CHUNK)
         ]
     )
 
 
-def _largest(matrices: torch.Tensor) -> torch.Tensor:
-    """Largest eigenvalue of every matrix of a stack."""
-    return _eigenvalues(matrices, -1)
+def _dominated(point: torch.Tensor, matrices: torch.Tensor) -> torch.Tensor:
+    """Tell which matrices of a stack ``point`` dominates, in double precision.
 
-
-def _smallest(matrices: torch.Tensor) -> torch.Tensor:
-    """Smallest eigenvalue of every matrix of a stack."""
-    return _eigenvalues(matrices, 0)
+    ``point - Q`` is positive definite exactly when its Cholesky factorisation
+    exists, which costs a fraction of an eigenvalue sweep and runs batched on
+    either device.
+    """
+    return torch.cat(
+        [
+            torch.linalg.cholesky_ex(
+                point - matrices[start : start + CHUNK].to(point.dtype)
+            ).info
+            == 0
+            for start in range(0, matrices.shape[0], CHUNK)
+        ]
+    )
 
 
 def compress(
@@ -74,17 +77,18 @@ def compress(
     ----------
     matrices
         Shape ``(n, n_channels, n_channels)``, complex, Hermitian and positive
-        semi-definite, as :func:`mariepy.sar.local_matrices` gives them.
+        semi-definite, as :func:`mariepy.sar.local_matrices` gives them. The
+        points are found on the device the stack is on.
     margin
         Overestimation allowed, as a fraction of the largest eigenvalue over the
-        whole stack. A cluster grows while the spectral norm its matrix adds
-        over the cluster's worst member stays within that.
+        whole stack. Each point is the strongest matrix left plus this much of
+        the identity.
 
     Returns
     -------
     vops : torch.Tensor
-        Shape ``(n_vops, n_channels, n_channels)``, Hermitian, each dominating
-        its cluster.
+        Shape ``(n_vops, n_channels, n_channels)``, complex128, Hermitian, each
+        dominating its cluster.
     cluster : torch.Tensor
         Shape ``(n,)``, which virtual observation point covers each input
         matrix.
@@ -104,43 +108,35 @@ def compress(
             f"the margin is a fraction of the largest eigenvalue, got {margin}"
         )
 
+    device = matrices.device
     # Every matrix keeps the largest eigenvalue it started with: the loop only
     # takes matrices out of the stack, so it is taken once rather than once per
     # point.
-    largest = _largest(matrices)
+    largest = _largest(matrices).to(device)
     allowed = margin * float(largest.max())
+    identity = allowed * torch.eye(
+        matrices.shape[-1], dtype=torch.complex128, device=device
+    )
     remaining = matrices
-    origin = torch.arange(matrices.shape[0], device=matrices.device)
-    cluster = torch.empty(matrices.shape[0], dtype=torch.long, device=matrices.device)
+    origin = torch.arange(matrices.shape[0], device=device)
+    cluster = torch.empty(matrices.shape[0], dtype=torch.long, device=device)
     vops = []
 
     while remaining.shape[0]:
-        worst = remaining[int(largest.argmax())]
-        gaps = _smallest(worst[None] - remaining)
-        order = torch.argsort(gaps, descending=True, stable=True)
-        remaining, origin = remaining[order], origin[order]
-        largest = largest[order]
+        strongest = int(largest.argmax())
+        point = remaining[strongest].to(torch.complex128) + identity
+        taken = _dominated(point, remaining)
+        # At a zero margin the strongest matrix minus itself is singular, and
+        # the factorisation refuses it.
+        taken[strongest] = True
 
-        added = torch.zeros_like(worst)
-        taken = 0
-        while taken < remaining.shape[0]:
-            trial = added + _deficiency(worst - remaining[taken])
-            # The order puts a matrix that ``worst`` already dominates first, so
-            # its deficiency is zero and a cluster is never empty -- except at a
-            # zero margin, where rounding in that zero decides, which is what
-            # ``taken`` guards.
-            if taken and float(torch.linalg.eigvalsh(trial)[-1]) > allowed:
-                break
-            added, taken = trial, taken + 1
-
-        cluster[origin[:taken]] = len(vops)
-        vops.append(worst + added)
-        remaining, origin = remaining[taken:], origin[taken:]
-        largest = largest[taken:]
+        cluster[origin[taken]] = len(vops)
+        vops.append(point)
+        remaining, origin, largest = remaining[~taken], origin[~taken], largest[~taken]
         _log.info(
             "point %d covers %d matrices, %d left",
             len(vops),
-            taken,
+            int(taken.sum()),
             remaining.shape[0],
         )
 
