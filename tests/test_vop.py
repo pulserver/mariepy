@@ -192,6 +192,38 @@ def test_the_transmit_identity_reads_back_and_is_absent_unless_given(tmp_path, d
     assert vop.read(path).metadata["transmit"] == "Head8Tx/8/0x1a2b3c4d"
 
 
+def test_the_global_safety_factor_reads_back_and_is_absent_unless_given(
+    tmp_path, device
+):
+    path, _, _, _ = _written(tmp_path, device)
+    assert "global_safety_factor" not in vop.read(path).metadata
+    path, _, _, _ = _written(
+        tmp_path,
+        device,
+        global_safety_factor=1.35,
+        global_safety_basis="vendor head SAR above the population's",
+    )
+    back = vop.read(path).metadata
+    assert back["global_safety_factor"] == 1.35
+    assert back["global_safety_basis"] == "vendor head SAR above the population's"
+
+
+@pytest.mark.parametrize("factor", [0.9, float("nan")])
+def test_a_global_safety_factor_below_one_is_refused(tmp_path, device, factor):
+    with pytest.raises(ValueError, match="at least 1"):
+        _written(tmp_path, device, global_safety_factor=factor, global_safety_basis="x")
+
+
+def test_a_global_safety_factor_without_a_basis_is_refused(tmp_path, device):
+    with pytest.raises(ValueError, match="basis"):
+        _written(tmp_path, device, global_safety_factor=1.2)
+
+
+def test_a_global_safety_basis_without_its_factor_is_refused(tmp_path, device):
+    with pytest.raises(ValueError, match="needs a global safety factor"):
+        _written(tmp_path, device, global_safety_basis="x")
+
+
 @pytest.mark.parametrize("factor", [0.9, float("nan")])
 def test_a_safety_factor_below_one_is_refused(tmp_path, device, factor):
     with pytest.raises(ValueError, match="at least 1"):

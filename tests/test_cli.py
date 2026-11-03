@@ -50,3 +50,26 @@ def test_vops_refuses_both_a_case_and_the_sphere(tmp_path):
                 "test",
             ]
         )
+
+
+def test_vops_writes_the_global_safety_factor_it_is_given(tmp_path):
+    path = tmp_path / "vops.npz"
+    main(
+        [
+            "vops",
+            "--sphere",
+            "--out",
+            str(path),
+            "--safety-factor",
+            "1.5",
+            "--safety-basis",
+            "test",
+            "--global-safety-factor",
+            "1.35",
+            "--global-safety-basis",
+            "vendor cross-check",
+        ]
+    )
+    back = vop.read(path).metadata
+    assert back["global_safety_factor"] == 1.35
+    assert back["global_safety_basis"] == "vendor cross-check"

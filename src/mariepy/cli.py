@@ -255,6 +255,8 @@ def _vops(args) -> None:
         safety_basis=args.safety_basis,
         data_licence=licence,
         transmit=args.transmit,
+        global_safety_factor=args.global_safety_factor,
+        global_safety_basis=args.global_safety_basis,
     )
     print(f"wrote {args.out} with mariepy {__version__} in {time.time() - t0:.0f}s")
 
@@ -312,6 +314,12 @@ def main(argv: list[str] | None = None) -> None:
     )
     vops.add_argument(
         "--transmit", help="the transmit configuration the scanner reports"
+    )
+    vops.add_argument(
+        "--global-safety-factor", type=float, help="on every head-average SAR read"
+    )
+    vops.add_argument(
+        "--global-safety-basis", help="what the global safety factor covers, one line"
     )
     vops.set_defaults(run=_vops)
 

@@ -234,6 +234,8 @@ def write(
     safety_basis: str,
     data_licence: str,
     transmit: str | None = None,
+    global_safety_factor: float | None = None,
+    global_safety_basis: str | None = None,
 ) -> None:
     """Write the virtual observation points a pulse designer reads.
 
@@ -276,12 +278,21 @@ def write(
     transmit
         Identity of the transmit configuration the file is valid for, as the
         scanner reports it; a scanner refuses a file written for another.
+    global_safety_factor
+        Factor, at least 1, every head-average SAR read from the file is
+        multiplied by, for what the head-average matrices do not carry, such as
+        a vendor cross-check that finds them low. Like ``safety_factor`` it
+        travels as metadata; a file without it gives head-average SAR a factor
+        of 1.
+    global_safety_basis
+        One line stating what ``global_safety_factor`` covers and where it
+        comes from; required with it.
 
     Raises
     ------
     ValueError
         A stack is not Hermitian, the two stacks disagree on the channel count,
-        the safety factor is below 1 or has no basis, or the names do not match
+        a safety factor is below 1 or has no basis, or the names do not match
         the matrices they label.
     """
     from mariepy import __version__
@@ -297,6 +308,17 @@ def write(
         raise ValueError(f"the safety factor is at least 1, got {safety_factor}")
     if not str(safety_basis).strip():
         raise ValueError("the safety factor needs a basis stating what it covers")
+    if global_safety_factor is not None:
+        if not (np.isfinite(global_safety_factor) and global_safety_factor >= 1.0):
+            raise ValueError(
+                f"the global safety factor is at least 1, got {global_safety_factor}"
+            )
+        if not str(global_safety_basis or "").strip():
+            raise ValueError(
+                "the global safety factor needs a basis stating what it covers"
+            )
+    elif global_safety_basis is not None:
+        raise ValueError("a global safety basis needs a global safety factor")
     names = [str(name) for name in channels]
     models = [str(name) for name in bodies]
     if len(names) != points.shape[-1]:
@@ -323,6 +345,9 @@ def write(
     }
     if transmit is not None:
         metadata["transmit"] = str(transmit)
+    if global_safety_factor is not None:
+        metadata["global_safety_factor"] = float(global_safety_factor)
+        metadata["global_safety_basis"] = str(global_safety_basis)
     np.savez_compressed(
         path,
         vops=points,
